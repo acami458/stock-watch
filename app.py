@@ -1,27 +1,19 @@
 #!/usr/bin/env python3
 """
-Stock Watch — full app (dashboard + accounts + shared list + email + web push)
-================================================================================
-Installable home-screen web app:
-- Shared dashboard (collaborative list), prices from Finnhub.
-- Accounts; personal watchlists; market-session badge; Copy-for-Excel.
-- EMAIL alerts AND PHONE PUSH notifications when one of YOUR stocks rises
-  >= 0.5% above the day's low (once per stock per day, market hours).
+Stock Watch — full app (dashboard + accounts + shared list + email + push + detail view)
+========================================================================================
+Installable home-screen web app. Tap any stock to see full stats and a chart of
+today's movement (built from the app's own minute-by-minute samples).
 
 Files in this folder: app.py, requirements.txt, icon.png  (upload all three).
 
 ENV VARS:
-  FINNHUB_API_KEY   - free Finnhub key (prices)
-  DATABASE_URL      - Neon Postgres (production; local uses SQLite if unset)
-  SECRET_KEY        - long random string (login cookie)
-  SMTP_HOST/PORT/USER/PASS, EMAIL_FROM, SMTP_SSL   - email alerts (optional)
-  VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY, VAPID_SUBJECT - push alerts (optional)
-  APP_URL           - your site URL (used in alert links)
+  FINNHUB_API_KEY, DATABASE_URL, SECRET_KEY,
+  SMTP_HOST/PORT/USER/PASS, EMAIL_FROM, SMTP_SSL  (email, optional),
+  VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY, VAPID_SUBJECT (push, optional), APP_URL
 
-RUN LOCALLY:
-  export FINNHUB_API_KEY=your_key
-  python3 app.py     ->  http://localhost:8765
-================================================================================
+RUN LOCALLY:  export FINNHUB_API_KEY=your_key ; python3 app.py  -> http://localhost:8765
+========================================================================================
 """
 
 import base64
@@ -83,7 +75,6 @@ VAPID_PRIVATE_KEY = os.environ.get("VAPID_PRIVATE_KEY", "").strip()
 VAPID_SUBJECT     = os.environ.get("VAPID_SUBJECT", "").strip() or ("mailto:" + (EMAIL_FROM or "admin@example.com"))
 PUSH_ON = bool(VAPID_PUBLIC_KEY and VAPID_PRIVATE_KEY)
 
-# 1x1 transparent PNG fallback if icon.png is missing.
 _FALLBACK_ICON = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==")
 
@@ -422,9 +413,40 @@ def clean_symbol(s):
     return None
 
 
-# =========================== QUOTES ===========================
+# =========================== QUOTES + HISTORY ===========================
 _quotes = {}
 _qlock = threading.Lock()
+_hist = {}                       # symbol -> [[ "HH:MM", price ], ...] for today
+_hist_lock = threading.Lock()
+_hist_state = {"day": None}
+HIST_MAX = 480
+
+
+def record_history():
+    now = datetime.now(ET)
+    today = now.strftime("%Y-%m-%d")
+    hhmm = now.strftime("%H:%M")
+    with _qlock:
+        snapshot = {s: r.get("price") for s, r in _quotes.items()}
+    with _hist_lock:
+        if _hist_state["day"] != today:
+            _hist.clear()
+            _hist_state["day"] = today
+        for s, p in snapshot.items():
+            if p is None:
+                continue
+            lst = _hist.setdefault(s, [])
+            if lst and lst[-1][0] == hhmm:
+                lst[-1] = [hhmm, p]
+            else:
+                lst.append([hhmm, p])
+            if len(lst) > HIST_MAX:
+                del lst[:len(lst) - HIST_MAX]
+
+
+def history_for(sym):
+    with _hist_lock:
+        return [{"t": t, "p": p} for t, p in _hist.get(sym, [])]
 
 
 def market_open(dt):
@@ -610,6 +632,10 @@ def refresher():
                 pass
             refresh_symbols(sorted(syms))
             try:
+                record_history()
+            except Exception:
+                pass
+            try:
                 alert_check()
             except Exception as e:
                 print(f"  (alert_check error: {e})", flush=True)
@@ -666,6 +692,7 @@ PAGE = """<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-title" content="Stock Watch">
 <meta name="theme-color" content="#1d4ed8">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
 <style>
 :root{color-scheme:light}*{box-sizing:border-box}
 body{margin:0;padding:18px;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;background:#f6f7f9;color:#16181d}
@@ -680,22 +707,23 @@ input{font:inherit;font-size:13px;padding:7px 10px;border:1px solid #d1d5db;bord
 .warn{background:#fffbeb;color:#92400e;border:1px solid #fde68a;padding:10px 12px;border-radius:8px;font-size:13px;margin-bottom:12px}
 .card-auth{background:#fff;border:1px solid #e7e9ee;border-radius:12px;padding:16px;max-width:340px;margin-bottom:14px}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:10px}
-.card{background:#fff;border:1px solid #e7e9ee;border-left:4px solid #cbd5e1;border-radius:10px;padding:10px 12px;position:relative}
-.card.near{border-left-color:#16a34a;background:#f0fdf4}
+.card{background:#fff;border:1px solid #e7e9ee;border-left:4px solid #cbd5e1;border-radius:10px;padding:10px 12px;position:relative;cursor:pointer}
+.card:hover{border-color:#c7ccd6}.card.near{border-left-color:#16a34a;background:#f0fdf4}
 .tk{font-weight:700;font-size:15px}.pr{float:right;font-weight:600}
 .row{font-size:12px;color:#4b5563;margin-top:3px}.up{color:#16a34a;font-weight:600}.dn{color:#dc2626;font-weight:600}
 .muted{color:#9ca3af}.foot{color:#9ca3af;font-size:11px;margin-top:18px}
 .x{position:absolute;top:6px;right:8px;cursor:pointer;color:#9ca3af;font-size:14px;border:none;background:none;padding:2px 5px}
 .x:hover{color:#dc2626}#msg,#authmsg{font-size:12px;color:#b91c1c}
 .who{font-size:12px;color:#374151;display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+#overlay{position:fixed;inset:0;background:rgba(15,18,25,.45);display:none;align-items:center;justify-content:center;padding:16px;z-index:50}
+#modal{background:#fff;border-radius:14px;max-width:440px;width:100%;padding:18px;position:relative}
+.stat{display:flex;justify-content:space-between;font-size:13px;padding:5px 0;border-bottom:1px solid #f1f1f1}
 </style></head><body>
 <h1>📈 Stock Watch</h1>
 <div class="meta" id="asof">loading…</div>
 <div class="rule" id="rule"></div>
 <div id="warn"></div>
-
 <div id="authbox"></div>
-
 <div class="bar">
   <span id="status"></span>
   <button onclick="load()">Refresh</button>
@@ -703,7 +731,6 @@ input{font:inherit;font-size:13px;padding:7px 10px;border:1px solid #d1d5db;bord
   <button id="pushbtn" style="display:none" onclick="enablePush()">🔔 Enable phone alerts</button>
   <span id="msg"></span>
 </div>
-
 <div id="mywrap" style="display:none">
   <h2>⭐ My Watchlist</h2>
   <div class="bar">
@@ -712,7 +739,6 @@ input{font:inherit;font-size:13px;padding:7px 10px;border:1px solid #d1d5db;bord
   </div>
   <div class="grid" id="mygrid"></div>
 </div>
-
 <h2>👥 Shared List</h2>
 <div id="sharededit" class="bar" style="display:none">
   <input id="sharedsym" placeholder="Add to shared list" maxlength="10" onkeydown="if(event.key==='Enter')addShared()">
@@ -720,10 +746,20 @@ input{font:inherit;font-size:13px;padding:7px 10px;border:1px solid #d1d5db;bord
   <span class="muted" style="font-size:12px">Everyone sees changes to the shared list.</span>
 </div>
 <div class="grid" id="grid"></div>
+<div class="foot">Data: Finnhub · free tier delayed ~15 min · tap a stock for details & today's chart · alerts fire when one of YOUR stocks rises ≥0.5% above the day's low.</div>
 
-<div class="foot">Data: Finnhub · free tier delayed ~15 min · updates ~once a minute · Alerts (email + phone) fire when one of YOUR stocks rises ≥0.5% above the day's low.</div>
+<div id="overlay" onclick="if(event.target===this)closeDetail()">
+  <div id="modal">
+    <button class="x" style="font-size:18px" onclick="closeDetail()">✕</button>
+    <div style="font-size:20px;font-weight:700" id="d_tk"></div>
+    <div style="font-size:22px;margin:4px 0 12px" id="d_price"></div>
+    <div id="d_stats"></div>
+    <div style="margin-top:14px;height:200px"><canvas id="d_chart"></canvas></div>
+    <div class="muted" style="font-size:12px;margin-top:8px" id="d_note"></div>
+  </div>
+</div>
 <script>
-let LAST={shared:[],mine:[]}, ME={logged_in:false};
+let LAST={shared:[],mine:[]}, ME={logged_in:false}, _chart=null;
 function pctSpan(v){if(v===null||v===undefined)return '<span class="muted">—</span>';var s=(v>=0?"+":"")+v.toFixed(2)+"%";return '<span class="'+(v>=0?'up':'dn')+'">'+s+'</span>';}
 function money(v){return (v===null||v===undefined)?'<span class="muted">—</span>':'$'+v.toFixed(2);}
 function card(t,removable,shared){
@@ -731,13 +767,41 @@ function card(t,removable,shared){
  const fn=shared?'delShared':'delSym';
  let tip='Remove from my list';
  if(shared){tip=t.added_by?('Added by '+t.added_by+' — remove from shared'):'Original list — remove from shared';}
- const x=removable?'<button class="x" title="'+tip+'" onclick="'+fn+'(\\''+t.ticker+'\\')">✕</button>':'';
+ const x=removable?'<button class="x" title="'+tip+'" onclick="event.stopPropagation();'+fn+'(\\''+t.ticker+'\\')">✕</button>':'';
  const by=(shared&&t.added_by)?'<div class="row muted">added by '+t.added_by+'</div>':'';
- return '<div class="'+cls+'">'+x+'<span class="tk">'+t.ticker+'</span><span class="pr">'+money(t.price)+'</span>'+
+ return '<div class="'+cls+'" onclick="openDetail(\\''+t.ticker+'\\')">'+x+'<span class="tk">'+t.ticker+'</span><span class="pr">'+money(t.price)+'</span>'+
   '<div class="row">change: '+pctSpan(t.change)+'</div>'+
   '<div class="row">from day low: '+pctSpan(t.from_low)+'</div>'+
   '<div class="row muted">open: '+(t.open==null?'—':'$'+t.open.toFixed(2))+' · prev: '+(t.prev_close==null?'—':'$'+t.prev_close.toFixed(2))+'</div>'+
   '<div class="row muted">'+(t.as_of||'')+'</div>'+by+'</div>';
+}
+function findRow(tk){return (LAST.shared||[]).concat(LAST.mine||[]).find(function(r){return r.ticker===tk;});}
+async function openDetail(tk){
+ const t=findRow(tk)||{ticker:tk};
+ document.getElementById('overlay').style.display='flex';
+ document.getElementById('d_tk').textContent=t.ticker;
+ document.getElementById('d_price').innerHTML=money(t.price)+' &nbsp; '+pctSpan(t.change);
+ const rows=[['From day low',(t.from_low==null?'—':(t.from_low>=0?'+':'')+t.from_low.toFixed(2)+'%')],
+   ['Open',t.open==null?'—':'$'+t.open.toFixed(2)],['Day high',t.high==null?'—':'$'+t.high.toFixed(2)],
+   ['Day low',t.low==null?'—':'$'+t.low.toFixed(2)],['Prev close',t.prev_close==null?'—':'$'+t.prev_close.toFixed(2)],
+   ['As of',t.as_of||'—']];
+ document.getElementById('d_stats').innerHTML=rows.map(function(r){return '<div class="stat"><span class="muted">'+r[0]+'</span><span>'+r[1]+'</span></div>';}).join('');
+ document.getElementById('d_note').textContent='Loading today’s chart…';
+ try{const h=await (await fetch('/api/history?symbol='+encodeURIComponent(tk),{cache:'no-store'})).json();drawChart(h.points||[], (t.prev_close==null?null:t.prev_close));}
+ catch(e){document.getElementById('d_note').textContent='Chart unavailable.';}
+}
+function closeDetail(){document.getElementById('overlay').style.display='none';if(_chart){_chart.destroy();_chart=null;}}
+function drawChart(points,prevClose){
+ const cv=document.getElementById('d_chart'),note=document.getElementById('d_note');
+ if(_chart){_chart.destroy();_chart=null;}
+ if(!points.length){cv.style.display='none';note.textContent='No intraday data yet today — check back during market hours.';return;}
+ cv.style.display='block';note.textContent='Today’s movement · '+points.length+' points'+(prevClose!=null?' · dashed = prev close':'');
+ const labels=points.map(function(p){return p.t;}),data=points.map(function(p){return p.p;});
+ const up=data[data.length-1]>=data[0];
+ const ds=[{data:data,borderColor:up?'#16a34a':'#dc2626',borderWidth:2,pointRadius:0,tension:0.25,fill:false}];
+ if(prevClose!=null){ds.push({data:labels.map(function(){return prevClose;}),borderColor:'#9ca3af',borderWidth:1,borderDash:[5,4],pointRadius:0,fill:false});}
+ _chart=new Chart(cv,{type:'line',data:{labels:labels,datasets:ds},
+   options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{ticks:{maxTicksLimit:6,font:{size:10}}},y:{ticks:{font:{size:10}}}}}});
 }
 async function whoami(){ME=await (await fetch('/api/me',{cache:'no-store'})).json();renderAuth();}
 function renderAuth(){
@@ -767,10 +831,7 @@ async function auth(kind){
  if(d.ok){await whoami();load();}else{document.getElementById('authmsg').textContent=d.error||'Something went wrong';}
 }
 async function logout(){await fetch('/api/logout',{method:'POST'});ME={logged_in:false};renderAuth();load();}
-async function toggleAlerts(){
- const on=document.getElementById('altog').checked;
- await fetch('/api/alerts',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({on})});ME.alerts_on=on;
-}
+async function toggleAlerts(){const on=document.getElementById('altog').checked;await fetch('/api/alerts',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({on})});ME.alerts_on=on;}
 async function addSym(){
  const v=document.getElementById('addsym').value.trim();if(!v)return;
  const d=await (await fetch('/api/watch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'add',symbol:v})})).json();
@@ -870,6 +931,10 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, SW_JS.encode("utf-8"), "application/javascript")
         elif self.path.startswith("/icon.png") or self.path.startswith("/apple-touch-icon"):
             self._send(200, icon_bytes(), "image/png")
+        elif self.path.startswith("/api/history"):
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            sym = clean_symbol((q.get("symbol") or [""])[0])
+            self._json({"symbol": sym, "points": history_for(sym) if sym else []})
         elif self.path.startswith("/api/push/key"):
             self._json({"key": VAPID_PUBLIC_KEY, "enabled": PUSH_ON})
         elif self.path.startswith("/api/me"):
