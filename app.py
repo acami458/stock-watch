@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
 """
-Stock Watch — Stages 1-4 + collaborative shared list
+Stock Watch — full app (dashboard + accounts + shared list + email + web push)
 ================================================================================
-- Shared dashboard, prices from Finnhub (refreshed once/min, shared snapshot).
-- Accounts: sign up / log in; each person keeps their own watchlist.
-- Collaborative SHARED list: any logged-in user can add/remove from it.
-- Market-session badge, open + day low, Copy-for-Excel (personal + shared).
-- Email alerts when one of YOUR stocks rises >= 0.5% above the day's low.
+Installable home-screen web app with:
+- Shared dashboard (collaborative list), prices from Finnhub.
+- Accounts; personal watchlists; market-session badge; Copy-for-Excel.
+- EMAIL alerts AND PHONE PUSH notifications when one of YOUR stocks rises
+  >= 0.5% above the day's low (once per stock per day, market hours).
 
 ENV VARS:
-  FINNHUB_API_KEY  - free Finnhub key (required for prices)
-  DATABASE_URL     - Neon Postgres URL (production; local uses SQLite if unset)
-  SECRET_KEY       - long random string (signs login cookie)
-  SMTP_HOST/PORT/USER/PASS, EMAIL_FROM, SMTP_SSL, APP_URL  - email alerts (optional)
+  FINNHUB_API_KEY   - free Finnhub key (prices)
+  DATABASE_URL      - Neon Postgres (production; local uses SQLite if unset)
+  SECRET_KEY        - long random string (login cookie)
+  # email alerts (optional): SMTP_HOST/PORT/USER/PASS, EMAIL_FROM, SMTP_SSL
+  # push alerts (optional): VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY, VAPID_SUBJECT
+  APP_URL           - your site URL (used in alert links)
 
 RUN LOCALLY:
   export FINNHUB_API_KEY=your_key
@@ -62,6 +64,7 @@ RISE_PCT        = 0.005
 MAX_PER_USER    = 60
 MAX_SHARED      = 100
 ALERT_SESSIONS  = {"Pre-market", "Open"}
+APP_URL         = os.environ.get("APP_URL", "").strip()
 
 SMTP_HOST = os.environ.get("SMTP_HOST", "").strip()
 SMTP_PORT = int(os.environ.get("SMTP_PORT", "587") or 587)
@@ -69,8 +72,15 @@ SMTP_USER = os.environ.get("SMTP_USER", "").strip()
 SMTP_PASS = os.environ.get("SMTP_PASS", "").strip()
 SMTP_SSL  = os.environ.get("SMTP_SSL", "false").lower() in ("1", "true", "yes")
 EMAIL_FROM = os.environ.get("EMAIL_FROM", "").strip() or SMTP_USER
-APP_URL   = os.environ.get("APP_URL", "").strip()
 EMAIL_ON  = bool(SMTP_HOST and SMTP_USER and SMTP_PASS)
+
+VAPID_PUBLIC_KEY  = os.environ.get("VAPID_PUBLIC_KEY", "").strip()
+VAPID_PRIVATE_KEY = os.environ.get("VAPID_PRIVATE_KEY", "").strip()
+VAPID_SUBJECT     = os.environ.get("VAPID_SUBJECT", "").strip() or ("mailto:" + (EMAIL_FROM or "admin@example.com"))
+PUSH_ON = bool(VAPID_PUBLIC_KEY and VAPID_PRIVATE_KEY)
+
+# Blue tile with a white rising chart (512px PNG).
+ICON_B64 = "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"
 
 # =========================== DATABASE ===========================
 def _db():
@@ -98,8 +108,7 @@ def init_db():
                 id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT UNIQUE NOT NULL,
                 pw_hash TEXT NOT NULL, created_at TEXT DEFAULT CURRENT_TIMESTAMP)""")
         cur.execute("""CREATE TABLE IF NOT EXISTS watchlist(
-            user_id INTEGER NOT NULL, symbol TEXT NOT NULL,
-            PRIMARY KEY(user_id, symbol))""")
+            user_id INTEGER NOT NULL, symbol TEXT NOT NULL, PRIMARY KEY(user_id, symbol))""")
         cur.execute("""CREATE TABLE IF NOT EXISTS user_settings(
             user_id INTEGER PRIMARY KEY, alerts_on INTEGER DEFAULT 1)""")
         cur.execute("""CREATE TABLE IF NOT EXISTS alerts_sent(
@@ -107,8 +116,10 @@ def init_db():
             PRIMARY KEY(user_id, symbol, day))""")
         cur.execute("""CREATE TABLE IF NOT EXISTS shared_list(
             symbol TEXT PRIMARY KEY, sort_order INTEGER DEFAULT 0, added_by TEXT)""")
+        cur.execute("""CREATE TABLE IF NOT EXISTS push_subs(
+            endpoint TEXT PRIMARY KEY, user_id INTEGER NOT NULL, sub TEXT NOT NULL)""")
         conn.commit()
-        try:                                             # migrate older DBs missing the column
+        try:
             if kind == "pg":
                 cur.execute("ALTER TABLE shared_list ADD COLUMN IF NOT EXISTS added_by TEXT")
             else:
@@ -117,7 +128,7 @@ def init_db():
         except Exception:
             conn.rollback()
         cur.execute("SELECT COUNT(*) FROM shared_list")
-        if cur.fetchone()[0] == 0:                       # seed once
+        if cur.fetchone()[0] == 0:
             for i, s in enumerate(SEED_TICKERS):
                 cur.execute(_ph("INSERT INTO shared_list(symbol, sort_order) VALUES(%s,%s)", kind), (s, i))
             conn.commit()
@@ -136,7 +147,6 @@ def get_shared_list():
 
 
 def get_shared_added():
-    """{symbol: added_by_email_or_None}."""
     conn, kind = _db()
     try:
         cur = conn.cursor()
@@ -326,6 +336,45 @@ def mark_alerted(uid, symbol, day):
         conn.close()
 
 
+def save_sub(uid, sub):
+    conn, kind = _db()
+    try:
+        cur = conn.cursor()
+        ep = sub.get("endpoint")
+        if not ep:
+            return
+        if kind == "pg":
+            cur.execute("""INSERT INTO push_subs(endpoint, user_id, sub) VALUES(%s,%s,%s)
+                           ON CONFLICT (endpoint) DO UPDATE SET user_id=EXCLUDED.user_id, sub=EXCLUDED.sub""",
+                        (ep, uid, json.dumps(sub)))
+        else:
+            cur.execute("INSERT OR REPLACE INTO push_subs(endpoint, user_id, sub) VALUES(?,?,?)",
+                        (ep, uid, json.dumps(sub)))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def delete_sub(endpoint):
+    conn, kind = _db()
+    try:
+        cur = conn.cursor()
+        cur.execute(_ph("DELETE FROM push_subs WHERE endpoint=%s", kind), (endpoint,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def subs_for_user(uid):
+    conn, kind = _db()
+    try:
+        cur = conn.cursor()
+        cur.execute(_ph("SELECT endpoint, sub FROM push_subs WHERE user_id=%s", kind), (uid,))
+        return [(r[0], json.loads(r[1])) for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+
 # =========================== AUTH ===========================
 def hash_pw(pw, salt=None):
     salt = salt or os.urandom(16)
@@ -461,7 +510,7 @@ def rows_for(syms):
     return out
 
 
-# =========================== EMAIL ALERTS ===========================
+# =========================== ALERTS (email + push) ===========================
 def send_alert_email(to_email, row):
     if not EMAIL_ON:
         return False
@@ -471,7 +520,6 @@ def send_alert_email(to_email, row):
             f"Change vs prev close: {row['change']:+.2f}%\nAs of: {row['as_of']}\n")
     if APP_URL:
         body += f"\nOpen the dashboard: {APP_URL}\n"
-    body += "\n(You're getting this because email alerts are on for your Stock Watch account.)"
     try:
         msg = EmailMessage()
         msg["Subject"] = f"📈 {t} alert — +{row['from_low']:.2f}% from the day's low"
@@ -491,8 +539,47 @@ def send_alert_email(to_email, row):
         return False
 
 
+def send_push(sub, title, body):
+    if not PUSH_ON:
+        return None
+    try:
+        from pywebpush import webpush, WebPushException
+    except Exception:
+        return None
+    try:
+        webpush(sub, json.dumps({"title": title, "body": body, "url": APP_URL or "/"}),
+                vapid_private_key=VAPID_PRIVATE_KEY, vapid_claims={"sub": VAPID_SUBJECT})
+        return True
+    except WebPushException as e:
+        code = getattr(getattr(e, "response", None), "status_code", None)
+        if code in (404, 410):
+            return "gone"
+        print(f"  (push failed: {str(e)[:90]})", flush=True)
+        return False
+    except Exception as e:
+        print(f"  (push error: {str(e)[:90]})", flush=True)
+        return False
+
+
+def notify_user(uid, email, row):
+    """Send one alert to a user via every enabled channel. Returns True if any sent."""
+    sent = False
+    if EMAIL_ON and send_alert_email(email, row):
+        sent = True
+    if PUSH_ON:
+        title = f"📈 {row['ticker']} +{row['from_low']:.2f}% from low"
+        body = f"${row['price']:.2f} · {row['change']:+.2f}% on the day"
+        for endpoint, sub in subs_for_user(uid):
+            res = send_push(sub, title, body)
+            if res == "gone":
+                delete_sub(endpoint)
+            elif res:
+                sent = True
+    return sent
+
+
 def alert_check():
-    if not EMAIL_ON:
+    if not (EMAIL_ON or PUSH_ON):
         return
     now = datetime.now(ET)
     if session_label(now) not in ALERT_SESSIONS:
@@ -504,7 +591,7 @@ def alert_check():
                 row = _quotes.get(s)
             if row and row.get("near") and row.get("price") is not None:
                 if not already_alerted(uid, s, day):
-                    if send_alert_email(email, row):
+                    if notify_user(uid, email, row):
                         mark_alerted(uid, s, day)
 
 
@@ -535,12 +622,38 @@ def meta():
             "session": session_label(now),
             "rule": f"highlighted when ≥ +{RISE_PCT*100:.1f}% above the day's low",
             "have_key": bool(FINNHUB_KEY),
-            "email_on": EMAIL_ON}
+            "email_on": EMAIL_ON, "push_on": PUSH_ON}
+
+
+MANIFEST = json.dumps({
+    "name": "Stock Watch", "short_name": "Stock Watch", "start_url": "/",
+    "display": "standalone", "background_color": "#f6f7f9", "theme_color": "#1d4ed8",
+    "icons": [{"src": "/icon.png", "sizes": "192x192", "type": "image/png"},
+              {"src": "/icon.png", "sizes": "512x512", "type": "image/png"}],
+})
+
+SW_JS = """self.addEventListener('push', function(e){
+  var d={}; try{d=e.data.json();}catch(_){d={title:'Stock Watch', body:(e.data?e.data.text():'')};}
+  e.waitUntil(self.registration.showNotification(d.title||'Stock Watch',
+    {body:d.body||'', icon:'/icon.png', badge:'/icon.png', data:(d.url||'/')}));
+});
+self.addEventListener('notificationclick', function(e){
+  e.notification.close();
+  e.waitUntil(clients.matchAll({type:'window'}).then(function(cl){
+    for(var i=0;i<cl.length;i++){ if('focus' in cl[i]) return cl[i].focus(); }
+    if(clients.openWindow) return clients.openWindow(e.notification.data||'/');
+  }));
+});"""
 
 
 # =========================== WEB PAGE ===========================
 PAGE = """<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1"><title>Stock Watch</title>
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="apple-touch-icon" href="/icon.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Stock Watch">
+<meta name="theme-color" content="#1d4ed8">
 <style>
 :root{color-scheme:light}*{box-sizing:border-box}
 body{margin:0;padding:18px;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;background:#f6f7f9;color:#16181d}
@@ -575,6 +688,7 @@ input{font:inherit;font-size:13px;padding:7px 10px;border:1px solid #d1d5db;bord
   <span id="status"></span>
   <button onclick="load()">Refresh</button>
   <button onclick="copyExcel()">Copy for Excel</button>
+  <button id="pushbtn" style="display:none" onclick="enablePush()">🔔 Enable phone alerts</button>
   <span id="msg"></span>
 </div>
 
@@ -595,7 +709,7 @@ input{font:inherit;font-size:13px;padding:7px 10px;border:1px solid #d1d5db;bord
 </div>
 <div class="grid" id="grid"></div>
 
-<div class="foot">Data: Finnhub · free tier delayed ~15 min · updates ~once a minute · Email alerts fire when one of YOUR stocks rises ≥0.5% above the day's low (once per stock per day, market hours).</div>
+<div class="foot">Data: Finnhub · free tier delayed ~15 min · updates ~once a minute · Alerts (email + phone) fire when one of YOUR stocks rises ≥0.5% above the day's low.</div>
 <script>
 let LAST={shared:[],mine:[]}, ME={logged_in:false};
 function pctSpan(v){if(v===null||v===undefined)return '<span class="muted">—</span>';var s=(v>=0?"+":"")+v.toFixed(2)+"%";return '<span class="'+(v>=0?'up':'dn')+'">'+s+'</span>';}
@@ -617,11 +731,12 @@ async function whoami(){ME=await (await fetch('/api/me',{cache:'no-store'})).jso
 function renderAuth(){
  const b=document.getElementById('authbox');
  document.getElementById('sharededit').style.display=ME.logged_in?'flex':'none';
+ document.getElementById('pushbtn').style.display=(ME.logged_in&&ME.push_on)?'inline-block':'none';
  if(ME.logged_in){
    const al=ME.alerts_on?'checked':'';
-   const note=ME.email_on?'':' <span class="muted">(email alerts not set up by site owner)</span>';
+   const note=(ME.email_on||ME.push_on)?'':' <span class="muted">(alerts not set up by site owner)</span>';
    b.innerHTML='<div class="who">Signed in as <b>'+ME.email+'</b> · <a href="#" onclick="logout();return false">Log out</a>'+
-     ' · <label><input type="checkbox" id="altog" '+al+' onchange="toggleAlerts()"> Email me alerts</label>'+note+'</div>';
+     ' · <label><input type="checkbox" id="altog" '+al+' onchange="toggleAlerts()"> Send me alerts</label>'+note+'</div>';
    document.getElementById('mywrap').style.display='block';
  }else{
    document.getElementById('mywrap').style.display='none';
@@ -656,6 +771,20 @@ async function addShared(){
  if(d.error){document.getElementById('msg').textContent=d.error;}else{document.getElementById('sharedsym').value='';load();}
 }
 async function delShared(s){await fetch('/api/shared',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'remove',symbol:s})});load();}
+function b64ToU8(b){const p='='.repeat((4-b.length%4)%4);const s=(b+p).replace(/-/g,'+').replace(/_/g,'/');const raw=atob(s);const a=new Uint8Array(raw.length);for(let i=0;i<raw.length;i++)a[i]=raw.charCodeAt(i);return a;}
+async function enablePush(){
+ const m=document.getElementById('msg');m.style.color='#b91c1c';
+ if(!('serviceWorker' in navigator)||!('PushManager' in window)){m.textContent='This browser can’t do push. On iPhone, use Safari and Add to Home Screen first.';return;}
+ try{
+  const reg=await navigator.serviceWorker.register('/sw.js');
+  const perm=await Notification.requestPermission();
+  if(perm!=='granted'){m.textContent='Notifications were not allowed.';return;}
+  const k=await (await fetch('/api/push/key')).json();
+  const sub=await reg.pushManager.subscribe({userVisibleOnly:true,applicationServerKey:b64ToU8(k.key)});
+  await fetch('/api/push/subscribe',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({subscription:sub})});
+  m.style.color='#047857';m.textContent='Phone alerts enabled on this device!';
+ }catch(e){m.textContent='Could not enable alerts: '+(e.message||e);}
+}
 async function load(){
  try{
   const d=await (await fetch('/api/quotes',{cache:'no-store'})).json();LAST=d;
@@ -682,6 +811,7 @@ function copyExcel(){
  const text=[h.join("\\t")].concat(all).join("\\n");
  navigator.clipboard.writeText(text).then(()=>{document.getElementById('msg').style.color='#047857';document.getElementById('msg').textContent='Copied '+all.length+' rows!';setTimeout(()=>document.getElementById('msg').textContent='',2500);});
 }
+if('serviceWorker' in navigator){navigator.serviceWorker.register('/sw.js').catch(function(){});}
 whoami();load();setInterval(load,30000);
 </script></body></html>"""
 
@@ -721,13 +851,21 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path in ("/", "/index.html"):
             self._send(200, PAGE.encode("utf-8"), "text/html; charset=utf-8")
+        elif self.path.startswith("/manifest.webmanifest"):
+            self._send(200, MANIFEST.encode("utf-8"), "application/manifest+json")
+        elif self.path.startswith("/sw.js"):
+            self._send(200, SW_JS.encode("utf-8"), "application/javascript")
+        elif self.path.startswith("/icon.png") or self.path.startswith("/apple-touch-icon"):
+            self._send(200, base64.b64decode(ICON_B64), "image/png")
+        elif self.path.startswith("/api/push/key"):
+            self._json({"key": VAPID_PUBLIC_KEY, "enabled": PUSH_ON})
         elif self.path.startswith("/api/me"):
             uid = self._uid()
             if uid:
                 self._json({"logged_in": True, "email": get_email(uid),
-                            "alerts_on": get_alerts_on(uid), "email_on": EMAIL_ON})
+                            "alerts_on": get_alerts_on(uid), "email_on": EMAIL_ON, "push_on": PUSH_ON})
             else:
-                self._json({"logged_in": False, "email_on": EMAIL_ON})
+                self._json({"logged_in": False, "email_on": EMAIL_ON, "push_on": PUSH_ON})
         elif self.path.startswith("/api/quotes"):
             uid = self._uid()
             shared = rows_for(get_shared_list())
@@ -770,6 +908,20 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"error": "Please log in first."})
             set_alerts_on(uid, bool(body.get("on")))
             return self._json({"ok": True})
+        elif self.path.startswith("/api/push/subscribe"):
+            uid = self._uid()
+            if not uid:
+                return self._json({"error": "Please log in first."})
+            sub = body.get("subscription")
+            if not isinstance(sub, dict) or not sub.get("endpoint"):
+                return self._json({"error": "bad subscription"})
+            save_sub(uid, sub)
+            return self._json({"ok": True})
+        elif self.path.startswith("/api/push/unsubscribe"):
+            ep = body.get("endpoint")
+            if ep:
+                delete_sub(ep)
+            return self._json({"ok": True})
         elif self.path.startswith("/api/shared"):
             uid = self._uid()
             if not uid:
@@ -804,7 +956,7 @@ def main():
     if not FINNHUB_KEY:
         print("WARNING: FINNHUB_API_KEY not set.")
     print(f"Storage: {'Postgres' if DATABASE_URL else 'local SQLite ('+DB_PATH+')'}")
-    print(f"Email alerts: {'ON' if EMAIL_ON else 'OFF (set SMTP_* env vars to enable)'}")
+    print(f"Email alerts: {'ON' if EMAIL_ON else 'OFF'} | Push alerts: {'ON' if PUSH_ON else 'OFF'}")
     threading.Thread(target=refresher, daemon=True).start()
     srv = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     print(f"Stock Watch running on http://localhost:{PORT}  (Ctrl+C to stop)")
