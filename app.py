@@ -1,28 +1,37 @@
 #!/usr/bin/env python3
 """
-Stock Watch — Stage 1: Shared Dashboard (web app)
+Stock Watch — Stage 1: Shared Dashboard (web app, Finnhub data)
 ============================================================
-A small website that shows live cards for a shared list of stocks:
-price, % from the day's intraday low, the 3-minute average, pre-market
-price, and change vs. the previous close. Plus a "Copy for Excel" button.
+A small website showing live cards for a shared list of stocks:
+current price, % from the day's low, change vs. previous close, plus a
+"Copy for Excel" button.
 
-This is the first stage of the shared cloud version. It runs the same
-whether on your Mac (to preview) or on a web host (to share a link).
+Data source: Finnhub (https://finnhub.io). You need a FREE API key.
+Prices on the free tier are delayed ~15 minutes — fine for watching;
+upgrade to a paid real-time plan later if anyone trades off it.
 
-RUN LOCALLY (preview on your own computer):
-    pip3 install --upgrade yfinance pandas
-    python3 app.py
-    then open  http://localhost:8765
+----------------------------------------------------------------
+GET A FREE KEY (2 min):
+  1. Go to finnhub.io -> Sign up (free).
+  2. Copy your API key from the dashboard.
 
-DEPLOY (share a link): see DEPLOY_GUIDE.md — the host sets the PORT
-environment variable automatically; nothing to change in this file.
-============================================================
+RUN LOCALLY (preview on your Mac):
+  Terminal:
+     export FINNHUB_API_KEY=your_key_here
+     python3 app.py
+  then open http://localhost:8765
+
+DEPLOY (Render): add an Environment Variable named FINNHUB_API_KEY
+  with your key (see DEPLOY_GUIDE.md). Nothing else to change.
+----------------------------------------------------------------
 """
 
 import json
 import os
-import threading
 import time
+import urllib.parse
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -31,12 +40,6 @@ try:
 except ImportError:
     raise SystemExit("Python 3.9+ required.")
 
-try:
-    import yfinance as yf
-    import pandas as pd
-except ImportError:
-    raise SystemExit("Missing dependencies. Run: pip3 install --upgrade yfinance pandas")
-
 # ----------------------------- CONFIG -----------------------------
 SHARED_TICKERS = [
     "AAPL", "ADI", "ADMA", "AMZN", "BABA", "CBRL", "CL", "COPX", "CUBE", "CVX",
@@ -44,15 +47,14 @@ SHARED_TICKERS = [
     "KO", "LLY", "LMT", "MA", "MAIN", "META", "MSFT", "MU", "NVDA", "PFE",
     "RIO", "SLV", "TSLA", "VZ", "WMT", "ADSK", "AVGO", "SPCX",
 ]
-RISE_PCT     = 0.005          # reference: 0.5% from the intraday low
-AVG_MINUTES  = 3              # trailing average window
-ET           = ZoneInfo("America/New_York")
-PORT         = int(os.environ.get("PORT", "8765"))   # host sets PORT; default 8765 locally
-CACHE_TTL    = 30             # seconds; shields the data source from many viewers
+FINNHUB_KEY = os.environ.get("FINNHUB_API_KEY", "").strip()
+ET          = ZoneInfo("America/New_York")
+PORT        = int(os.environ.get("PORT", "8765"))
+CACHE_TTL   = 30      # seconds; shields the API from many viewers / rate limits
+RISE_PCT    = 0.005   # reference highlight: 0.5% above the day's low
 # ------------------------------------------------------------------
 
 _cache = {"payload": None, "ts": 0.0}
-_lock = threading.Lock()
 
 
 def market_open(dt):
@@ -62,73 +64,60 @@ def market_open(dt):
     return 9 * 60 + 30 <= m < 16 * 60
 
 
-def fetch_quotes():
-    intraday = yf.download(" ".join(SHARED_TICKERS), period="1d", interval="1m",
-                           prepost=True, group_by="ticker", progress=False,
-                           auto_adjust=False, threads=True)
-    daily = yf.download(" ".join(SHARED_TICKERS), period="7d", interval="1d",
-                        prepost=False, group_by="ticker", progress=False,
-                        auto_adjust=False, threads=True)
+def fh_quote(sym):
+    """Finnhub /quote -> {c:current, h:high, l:low, o:open, pc:prev close, t:epoch}."""
+    url = f"https://finnhub.io/api/v1/quote?symbol={urllib.parse.quote(sym)}&token={FINNHUB_KEY}"
+    req = urllib.request.Request(url, headers={"User-Agent": "stock-watch"})
+    with urllib.request.urlopen(req, timeout=12) as r:
+        return json.loads(r.read().decode())
 
-    def sub(frame, t):
-        try:
-            d = frame[t] if len(SHARED_TICKERS) > 1 else frame
-            return d.dropna(subset=["Close"])
-        except Exception:
-            return None
 
-    rows = []
-    for t in SHARED_TICKERS:
-        price = low = avg3 = prev = pct = chg = None
-        as_of = ""
-        idf = sub(intraday, t)
-        if idf is not None and len(idf):
-            price = float(idf["Close"].iloc[-1])
-            low = float(idf["Low"].min())
-            if len(idf) >= AVG_MINUTES:
-                avg3 = float(idf["Close"].iloc[-AVG_MINUTES:].mean())
-            ts = idf.index[-1]
-            try:
-                as_of = ts.tz_convert(ET).strftime("%H:%M ET")
-            except Exception:
-                as_of = str(ts)[-14:-3]
-        ddf = sub(daily, t)
-        if ddf is not None and len(ddf):
-            prev = float(ddf["Close"].iloc[-1])
-        if price is not None and low and low > 0:
-            pct = (price - low) / low * 100
-        if price is not None and prev:
-            chg = (price - prev) / prev * 100
-        rows.append({
+def one_row(t):
+    try:
+        q = fh_quote(t)
+        c = q.get("c")
+        low = q.get("l")
+        pc = q.get("pc")
+        ts = q.get("t")
+        if not c:                     # 0 or None -> no data for this symbol
+            return {"ticker": t, "price": None, "from_low": None,
+                    "prev_close": None, "change": None, "as_of": "", "near": False}
+        from_low = (c - low) / low * 100 if low else None
+        change = (c - pc) / pc * 100 if pc else None
+        as_of = datetime.fromtimestamp(ts, ET).strftime("%H:%M ET") if ts else ""
+        return {
             "ticker": t,
-            "price": None if price is None else round(price, 2),
-            "from_low": None if pct is None else round(pct, 2),
-            "avg3": None if avg3 is None else round(avg3, 2),
-            "prev_close": None if prev is None else round(prev, 2),
-            "change": None if chg is None else round(chg, 2),
+            "price": round(c, 2),
+            "from_low": None if from_low is None else round(from_low, 2),
+            "prev_close": None if not pc else round(pc, 2),
+            "change": None if change is None else round(change, 2),
             "as_of": as_of,
-            "near": bool(pct is not None and avg3 is not None
-                         and pct >= RISE_PCT * 100 and price > avg3),
-        })
+            "near": bool(from_low is not None and from_low >= RISE_PCT * 100),
+        }
+    except Exception:
+        return {"ticker": t, "price": None, "from_low": None,
+                "prev_close": None, "change": None, "as_of": "err", "near": False}
+
+
+def fetch_quotes():
+    if not FINNHUB_KEY:
+        return {"as_of": "no API key", "market_open": False, "error": "missing_key",
+                "rule": "", "rows": []}
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        rows = list(ex.map(one_row, SHARED_TICKERS))
     now = datetime.now(ET)
     return {"as_of": now.strftime("%a %b %d, %H:%M:%S ET"),
             "market_open": market_open(now),
-            "rule": f"+{RISE_PCT*100:.1f}% from intraday low AND above {AVG_MINUTES}-min avg",
+            "rule": f"highlighted when ≥ +{RISE_PCT*100:.1f}% above the day's low",
             "rows": rows}
 
 
 def get_payload():
-    with _lock:
-        if _cache["payload"] and (time.time() - _cache["ts"] < CACHE_TTL):
-            return _cache["payload"]
-    try:
-        payload = fetch_quotes()
-    except Exception as e:
-        payload = {"as_of": "data error", "market_open": False,
-                   "rule": "", "rows": [], "error": str(e)}
-    with _lock:
-        _cache["payload"] = payload
-        _cache["ts"] = time.time()
+    if _cache["payload"] and (time.time() - _cache["ts"] < CACHE_TTL):
+        return _cache["payload"]
+    payload = fetch_quotes()
+    _cache["payload"] = payload
+    _cache["ts"] = time.time()
     return payload
 
 
@@ -145,7 +134,8 @@ button{font:inherit;font-size:13px;padding:7px 13px;border-radius:8px;border:1px
 button:hover{background:#f3f4f6}
 .open{background:#ecfdf5;color:#047857;border:1px solid #a7f3d0;padding:5px 11px;border-radius:999px;font-size:12px}
 .closed{background:#fef2f2;color:#b91c1c;border:1px solid #fecaca;padding:5px 11px;border-radius:999px;font-size:12px}
-.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(165px,1fr));gap:10px}
+.warn{background:#fffbeb;color:#92400e;border:1px solid #fde68a;padding:10px 12px;border-radius:8px;font-size:13px;margin-bottom:12px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:10px}
 .card{background:#fff;border:1px solid #e7e9ee;border-left:4px solid #cbd5e1;border-radius:10px;padding:10px 12px}
 .card.near{border-left-color:#16a34a;background:#f0fdf4}
 .tk{font-weight:700;font-size:15px}.pr{float:right;font-weight:600}
@@ -157,6 +147,7 @@ button:hover{background:#f3f4f6}
 <h1>📈 Stock Watch — shared list</h1>
 <div class="meta" id="asof">loading…</div>
 <div class="rule" id="rule"></div>
+<div id="warn"></div>
 <div class="toolbar">
   <span id="status"></span>
   <button onclick="refresh()">Refresh</button>
@@ -164,16 +155,18 @@ button:hover{background:#f3f4f6}
   <span id="msg"></span>
 </div>
 <div class="grid" id="grid"></div>
-<div class="foot">Auto-refreshes every 30s · prices may be ~15 min delayed · "Copy for Excel" copies a table you can paste into a spreadsheet.</div>
+<div class="foot">Data: Finnhub · free tier is delayed ~15 min · auto-refreshes every 30s · "Copy for Excel" copies a table you can paste into a spreadsheet.</div>
 <script>
 let LAST={rows:[]};
-function pctSpan(v){if(v===null)return '<span class="muted">—</span>';var s=(v>=0?"+":"")+v.toFixed(2)+"%";return '<span class="'+(v>=0?'up':'dn')+'">'+s+'</span>';}
-function money(v){return v===null?'<span class="muted">—</span>':'$'+v.toFixed(2);}
+function pctSpan(v){if(v===null||v===undefined)return '<span class="muted">—</span>';var s=(v>=0?"+":"")+v.toFixed(2)+"%";return '<span class="'+(v>=0?'up':'dn')+'">'+s+'</span>';}
+function money(v){return (v===null||v===undefined)?'<span class="muted">—</span>':'$'+v.toFixed(2);}
 async function refresh(){
  try{
   const r=await fetch('/api/quotes',{cache:'no-store'});const d=await r.json();LAST=d;
   document.getElementById('asof').textContent='As of '+d.as_of;
-  document.getElementById('rule').textContent=d.rule?('Highlight rule: '+d.rule):'';
+  document.getElementById('rule').textContent=d.rule?('Note: '+d.rule):'';
+  document.getElementById('warn').innerHTML = d.error==='missing_key'
+    ? '<div class="warn">No data key set yet. Add an environment variable <b>FINNHUB_API_KEY</b> with your free Finnhub key, then reload.</div>' : '';
   document.getElementById('status').innerHTML=d.market_open?'<span class="open">● Market open</span>':'<span class="closed">● Market closed</span>';
   const rows=d.rows.slice().sort((a,b)=>(b.from_low??-99)-(a.from_low??-99));
   document.getElementById('grid').innerHTML=rows.map(card).join('');
@@ -182,17 +175,16 @@ async function refresh(){
 function card(t){
  const cls=t.near?'card near':'card';
  return '<div class="'+cls+'"><span class="tk">'+t.ticker+'</span><span class="pr">'+money(t.price)+'</span>'+
-  '<div class="row">from low: '+pctSpan(t.from_low)+'</div>'+
-  '<div class="row">pre-mkt/last chg: '+pctSpan(t.change)+'</div>'+
-  '<div class="row muted">3-min avg: '+(t.avg3===null?'—':'$'+t.avg3.toFixed(2))+' · '+(t.as_of||'')+'</div></div>';
+  '<div class="row">change: '+pctSpan(t.change)+'</div>'+
+  '<div class="row">from day low: '+pctSpan(t.from_low)+'</div>'+
+  '<div class="row muted">prev close: '+(t.prev_close==null?'—':'$'+t.prev_close.toFixed(2))+' · '+(t.as_of||'')+'</div></div>';
 }
 function copyExcel(){
- const h=["Ticker","Price","% From Low","Prev Close","Change %","3-min Avg","As Of"];
- const lines=[h.join("\\t")].concat(LAST.rows.map(t=>[t.ticker,t.price??"",t.from_low??"",t.prev_close??"",t.change??"",t.avg3??"",t.as_of||""].join("\\t")));
- const text=lines.join("\\n");
- navigator.clipboard.writeText(text).then(()=>{document.getElementById('msg').textContent='Copied! Paste into Excel.';
+ const h=["Ticker","Price","Change %","% From Low","Prev Close","As Of"];
+ const lines=[h.join("\\t")].concat(LAST.rows.map(t=>[t.ticker,t.price??"",t.change??"",t.from_low??"",t.prev_close??"",t.as_of||""].join("\\t")));
+ navigator.clipboard.writeText(lines.join("\\n")).then(()=>{document.getElementById('msg').textContent='Copied! Paste into Excel.';
    setTimeout(()=>document.getElementById('msg').textContent='',3000);})
- .catch(()=>{document.getElementById('msg').textContent='Copy failed — try the Refresh then again.';});
+ .catch(()=>{document.getElementById('msg').textContent='Copy failed — click Refresh, then try again.';});
 }
 refresh();setInterval(refresh,30000);
 </script></body></html>"""
@@ -221,6 +213,8 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
+    if not FINNHUB_KEY:
+        print("WARNING: FINNHUB_API_KEY is not set — the page will prompt you to add it.")
     srv = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     print(f"Stock Watch running on http://localhost:{PORT}  (Ctrl+C to stop)")
     try:
