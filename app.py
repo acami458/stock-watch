@@ -3,32 +3,30 @@
 Stock Watch — Stage 1: Shared Dashboard (web app, Finnhub data)
 ============================================================
 A small website showing live cards for a shared list of stocks:
-current price, % from the day's low, change vs. previous close, plus a
-"Copy for Excel" button.
+current price, change vs. previous close, and % from the day's low,
+plus a "Copy for Excel" button.
 
 Data source: Finnhub (https://finnhub.io). You need a FREE API key.
-Prices on the free tier are delayed ~15 minutes — fine for watching;
-upgrade to a paid real-time plan later if anyone trades off it.
+Free tier is delayed ~15 min and rate-limited, so THIS app fetches all
+prices in the background once a minute and serves every visitor from
+that snapshot — so the page is instant and the rate limit is never hit,
+no matter how many people open the link.
 
-----------------------------------------------------------------
-GET A FREE KEY (2 min):
-  1. Go to finnhub.io -> Sign up (free).
-  2. Copy your API key from the dashboard.
+GET A FREE KEY: finnhub.io -> Sign up -> copy your API key.
 
-RUN LOCALLY (preview on your Mac):
-  Terminal:
-     export FINNHUB_API_KEY=your_key_here
-     python3 app.py
-  then open http://localhost:8765
+RUN LOCALLY:
+    export FINNHUB_API_KEY=your_key_here
+    python3 app.py        ->  http://localhost:8765
 
-DEPLOY (Render): add an Environment Variable named FINNHUB_API_KEY
-  with your key (see DEPLOY_GUIDE.md). Nothing else to change.
-----------------------------------------------------------------
+DEPLOY (Render): add an Environment Variable FINNHUB_API_KEY (see DEPLOY_GUIDE.md).
+============================================================
 """
 
 import json
 import os
+import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
@@ -47,14 +45,15 @@ SHARED_TICKERS = [
     "KO", "LLY", "LMT", "MA", "MAIN", "META", "MSFT", "MU", "NVDA", "PFE",
     "RIO", "SLV", "TSLA", "VZ", "WMT", "ADSK", "AVGO", "SPCX",
 ]
-FINNHUB_KEY = os.environ.get("FINNHUB_API_KEY", "").strip()
-ET          = ZoneInfo("America/New_York")
-PORT        = int(os.environ.get("PORT", "8765"))
-CACHE_TTL   = 30      # seconds; shields the API from many viewers / rate limits
-RISE_PCT    = 0.005   # reference highlight: 0.5% above the day's low
+FINNHUB_KEY     = os.environ.get("FINNHUB_API_KEY", "").strip()
+ET              = ZoneInfo("America/New_York")
+PORT            = int(os.environ.get("PORT", "8765"))
+REFRESH_SECONDS = 60      # background refresh interval (once/min stays under free limit)
+MAX_WORKERS     = 4       # gentle concurrency to avoid bursts
+RISE_PCT        = 0.005   # highlight when >= +0.5% above the day's low
 # ------------------------------------------------------------------
 
-_cache = {"payload": None, "ts": 0.0}
+_cache = {"payload": None}
 
 
 def market_open(dt):
@@ -64,22 +63,31 @@ def market_open(dt):
     return 9 * 60 + 30 <= m < 16 * 60
 
 
-def fh_quote(sym):
-    """Finnhub /quote -> {c:current, h:high, l:low, o:open, pc:prev close, t:epoch}."""
+def fh_quote(sym, retries=3):
+    """Finnhub /quote -> {c,h,l,o,pc,t}. Retries on rate-limit / transient errors."""
     url = f"https://finnhub.io/api/v1/quote?symbol={urllib.parse.quote(sym)}&token={FINNHUB_KEY}"
     req = urllib.request.Request(url, headers={"User-Agent": "stock-watch"})
-    with urllib.request.urlopen(req, timeout=12) as r:
-        return json.loads(r.read().decode())
+    for attempt in range(retries):
+        try:
+            with urllib.request.urlopen(req, timeout=12) as r:
+                return json.loads(r.read().decode())
+        except urllib.error.HTTPError as e:
+            if e.code == 429 and attempt < retries - 1:       # rate limited
+                time.sleep(1.5 * (attempt + 1))
+                continue
+            raise
+        except Exception:
+            if attempt < retries - 1:
+                time.sleep(0.8 * (attempt + 1))
+                continue
+            raise
 
 
 def one_row(t):
     try:
         q = fh_quote(t)
-        c = q.get("c")
-        low = q.get("l")
-        pc = q.get("pc")
-        ts = q.get("t")
-        if not c:                     # 0 or None -> no data for this symbol
+        c, low, pc, ts = q.get("c"), q.get("l"), q.get("pc"), q.get("t")
+        if not c:
             return {"ticker": t, "price": None, "from_low": None,
                     "prev_close": None, "change": None, "as_of": "", "near": False}
         from_low = (c - low) / low * 100 if low else None
@@ -103,7 +111,7 @@ def fetch_quotes():
     if not FINNHUB_KEY:
         return {"as_of": "no API key", "market_open": False, "error": "missing_key",
                 "rule": "", "rows": []}
-    with ThreadPoolExecutor(max_workers=8) as ex:
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
         rows = list(ex.map(one_row, SHARED_TICKERS))
     now = datetime.now(ET)
     return {"as_of": now.strftime("%a %b %d, %H:%M:%S ET"),
@@ -112,13 +120,21 @@ def fetch_quotes():
             "rows": rows}
 
 
+def refresher():
+    """Background loop: refresh the shared snapshot once per REFRESH_SECONDS."""
+    while True:
+        try:
+            _cache["payload"] = fetch_quotes()
+        except Exception:
+            pass
+        time.sleep(REFRESH_SECONDS)
+
+
 def get_payload():
-    if _cache["payload"] and (time.time() - _cache["ts"] < CACHE_TTL):
-        return _cache["payload"]
-    payload = fetch_quotes()
-    _cache["payload"] = payload
-    _cache["ts"] = time.time()
-    return payload
+    if _cache["payload"] is None:
+        return {"as_of": "warming up… reload in a few seconds",
+                "market_open": False, "rule": "", "rows": []}
+    return _cache["payload"]
 
 
 PAGE = """<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
@@ -155,7 +171,7 @@ button:hover{background:#f3f4f6}
   <span id="msg"></span>
 </div>
 <div class="grid" id="grid"></div>
-<div class="foot">Data: Finnhub · free tier is delayed ~15 min · auto-refreshes every 30s · "Copy for Excel" copies a table you can paste into a spreadsheet.</div>
+<div class="foot">Data: Finnhub · free tier delayed ~15 min · updates about once a minute · "Copy for Excel" copies a table you can paste into a spreadsheet.</div>
 <script>
 let LAST={rows:[]};
 function pctSpan(v){if(v===null||v===undefined)return '<span class="muted">—</span>';var s=(v>=0?"+":"")+v.toFixed(2)+"%";return '<span class="'+(v>=0?'up':'dn')+'">'+s+'</span>';}
@@ -215,6 +231,7 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     if not FINNHUB_KEY:
         print("WARNING: FINNHUB_API_KEY is not set — the page will prompt you to add it.")
+    threading.Thread(target=refresher, daemon=True).start()
     srv = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     print(f"Stock Watch running on http://localhost:{PORT}  (Ctrl+C to stop)")
     try:
