@@ -59,8 +59,7 @@ PORT            = int(os.environ.get("PORT", "8765"))
 REFRESH_SECONDS = 60
 MAX_WORKERS     = 4
 RISE_PCT        = 0.005
-MAX_PER_USER    = 60      # cap personal watchlist size
-# ------------------------------------------------------------------
+MAX_PER_USER    = 60
 
 # =========================== DATABASE ===========================
 def _db():
@@ -104,7 +103,7 @@ def create_user(email, pw_hash):
         cur = conn.cursor()
         cur.execute(_ph("SELECT id FROM users WHERE email=%s", kind), (email,))
         if cur.fetchone():
-            return None  # already exists
+            return None
         if kind == "pg":
             cur.execute("INSERT INTO users(email, pw_hash) VALUES(%s,%s) RETURNING id",
                         (email, pw_hash))
@@ -161,7 +160,7 @@ def add_watch(uid, symbol):
                         (uid, symbol))
             conn.commit()
         except Exception:
-            conn.rollback()  # already there
+            conn.rollback()
         return True
     finally:
         conn.close()
@@ -264,9 +263,11 @@ def one_row(t):
     try:
         q = fh_quote(t)
         c, low, pc, ts = q.get("c"), q.get("l"), q.get("pc"), q.get("t")
+        o, hi = q.get("o"), q.get("h")
         if not c:
-            return {"ticker": t, "price": None, "from_low": None,
-                    "prev_close": None, "change": None, "as_of": "", "near": False}
+            return {"ticker": t, "price": None, "from_low": None, "prev_close": None,
+                    "change": None, "open": None, "high": None, "low": None,
+                    "as_of": "", "near": False}
         from_low = (c - low) / low * 100 if low else None
         change = (c - pc) / pc * 100 if pc else None
         as_of = datetime.fromtimestamp(ts, ET).strftime("%H:%M ET") if ts else ""
@@ -274,11 +275,15 @@ def one_row(t):
                 "from_low": None if from_low is None else round(from_low, 2),
                 "prev_close": None if not pc else round(pc, 2),
                 "change": None if change is None else round(change, 2),
+                "open": None if not o else round(o, 2),
+                "high": None if not hi else round(hi, 2),
+                "low": None if not low else round(low, 2),
                 "as_of": as_of,
                 "near": bool(from_low is not None and from_low >= RISE_PCT * 100)}
     except Exception:
-        return {"ticker": t, "price": None, "from_low": None,
-                "prev_close": None, "change": None, "as_of": "err", "near": False}
+        return {"ticker": t, "price": None, "from_low": None, "prev_close": None,
+                "change": None, "open": None, "high": None, "low": None,
+                "as_of": "err", "near": False}
 
 
 def refresh_symbols(syms):
@@ -317,14 +322,30 @@ def rows_for(syms):
         _tracked.update(syms)
         for s in syms:
             out.append(_quotes.get(s) or {"ticker": s, "price": None, "from_low": None,
-                       "prev_close": None, "change": None, "as_of": "", "near": False})
+                       "prev_close": None, "change": None, "open": None, "high": None,
+                       "low": None, "as_of": "", "near": False})
     return out
+
+
+def session_label(dt):
+    if dt.weekday() >= 5:
+        return "Closed (weekend)"
+    m = dt.hour * 60 + dt.minute
+    if 4 * 60 <= m < 9 * 60 + 30:
+        return "Pre-market"
+    if 9 * 60 + 30 <= m < 16 * 60:
+        return "Open"
+    if 16 * 60 <= m < 20 * 60:
+        return "After-hours"
+    return "Closed"
 
 
 def meta():
     now = datetime.now(ET)
     return {"as_of": now.strftime("%a %b %d, %H:%M:%S ET"),
+            "date": now.strftime("%Y-%m-%d"),
             "market_open": market_open(now),
+            "session": session_label(now),
             "rule": f"highlighted when ≥ +{RISE_PCT*100:.1f}% above the day's low",
             "have_key": bool(FINNHUB_KEY)}
 
@@ -392,7 +413,8 @@ function card(t,withX){
  return '<div class="'+cls+'">'+x+'<span class="tk">'+t.ticker+'</span><span class="pr">'+money(t.price)+'</span>'+
   '<div class="row">change: '+pctSpan(t.change)+'</div>'+
   '<div class="row">from day low: '+pctSpan(t.from_low)+'</div>'+
-  '<div class="row muted">prev close: '+(t.prev_close==null?'—':'$'+t.prev_close.toFixed(2))+' · '+(t.as_of||'')+'</div></div>';
+  '<div class="row muted">open: '+(t.open==null?'—':'$'+t.open.toFixed(2))+' · prev: '+(t.prev_close==null?'—':'$'+t.prev_close.toFixed(2))+'</div>'+
+  '<div class="row muted">'+(t.as_of||'')+'</div></div>';
 }
 async function whoami(){ME=await (await fetch('/api/me',{cache:'no-store'})).json();renderAuth();}
 function renderAuth(){
@@ -431,7 +453,8 @@ async function load(){
   document.getElementById('asof').textContent='As of '+d.meta.as_of;
   document.getElementById('rule').textContent='Note: '+d.meta.rule;
   document.getElementById('warn').innerHTML=d.meta.have_key?'':'<div class="warn">No data key set. Add FINNHUB_API_KEY.</div>';
-  document.getElementById('status').innerHTML=d.meta.market_open?'<span class="open">● Market open</span>':'<span class="closed">● Market closed</span>';
+  const ses=d.meta.session||'';const sc=(ses==='Open')?'open':'closed';
+  document.getElementById('status').innerHTML='<span class="'+sc+'">● '+ses+'</span>';
   const sh=d.shared.slice().sort((a,b)=>(b.from_low??-99)-(a.from_low??-99));
   document.getElementById('grid').innerHTML=sh.map(t=>card(t,false)).join('');
   if(ME.logged_in){
@@ -441,9 +464,14 @@ async function load(){
  }catch(e){document.getElementById('asof').textContent='could not load data';}
 }
 function copyExcel(){
- const h=["Ticker","Price","Change %","% From Low","Prev Close","As Of"];
- const lines=[h.join("\\t")].concat(LAST.shared.map(t=>[t.ticker,t.price??"",t.change??"",t.from_low??"",t.prev_close??"",t.as_of||""].join("\\t")));
- navigator.clipboard.writeText(lines.join("\\n")).then(()=>{document.getElementById('msg').style.color='#047857';document.getElementById('msg').textContent='Copied!';setTimeout(()=>document.getElementById('msg').textContent='',2500);});
+ const ses=(LAST.meta&&LAST.meta.session)||'';const date=(LAST.meta&&LAST.meta.date)||'';
+ const h=["List","Ticker","Price","Change %","% From Low","Open","Day Low","Prev Close","Session","Date","As Of"];
+ const rowsOf=(arr,label)=>arr.map(t=>[label,t.ticker,t.price??"",t.change??"",t.from_low??"",t.open??"",t.low??"",t.prev_close??"",ses,date,t.as_of||""].join("\\t"));
+ let all=[];
+ if(ME.logged_in && LAST.mine && LAST.mine.length) all=all.concat(rowsOf(LAST.mine,"Mine"));
+ all=all.concat(rowsOf(LAST.shared,"Shared"));
+ const text=[h.join("\\t")].concat(all).join("\\n");
+ navigator.clipboard.writeText(text).then(()=>{document.getElementById('msg').style.color='#047857';document.getElementById('msg').textContent='Copied '+all.length+' rows!';setTimeout(()=>document.getElementById('msg').textContent='',2500);});
 }
 whoami();load();setInterval(load,30000);
 </script></body></html>"""
