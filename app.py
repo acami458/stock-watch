@@ -2,18 +2,20 @@
 """
 Stock Watch — full app (dashboard + accounts + shared list + email + web push)
 ================================================================================
-Installable home-screen web app with:
+Installable home-screen web app:
 - Shared dashboard (collaborative list), prices from Finnhub.
 - Accounts; personal watchlists; market-session badge; Copy-for-Excel.
 - EMAIL alerts AND PHONE PUSH notifications when one of YOUR stocks rises
   >= 0.5% above the day's low (once per stock per day, market hours).
 
+Files in this folder: app.py, requirements.txt, icon.png  (upload all three).
+
 ENV VARS:
   FINNHUB_API_KEY   - free Finnhub key (prices)
   DATABASE_URL      - Neon Postgres (production; local uses SQLite if unset)
   SECRET_KEY        - long random string (login cookie)
-  # email alerts (optional): SMTP_HOST/PORT/USER/PASS, EMAIL_FROM, SMTP_SSL
-  # push alerts (optional): VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY, VAPID_SUBJECT
+  SMTP_HOST/PORT/USER/PASS, EMAIL_FROM, SMTP_SSL   - email alerts (optional)
+  VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY, VAPID_SUBJECT - push alerts (optional)
   APP_URL           - your site URL (used in alert links)
 
 RUN LOCALLY:
@@ -52,10 +54,12 @@ SEED_TICKERS = [
     "KO", "LLY", "LMT", "MA", "MAIN", "META", "MSFT", "MU", "NVDA", "PFE",
     "RIO", "SLV", "TSLA", "VZ", "WMT", "ADSK", "AVGO", "SPCX",
 ]
+HERE            = os.path.dirname(os.path.abspath(__file__))
 FINNHUB_KEY     = os.environ.get("FINNHUB_API_KEY", "").strip()
 DATABASE_URL    = os.environ.get("DATABASE_URL", "").strip()
 SECRET_KEY      = os.environ.get("SECRET_KEY", "").strip() or base64.b64encode(os.urandom(24)).decode()
-DB_PATH         = os.path.join(os.path.dirname(os.path.abspath(__file__)), "stockwatch.db")
+DB_PATH         = os.path.join(HERE, "stockwatch.db")
+ICON_PATH       = os.path.join(HERE, "icon.png")
 ET              = ZoneInfo("America/New_York")
 PORT            = int(os.environ.get("PORT", "8765"))
 REFRESH_SECONDS = 60
@@ -79,8 +83,9 @@ VAPID_PRIVATE_KEY = os.environ.get("VAPID_PRIVATE_KEY", "").strip()
 VAPID_SUBJECT     = os.environ.get("VAPID_SUBJECT", "").strip() or ("mailto:" + (EMAIL_FROM or "admin@example.com"))
 PUSH_ON = bool(VAPID_PUBLIC_KEY and VAPID_PRIVATE_KEY)
 
-# Blue tile with a white rising chart (512px PNG).
-ICON_B64 = "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"
+# 1x1 transparent PNG fallback if icon.png is missing.
+_FALLBACK_ICON = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==")
 
 # =========================== DATABASE ===========================
 def _db():
@@ -562,7 +567,6 @@ def send_push(sub, title, body):
 
 
 def notify_user(uid, email, row):
-    """Send one alert to a user via every enabled channel. Returns True if any sent."""
     sent = False
     if EMAIL_ON and send_alert_email(email, row):
         sent = True
@@ -644,6 +648,14 @@ self.addEventListener('notificationclick', function(e){
     if(clients.openWindow) return clients.openWindow(e.notification.data||'/');
   }));
 });"""
+
+
+def icon_bytes():
+    try:
+        with open(ICON_PATH, "rb") as f:
+            return f.read()
+    except Exception:
+        return _FALLBACK_ICON
 
 
 # =========================== WEB PAGE ===========================
@@ -771,7 +783,7 @@ async function addShared(){
  if(d.error){document.getElementById('msg').textContent=d.error;}else{document.getElementById('sharedsym').value='';load();}
 }
 async function delShared(s){await fetch('/api/shared',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'remove',symbol:s})});load();}
-function b64ToU8(b){const p='='.repeat((4-b.length%4)%4);const s=(b+p).replace(/-/g,'+').replace(/_/g,'/');const raw=atob(s);const a=new Uint8Array(raw.length);for(let i=0;i<raw.length;i++)a[i]=raw.charCodeAt(i);return a;}
+function b64ToU8(b){b=(b||'').replace(/[^A-Za-z0-9_-]/g,'');const p='='.repeat((4-b.length%4)%4);const s=(b+p).replace(/-/g,'+').replace(/_/g,'/');const raw=atob(s);const a=new Uint8Array(raw.length);for(let i=0;i<raw.length;i++)a[i]=raw.charCodeAt(i);return a;}
 async function enablePush(){
  const m=document.getElementById('msg');m.style.color='#b91c1c';
  if(!('serviceWorker' in navigator)||!('PushManager' in window)){m.textContent='This browser can’t do push. On iPhone, use Safari and Add to Home Screen first.';return;}
@@ -780,6 +792,7 @@ async function enablePush(){
   const perm=await Notification.requestPermission();
   if(perm!=='granted'){m.textContent='Notifications were not allowed.';return;}
   const k=await (await fetch('/api/push/key')).json();
+  if(!k.key){m.textContent='Push key missing on server.';return;}
   const sub=await reg.pushManager.subscribe({userVisibleOnly:true,applicationServerKey:b64ToU8(k.key)});
   await fetch('/api/push/subscribe',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({subscription:sub})});
   m.style.color='#047857';m.textContent='Phone alerts enabled on this device!';
@@ -856,7 +869,7 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path.startswith("/sw.js"):
             self._send(200, SW_JS.encode("utf-8"), "application/javascript")
         elif self.path.startswith("/icon.png") or self.path.startswith("/apple-touch-icon"):
-            self._send(200, base64.b64decode(ICON_B64), "image/png")
+            self._send(200, icon_bytes(), "image/png")
         elif self.path.startswith("/api/push/key"):
             self._json({"key": VAPID_PUBLIC_KEY, "enabled": PUSH_ON})
         elif self.path.startswith("/api/me"):
@@ -957,6 +970,7 @@ def main():
         print("WARNING: FINNHUB_API_KEY not set.")
     print(f"Storage: {'Postgres' if DATABASE_URL else 'local SQLite ('+DB_PATH+')'}")
     print(f"Email alerts: {'ON' if EMAIL_ON else 'OFF'} | Push alerts: {'ON' if PUSH_ON else 'OFF'}")
+    print(f"Icon: {'icon.png found' if os.path.exists(ICON_PATH) else 'using fallback (add icon.png)'}")
     threading.Thread(target=refresher, daemon=True).start()
     srv = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     print(f"Stock Watch running on http://localhost:{PORT}  (Ctrl+C to stop)")
