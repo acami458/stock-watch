@@ -1,2 +1,3 @@
-yfinance>=0.2.40
-pandas>=2.0
+# Needed in production for the Neon Postgres database.
+# (Local preview without DATABASE_URL uses built-in SQLite and ignores this.)
+psycopg[binary]>=3.1
