@@ -1,26 +1,27 @@
 #!/usr/bin/env python3
 """
-Stock Watch — Stage 2: Accounts + per-user watchlists
-============================================================
-A shared stock dashboard PLUS personal accounts: each person signs up,
-logs in, and keeps their own editable watchlist (add/delete stocks) on
-top of the shared list. Prices from Finnhub, refreshed once a minute and
-served from a shared snapshot (rate-limit safe for many viewers).
+Stock Watch — Stages 1-4 (shared dashboard + accounts + sessions + email alerts)
+================================================================================
+- Shared dashboard of a fixed list, prices from Finnhub (refreshed once/min,
+  served from a shared snapshot so it's rate-limit safe for many viewers).
+- Accounts: sign up / log in; each person keeps their own watchlist.
+- Market-session badge (pre-market / open / after-hours / closed), open + day low.
+- Copy-for-Excel of both the personal and shared lists.
+- EMAIL ALERTS: when one of YOUR watchlist stocks rises >= 0.5% above the day's
+  low, you get an email (once per stock per day). Toggle on/off per account.
 
-STORAGE:
-  - Production: set DATABASE_URL to your Neon Postgres connection string.
-  - Local preview: if DATABASE_URL is unset, it uses a local SQLite file
-    (stockwatch.db) so you can test sign-up/login on your Mac first.
-
-REQUIRED ENV VARS (in production):
-  FINNHUB_API_KEY  - your free Finnhub key
-  DATABASE_URL     - your Neon Postgres URL (postgresql://...:...@.../db?sslmode=require)
-  SECRET_KEY       - any long random string (signs the login cookie)
+ENV VARS:
+  FINNHUB_API_KEY  - free Finnhub key (required for prices)
+  DATABASE_URL     - Neon Postgres URL (required in production; local uses SQLite)
+  SECRET_KEY       - long random string (signs login cookie)
+  # Email alerts (optional; if unset, alerts are simply not sent):
+  SMTP_HOST, SMTP_PORT(=587), SMTP_USER, SMTP_PASS, EMAIL_FROM(=SMTP_USER)
+  SMTP_SSL(=false), APP_URL(optional, link shown in the email)
 
 RUN LOCALLY:
   export FINNHUB_API_KEY=your_key
-  python3 app.py        ->  http://localhost:8765
-============================================================
+  python3 app.py     ->  http://localhost:8765
+================================================================================
 """
 
 import base64
@@ -28,6 +29,8 @@ import hashlib
 import hmac
 import json
 import os
+import smtplib
+import ssl
 import threading
 import time
 import urllib.error
@@ -35,6 +38,7 @@ import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
+from email.message import EmailMessage
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -60,6 +64,16 @@ REFRESH_SECONDS = 60
 MAX_WORKERS     = 4
 RISE_PCT        = 0.005
 MAX_PER_USER    = 60
+ALERT_SESSIONS  = {"Pre-market", "Open"}
+
+SMTP_HOST = os.environ.get("SMTP_HOST", "").strip()
+SMTP_PORT = int(os.environ.get("SMTP_PORT", "587") or 587)
+SMTP_USER = os.environ.get("SMTP_USER", "").strip()
+SMTP_PASS = os.environ.get("SMTP_PASS", "").strip()
+SMTP_SSL  = os.environ.get("SMTP_SSL", "false").lower() in ("1", "true", "yes")
+EMAIL_FROM = os.environ.get("EMAIL_FROM", "").strip() or SMTP_USER
+APP_URL   = os.environ.get("APP_URL", "").strip()
+EMAIL_ON  = bool(SMTP_HOST and SMTP_USER and SMTP_PASS)
 
 # =========================== DATABASE ===========================
 def _db():
@@ -82,16 +96,18 @@ def init_db():
             cur.execute("""CREATE TABLE IF NOT EXISTS users(
                 id SERIAL PRIMARY KEY, email TEXT UNIQUE NOT NULL,
                 pw_hash TEXT NOT NULL, created_at TIMESTAMP DEFAULT NOW())""")
-            cur.execute("""CREATE TABLE IF NOT EXISTS watchlist(
-                user_id INTEGER NOT NULL, symbol TEXT NOT NULL,
-                PRIMARY KEY(user_id, symbol))""")
         else:
             cur.execute("""CREATE TABLE IF NOT EXISTS users(
                 id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT UNIQUE NOT NULL,
                 pw_hash TEXT NOT NULL, created_at TEXT DEFAULT CURRENT_TIMESTAMP)""")
-            cur.execute("""CREATE TABLE IF NOT EXISTS watchlist(
-                user_id INTEGER NOT NULL, symbol TEXT NOT NULL,
-                PRIMARY KEY(user_id, symbol))""")
+        cur.execute("""CREATE TABLE IF NOT EXISTS watchlist(
+            user_id INTEGER NOT NULL, symbol TEXT NOT NULL,
+            PRIMARY KEY(user_id, symbol))""")
+        cur.execute("""CREATE TABLE IF NOT EXISTS user_settings(
+            user_id INTEGER PRIMARY KEY, alerts_on INTEGER DEFAULT 1)""")
+        cur.execute("""CREATE TABLE IF NOT EXISTS alerts_sent(
+            user_id INTEGER NOT NULL, symbol TEXT NOT NULL, day TEXT NOT NULL,
+            PRIMARY KEY(user_id, symbol, day))""")
         conn.commit()
     finally:
         conn.close()
@@ -105,8 +121,7 @@ def create_user(email, pw_hash):
         if cur.fetchone():
             return None
         if kind == "pg":
-            cur.execute("INSERT INTO users(email, pw_hash) VALUES(%s,%s) RETURNING id",
-                        (email, pw_hash))
+            cur.execute("INSERT INTO users(email, pw_hash) VALUES(%s,%s) RETURNING id", (email, pw_hash))
             uid = cur.fetchone()[0]
         else:
             cur.execute("INSERT INTO users(email, pw_hash) VALUES(?,?)", (email, pw_hash))
@@ -156,8 +171,7 @@ def add_watch(uid, symbol):
         if cur.fetchone()[0] >= MAX_PER_USER:
             return False
         try:
-            cur.execute(_ph("INSERT INTO watchlist(user_id, symbol) VALUES(%s,%s)", kind),
-                        (uid, symbol))
+            cur.execute(_ph("INSERT INTO watchlist(user_id, symbol) VALUES(%s,%s)", kind), (uid, symbol))
             conn.commit()
         except Exception:
             conn.rollback()
@@ -170,8 +184,7 @@ def remove_watch(uid, symbol):
     conn, kind = _db()
     try:
         cur = conn.cursor()
-        cur.execute(_ph("DELETE FROM watchlist WHERE user_id=%s AND symbol=%s", kind),
-                    (uid, symbol))
+        cur.execute(_ph("DELETE FROM watchlist WHERE user_id=%s AND symbol=%s", kind), (uid, symbol))
         conn.commit()
     finally:
         conn.close()
@@ -183,6 +196,70 @@ def all_user_symbols():
         cur = conn.cursor()
         cur.execute("SELECT DISTINCT symbol FROM watchlist")
         return [r[0] for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+def get_alerts_on(uid):
+    conn, kind = _db()
+    try:
+        cur = conn.cursor()
+        cur.execute(_ph("SELECT alerts_on FROM user_settings WHERE user_id=%s", kind), (uid,))
+        r = cur.fetchone()
+        return True if r is None else bool(r[0])   # default ON
+    finally:
+        conn.close()
+
+
+def set_alerts_on(uid, on):
+    conn, kind = _db()
+    try:
+        cur = conn.cursor()
+        val = 1 if on else 0
+        if kind == "pg":
+            cur.execute("""INSERT INTO user_settings(user_id, alerts_on) VALUES(%s,%s)
+                           ON CONFLICT (user_id) DO UPDATE SET alerts_on=EXCLUDED.alerts_on""", (uid, val))
+        else:
+            cur.execute("INSERT OR REPLACE INTO user_settings(user_id, alerts_on) VALUES(?,?)", (uid, val))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def alert_users():
+    """[(id, email)] for users with alerts enabled (default on)."""
+    conn, kind = _db()
+    try:
+        cur = conn.cursor()
+        cur.execute("""SELECT u.id, u.email FROM users u
+                       LEFT JOIN user_settings s ON u.id=s.user_id
+                       WHERE COALESCE(s.alerts_on, 1)=1""")
+        return cur.fetchall()
+    finally:
+        conn.close()
+
+
+def already_alerted(uid, symbol, day):
+    conn, kind = _db()
+    try:
+        cur = conn.cursor()
+        cur.execute(_ph("SELECT 1 FROM alerts_sent WHERE user_id=%s AND symbol=%s AND day=%s", kind),
+                    (uid, symbol, day))
+        return cur.fetchone() is not None
+    finally:
+        conn.close()
+
+
+def mark_alerted(uid, symbol, day):
+    conn, kind = _db()
+    try:
+        cur = conn.cursor()
+        try:
+            cur.execute(_ph("INSERT INTO alerts_sent(user_id, symbol, day) VALUES(%s,%s,%s)", kind),
+                        (uid, symbol, day))
+            conn.commit()
+        except Exception:
+            conn.rollback()
     finally:
         conn.close()
 
@@ -232,7 +309,6 @@ def clean_symbol(s):
 # =========================== QUOTES ===========================
 _quotes = {}
 _qlock = threading.Lock()
-_tracked = set(SHARED_TICKERS)
 
 
 def market_open(dt):
@@ -240,6 +316,19 @@ def market_open(dt):
         return False
     m = dt.hour * 60 + dt.minute
     return 9 * 60 + 30 <= m < 16 * 60
+
+
+def session_label(dt):
+    if dt.weekday() >= 5:
+        return "Closed (weekend)"
+    m = dt.hour * 60 + dt.minute
+    if 4 * 60 <= m < 9 * 60 + 30:
+        return "Pre-market"
+    if 9 * 60 + 30 <= m < 16 * 60:
+        return "Open"
+    if 16 * 60 <= m < 20 * 60:
+        return "After-hours"
+    return "Closed"
 
 
 def fh_quote(sym, retries=3):
@@ -296,6 +385,69 @@ def refresh_symbols(syms):
             _quotes[s] = row
 
 
+def rows_for(syms):
+    with _qlock:
+        missing = [s for s in syms if s not in _quotes]
+    if missing:
+        refresh_symbols(missing)
+    out = []
+    with _qlock:
+        for s in syms:
+            out.append(_quotes.get(s) or {"ticker": s, "price": None, "from_low": None,
+                       "prev_close": None, "change": None, "open": None, "high": None,
+                       "low": None, "as_of": "", "near": False})
+    return out
+
+
+# =========================== EMAIL ALERTS ===========================
+def send_alert_email(to_email, row):
+    if not EMAIL_ON:
+        return False
+    t = row["ticker"]
+    body = (f"{t} just rose {row['from_low']:.2f}% above today's low.\n\n"
+            f"Price: ${row['price']:.2f}\n"
+            f"Day low: ${row['low']:.2f}\n"
+            f"Change vs prev close: {row['change']:+.2f}%\n"
+            f"As of: {row['as_of']}\n")
+    if APP_URL:
+        body += f"\nOpen the dashboard: {APP_URL}\n"
+    body += "\n(You're getting this because email alerts are on for your Stock Watch account.)"
+    try:
+        msg = EmailMessage()
+        msg["Subject"] = f"📈 {t} alert — +{row['from_low']:.2f}% from the day's low"
+        msg["From"] = EMAIL_FROM
+        msg["To"] = to_email
+        msg.set_content(body)
+        ctx = ssl.create_default_context()
+        if SMTP_SSL:
+            with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, context=ctx, timeout=15) as s:
+                s.login(SMTP_USER, SMTP_PASS); s.send_message(msg)
+        else:
+            with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as s:
+                s.starttls(context=ctx); s.login(SMTP_USER, SMTP_PASS); s.send_message(msg)
+        return True
+    except Exception as e:
+        print(f"  (alert email failed: {e})", flush=True)
+        return False
+
+
+def alert_check():
+    if not EMAIL_ON:
+        return
+    now = datetime.now(ET)
+    if session_label(now) not in ALERT_SESSIONS:
+        return
+    day = now.strftime("%Y-%m-%d")
+    for uid, email in alert_users():
+        for s in get_watchlist(uid):
+            with _qlock:
+                row = _quotes.get(s)
+            if row and row.get("near") and row.get("price") is not None:
+                if not already_alerted(uid, s, day):
+                    if send_alert_email(email, row):
+                        mark_alerted(uid, s, day)
+
+
 def refresher():
     while True:
         try:
@@ -304,40 +456,14 @@ def refresher():
                 syms |= set(all_user_symbols())
             except Exception:
                 pass
-            with _qlock:
-                _tracked.update(syms)
             refresh_symbols(sorted(syms))
+            try:
+                alert_check()
+            except Exception as e:
+                print(f"  (alert_check error: {e})", flush=True)
         except Exception:
             pass
         time.sleep(REFRESH_SECONDS)
-
-
-def rows_for(syms):
-    with _qlock:
-        missing = [s for s in syms if s not in _quotes]
-    if missing:
-        refresh_symbols(missing)
-    out = []
-    with _qlock:
-        _tracked.update(syms)
-        for s in syms:
-            out.append(_quotes.get(s) or {"ticker": s, "price": None, "from_low": None,
-                       "prev_close": None, "change": None, "open": None, "high": None,
-                       "low": None, "as_of": "", "near": False})
-    return out
-
-
-def session_label(dt):
-    if dt.weekday() >= 5:
-        return "Closed (weekend)"
-    m = dt.hour * 60 + dt.minute
-    if 4 * 60 <= m < 9 * 60 + 30:
-        return "Pre-market"
-    if 9 * 60 + 30 <= m < 16 * 60:
-        return "Open"
-    if 16 * 60 <= m < 20 * 60:
-        return "After-hours"
-    return "Closed"
 
 
 def meta():
@@ -347,7 +473,8 @@ def meta():
             "market_open": market_open(now),
             "session": session_label(now),
             "rule": f"highlighted when ≥ +{RISE_PCT*100:.1f}% above the day's low",
-            "have_key": bool(FINNHUB_KEY)}
+            "have_key": bool(FINNHUB_KEY),
+            "email_on": EMAIL_ON}
 
 
 # =========================== WEB PAGE ===========================
@@ -374,7 +501,7 @@ input{font:inherit;font-size:13px;padding:7px 10px;border:1px solid #d1d5db;bord
 .muted{color:#9ca3af}.foot{color:#9ca3af;font-size:11px;margin-top:18px}
 .x{position:absolute;top:6px;right:8px;cursor:pointer;color:#9ca3af;font-size:14px;border:none;background:none;padding:2px 5px}
 .x:hover{color:#dc2626}#msg,#authmsg{font-size:12px;color:#b91c1c}
-.who{font-size:12px;color:#374151}
+.who{font-size:12px;color:#374151;display:flex;gap:10px;align-items:center;flex-wrap:wrap}
 </style></head><body>
 <h1>📈 Stock Watch</h1>
 <div class="meta" id="asof">loading…</div>
@@ -402,7 +529,7 @@ input{font:inherit;font-size:13px;padding:7px 10px;border:1px solid #d1d5db;bord
 <h2>👥 Shared List</h2>
 <div class="grid" id="grid"></div>
 
-<div class="foot">Data: Finnhub · free tier delayed ~15 min · updates ~once a minute · "Copy for Excel" copies the shared list.</div>
+<div class="foot">Data: Finnhub · free tier delayed ~15 min · updates ~once a minute · Email alerts fire when one of YOUR stocks rises ≥0.5% above the day's low (once per stock per day, market hours).</div>
 <script>
 let LAST={shared:[],mine:[]}, ME={logged_in:false};
 function pctSpan(v){if(v===null||v===undefined)return '<span class="muted">—</span>';var s=(v>=0?"+":"")+v.toFixed(2)+"%";return '<span class="'+(v>=0?'up':'dn')+'">'+s+'</span>';}
@@ -420,11 +547,14 @@ async function whoami(){ME=await (await fetch('/api/me',{cache:'no-store'})).jso
 function renderAuth(){
  const b=document.getElementById('authbox');
  if(ME.logged_in){
-   b.innerHTML='<div class="who">Signed in as <b>'+ME.email+'</b> · <a href="#" onclick="logout();return false">Log out</a></div>';
+   const al=ME.alerts_on?'checked':'';
+   const note=ME.email_on?'':' <span class="muted">(email alerts not set up by site owner)</span>';
+   b.innerHTML='<div class="who">Signed in as <b>'+ME.email+'</b> · <a href="#" onclick="logout();return false">Log out</a>'+
+     ' · <label><input type="checkbox" id="altog" '+al+' onchange="toggleAlerts()"> Email me alerts</label>'+note+'</div>';
    document.getElementById('mywrap').style.display='block';
  }else{
    document.getElementById('mywrap').style.display='none';
-   b.innerHTML='<div class="card-auth"><b>Sign in</b> to keep your own watchlist'+
+   b.innerHTML='<div class="card-auth"><b>Sign in</b> to keep your own watchlist & get alerts'+
      '<div class="bar" style="margin-top:8px"><input id="em" placeholder="email" style="flex:1"></div>'+
      '<div class="bar"><input id="pw" type="password" placeholder="password" style="flex:1"></div>'+
      '<div class="bar"><button class="primary" onclick="auth(\\'login\\')">Log in</button>'+
@@ -439,6 +569,11 @@ async function auth(kind){
  if(d.ok){await whoami();load();}else{document.getElementById('authmsg').textContent=d.error||'Something went wrong';}
 }
 async function logout(){await fetch('/api/logout',{method:'POST'});ME={logged_in:false};renderAuth();load();}
+async function toggleAlerts(){
+ const on=document.getElementById('altog').checked;
+ await fetch('/api/alerts',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({on})});
+ ME.alerts_on=on;
+}
 async function addSym(){
  const v=document.getElementById('addsym').value.trim();if(!v)return;
  const r=await fetch('/api/watch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'add',symbol:v})});
@@ -514,7 +649,11 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, PAGE.encode("utf-8"), "text/html; charset=utf-8")
         elif self.path.startswith("/api/me"):
             uid = self._uid()
-            self._json({"logged_in": bool(uid), "email": get_email(uid) if uid else None})
+            if uid:
+                self._json({"logged_in": True, "email": get_email(uid),
+                            "alerts_on": get_alerts_on(uid), "email_on": EMAIL_ON})
+            else:
+                self._json({"logged_in": False, "email_on": EMAIL_ON})
         elif self.path.startswith("/api/quotes"):
             uid = self._uid()
             out = {"meta": meta(), "shared": rows_for(SHARED_TICKERS), "mine": []}
@@ -546,6 +685,12 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"ok": True}, extra=[("Set-Cookie", cookie)])
         elif self.path.startswith("/api/logout"):
             return self._json({"ok": True}, extra=[("Set-Cookie", "session=; Path=/; Max-Age=0")])
+        elif self.path.startswith("/api/alerts"):
+            uid = self._uid()
+            if not uid:
+                return self._json({"error": "Please log in first."})
+            set_alerts_on(uid, bool(body.get("on")))
+            return self._json({"ok": True})
         elif self.path.startswith("/api/watch"):
             uid = self._uid()
             if not uid:
@@ -566,7 +711,8 @@ def main():
     init_db()
     if not FINNHUB_KEY:
         print("WARNING: FINNHUB_API_KEY not set.")
-    print(f"Storage: {'Postgres (DATABASE_URL)' if DATABASE_URL else 'local SQLite ('+DB_PATH+')'}")
+    print(f"Storage: {'Postgres' if DATABASE_URL else 'local SQLite ('+DB_PATH+')'}")
+    print(f"Email alerts: {'ON' if EMAIL_ON else 'OFF (set SMTP_* env vars to enable)'}")
     threading.Thread(target=refresher, daemon=True).start()
     srv = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     print(f"Stock Watch running on http://localhost:{PORT}  (Ctrl+C to stop)")
