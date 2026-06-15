@@ -1,19 +1,9 @@
 #!/usr/bin/env python3
 """
 Stock Watch — full app (dashboard + accounts + shared list + email + push + detail view)
-========================================================================================
-Installable home-screen web app. Tap any stock to see full stats and a chart of
-today's movement (built from the app's own minute-by-minute samples).
-
-Files in this folder: app.py, requirements.txt, icon.png  (upload all three).
-
-ENV VARS:
-  FINNHUB_API_KEY, DATABASE_URL, SECRET_KEY,
-  SMTP_HOST/PORT/USER/PASS, EMAIL_FROM, SMTP_SSL  (email, optional),
-  VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY, VAPID_SUBJECT (push, optional), APP_URL
-
-RUN LOCALLY:  export FINNHUB_API_KEY=your_key ; python3 app.py  -> http://localhost:8765
-========================================================================================
+Two Copy buttons: pre-market list and intraday list.
+ENV: FINNHUB_API_KEY, DATABASE_URL, SECRET_KEY, SMTP_* (email), VAPID_* (push), APP_URL
+RUN: export FINNHUB_API_KEY=your_key ; python3 app.py  -> http://localhost:8765
 """
 
 import base64
@@ -416,7 +406,7 @@ def clean_symbol(s):
 # =========================== QUOTES + HISTORY ===========================
 _quotes = {}
 _qlock = threading.Lock()
-_hist = {}                       # symbol -> [[ "HH:MM", price ], ...] for today
+_hist = {}
 _hist_lock = threading.Lock()
 _hist_state = {"day": None}
 HIST_MAX = 480
@@ -727,7 +717,8 @@ input{font:inherit;font-size:13px;padding:7px 10px;border:1px solid #d1d5db;bord
 <div class="bar">
   <span id="status"></span>
   <button onclick="load()">Refresh</button>
-  <button onclick="copyExcel()">Copy for Excel</button>
+  <button onclick="copyList('pre')">Copy pre-market</button>
+  <button onclick="copyList('intra')">Copy intraday</button>
   <button id="pushbtn" style="display:none" onclick="enablePush()">🔔 Enable phone alerts</button>
   <span id="msg"></span>
 </div>
@@ -875,15 +866,16 @@ async function load(){
   }
  }catch(e){document.getElementById('asof').textContent='could not load data';}
 }
-function copyExcel(){
- const ses=(LAST.meta&&LAST.meta.session)||'';const date=(LAST.meta&&LAST.meta.date)||'';
- const h=["List","Ticker","Price","Change %","% From Low","Open","Day Low","Prev Close","Session","Date","As Of"];
- const rowsOf=(arr,label)=>arr.map(t=>[label,t.ticker,t.price??"",t.change??"",t.from_low??"",t.open??"",t.low??"",t.prev_close??"",ses,date,t.as_of||""].join("\\t"));
+function copyList(kind){
+ const date=(LAST.meta&&LAST.meta.date)||'';
+ const priceHdr=(kind==='pre')?'Pre-Market Price':'Intraday Price';
+ const h=["Date","Ticker","Prev Close",priceHdr];
+ const rowsOf=(arr)=>arr.map(t=>[date,t.ticker,t.prev_close??"",t.price??""].join("\\t"));
  let all=[];
- if(ME.logged_in && LAST.mine && LAST.mine.length) all=all.concat(rowsOf(LAST.mine,"Mine"));
- all=all.concat(rowsOf(LAST.shared,"Shared"));
+ if(ME.logged_in && LAST.mine && LAST.mine.length) all=all.concat(rowsOf(LAST.mine));
+ all=all.concat(rowsOf(LAST.shared));
  const text=[h.join("\\t")].concat(all).join("\\n");
- navigator.clipboard.writeText(text).then(()=>{document.getElementById('msg').style.color='#047857';document.getElementById('msg').textContent='Copied '+all.length+' rows!';setTimeout(()=>document.getElementById('msg').textContent='',2500);});
+ navigator.clipboard.writeText(text).then(()=>{document.getElementById('msg').style.color='#047857';document.getElementById('msg').textContent='Copied '+(kind==='pre'?'pre-market':'intraday')+' list ('+all.length+' rows)!';setTimeout(()=>document.getElementById('msg').textContent='',2600);});
 }
 if('serviceWorker' in navigator){navigator.serviceWorker.register('/sw.js').catch(function(){});}
 whoami();load();setInterval(load,30000);
