@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Stock Watch — full app. Layout: add boxes on top, bold card text, Alerts section,
-blinking + sound for your own watchlist alerts.
+Stock Watch — full app. Layout: add boxes on top, bold card + footer text,
+Alerts section, blinking + sound for your own watchlist alerts.
 ENV: FINNHUB_API_KEY, DATABASE_URL, SECRET_KEY, SMTP_* (email), VAPID_* (push), APP_URL
 RUN: export FINNHUB_API_KEY=your_key ; python3 app.py  -> http://localhost:8765
 """
@@ -704,7 +704,7 @@ input{font:inherit;font-size:13px;padding:7px 10px;border:1px solid #d1d5db;bord
 .row{font-size:12px;color:#16181d;margin-top:3px;font-weight:600}
 .card .muted{color:#1f2430;font-weight:700}
 .up{color:#16a34a;font-weight:700}.dn{color:#dc2626;font-weight:700}
-.muted{color:#9ca3af}.foot{color:#6b7280;font-size:11px;margin-top:18px}
+.muted{color:#9ca3af}.foot{color:#16181d;font-weight:600;font-size:12px;margin-top:18px}
 .x{position:absolute;top:6px;right:8px;cursor:pointer;color:#9ca3af;font-size:14px;border:none;background:none;padding:2px 5px}
 .x:hover{color:#dc2626}#msg,#authmsg{font-size:12px;color:#b91c1c}
 .who{font-size:12px;color:#374151;display:flex;gap:10px;align-items:center;flex-wrap:wrap}
@@ -713,7 +713,7 @@ input{font:inherit;font-size:13px;padding:7px 10px;border:1px solid #d1d5db;bord
 .stat{display:flex;justify-content:space-between;font-size:13px;padding:5px 0;border-bottom:1px solid #f1f1f1}
 @keyframes blink{0%,100%{background:#dcfce7;border-color:#16a34a}50%{background:#fff7ed;border-color:#f59e0b}}
 .card.alerting{animation:blink 1.1s ease-in-out infinite}
-.alerts-empty{font-size:13px;color:#374151}
+.alerts-empty{font-size:13px;color:#16181d;font-weight:600}
 </style></head><body>
 <h1>📈 Stock Watch</h1>
 <div class="meta" id="asof">loading…</div>
@@ -867,7 +867,6 @@ function renderAlerts(){
  if(!ME.logged_in){box.innerHTML='<div class="alerts-empty">Sign in and add stocks to <b>My Watchlist</b> to get alerts here.</div>';return;}
  if(!mine.length){box.innerHTML='<div class="alerts-empty">Add stocks to <b>My Watchlist</b> below — alerts for them show here.</div>';return;}
  box.innerHTML=alerting.length?alerting.map(t=>card(t,false,false,true)).join(''):'<div class="alerts-empty">No alerts right now. A stock appears here when it climbs 0.5%+ from today\\'s low.</div>';
- // sound on NEW alert
  const sndOn=document.getElementById('sndtog')&&document.getElementById('sndtog').checked;
  let isNew=false;alerting.forEach(function(t){if(!prevAlerts.has(t.ticker))isNew=true;});
  if(isNew && sndOn && !firstLoad) beep();
