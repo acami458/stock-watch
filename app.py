@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Stock Watch — full app. Layout: add boxes on top, bold card + footer text,
-Alerts section, blinking + sound for your own watchlist alerts.
+Stock Watch — single-list version. One "My Watchlist" per account (no shared list,
+no separate Alerts tab). Alerting cards blink + play a sound right in the list.
 ENV: FINNHUB_API_KEY, DATABASE_URL, SECRET_KEY, SMTP_* (email), VAPID_* (push), APP_URL
 RUN: export FINNHUB_API_KEY=your_key ; python3 app.py  -> http://localhost:8765
 """
@@ -30,12 +30,6 @@ except ImportError:
     raise SystemExit("Python 3.9+ required.")
 
 # ----------------------------- CONFIG -----------------------------
-SEED_TICKERS = [
-    "AAPL", "ADI", "ADMA", "AMZN", "BABA", "CBRL", "CL", "COPX", "CUBE", "CVX",
-    "DE", "FUTU", "GE", "GEV", "GLD", "GOOG", "IEP", "INTU", "JNJ", "JPM",
-    "KO", "LLY", "LMT", "MA", "MAIN", "META", "MSFT", "MU", "NVDA", "PFE",
-    "RIO", "SLV", "TSLA", "VZ", "WMT", "ADSK", "AVGO", "SPCX",
-]
 HERE            = os.path.dirname(os.path.abspath(__file__))
 FINNHUB_KEY     = os.environ.get("FINNHUB_API_KEY", "").strip()
 DATABASE_URL    = os.environ.get("DATABASE_URL", "").strip()
@@ -47,8 +41,7 @@ PORT            = int(os.environ.get("PORT", "8765"))
 REFRESH_SECONDS = 60
 MAX_WORKERS     = 4
 RISE_PCT        = 0.005
-MAX_PER_USER    = 60
-MAX_SHARED      = 100
+MAX_PER_USER    = 80
 ALERT_SESSIONS  = {"Pre-market", "Open"}
 APP_URL         = os.environ.get("APP_URL", "").strip()
 
@@ -100,73 +93,8 @@ def init_db():
         cur.execute("""CREATE TABLE IF NOT EXISTS alerts_sent(
             user_id INTEGER NOT NULL, symbol TEXT NOT NULL, day TEXT NOT NULL,
             PRIMARY KEY(user_id, symbol, day))""")
-        cur.execute("""CREATE TABLE IF NOT EXISTS shared_list(
-            symbol TEXT PRIMARY KEY, sort_order INTEGER DEFAULT 0, added_by TEXT)""")
         cur.execute("""CREATE TABLE IF NOT EXISTS push_subs(
             endpoint TEXT PRIMARY KEY, user_id INTEGER NOT NULL, sub TEXT NOT NULL)""")
-        conn.commit()
-        try:
-            if kind == "pg":
-                cur.execute("ALTER TABLE shared_list ADD COLUMN IF NOT EXISTS added_by TEXT")
-            else:
-                cur.execute("ALTER TABLE shared_list ADD COLUMN added_by TEXT")
-            conn.commit()
-        except Exception:
-            conn.rollback()
-        cur.execute("SELECT COUNT(*) FROM shared_list")
-        if cur.fetchone()[0] == 0:
-            for i, s in enumerate(SEED_TICKERS):
-                cur.execute(_ph("INSERT INTO shared_list(symbol, sort_order) VALUES(%s,%s)", kind), (s, i))
-            conn.commit()
-    finally:
-        conn.close()
-
-
-def get_shared_list():
-    conn, kind = _db()
-    try:
-        cur = conn.cursor()
-        cur.execute("SELECT symbol FROM shared_list ORDER BY sort_order, symbol")
-        return [r[0] for r in cur.fetchall()]
-    finally:
-        conn.close()
-
-
-def get_shared_added():
-    conn, kind = _db()
-    try:
-        cur = conn.cursor()
-        cur.execute("SELECT symbol, added_by FROM shared_list")
-        return {r[0]: r[1] for r in cur.fetchall()}
-    finally:
-        conn.close()
-
-
-def add_shared(symbol, added_by=None):
-    conn, kind = _db()
-    try:
-        cur = conn.cursor()
-        cur.execute("SELECT COUNT(*) FROM shared_list")
-        if cur.fetchone()[0] >= MAX_SHARED:
-            return False
-        cur.execute("SELECT COALESCE(MAX(sort_order),0)+1 FROM shared_list")
-        nxt = cur.fetchone()[0]
-        try:
-            cur.execute(_ph("INSERT INTO shared_list(symbol, sort_order, added_by) VALUES(%s,%s,%s)", kind),
-                        (symbol, nxt, added_by))
-            conn.commit()
-        except Exception:
-            conn.rollback()
-        return True
-    finally:
-        conn.close()
-
-
-def remove_shared(symbol):
-    conn, kind = _db()
-    try:
-        cur = conn.cursor()
-        cur.execute(_ph("DELETE FROM shared_list WHERE symbol=%s", kind), (symbol,))
         conn.commit()
     finally:
         conn.close()
@@ -614,9 +542,8 @@ def alert_check():
 def refresher():
     while True:
         try:
-            syms = set(SEED_TICKERS)
+            syms = set()
             try:
-                syms |= set(get_shared_list())
                 syms |= set(all_user_symbols())
             except Exception:
                 pass
@@ -641,7 +568,7 @@ def meta():
             "market_open": market_open(now),
             "session": session_label(now),
             "rule": f"Stocks turning green have climbed {RISE_PCT*100:.1f}%+ from their lowest price today. "
-                    f"You'll get an alert when one of your own stocks does this.",
+                    f"You'll get an alert when one of your stocks does this.",
             "have_key": bool(FINNHUB_KEY),
             "email_on": EMAIL_ON, "push_on": PUSH_ON}
 
@@ -713,7 +640,7 @@ input{font:inherit;font-size:13px;padding:7px 10px;border:1px solid #d1d5db;bord
 .stat{display:flex;justify-content:space-between;font-size:13px;padding:5px 0;border-bottom:1px solid #f1f1f1}
 @keyframes blink{0%,100%{background:#dcfce7;border-color:#16a34a}50%{background:#fff7ed;border-color:#f59e0b}}
 .card.alerting{animation:blink 1.1s ease-in-out infinite}
-.alerts-empty{font-size:13px;color:#16181d;font-weight:600}
+.empty{font-size:14px;color:#16181d;font-weight:600;margin-top:8px}
 </style></head><body>
 <h1>📈 Stock Watch</h1>
 <div class="meta" id="asof">loading…</div>
@@ -730,22 +657,14 @@ input{font:inherit;font-size:13px;padding:7px 10px;border:1px solid #d1d5db;bord
   <span id="msg"></span>
 </div>
 <div id="addbar" class="bar" style="display:none">
-  <input id="addsym" placeholder="Add to my list (e.g. NFLX)" maxlength="10" onkeydown="if(event.key==='Enter')addSym()">
+  <input id="addsym" placeholder="Add a stock (e.g. NFLX)" maxlength="10" onkeydown="if(event.key==='Enter')addSym()">
   <button class="primary" onclick="addSym()">Add</button>
-  <input id="sharedsym" placeholder="Add to shared list" maxlength="10" onkeydown="if(event.key==='Enter')addShared()">
-  <button onclick="addShared()">Add to shared</button>
 </div>
 
-<h2>🔔 Alerts</h2>
-<div class="grid" id="alerts"></div>
+<h2>⭐ My Watchlist</h2>
+<div class="grid" id="mygrid"></div>
+<div id="signedout" class="empty" style="display:none">Sign in above to build your watchlist.</div>
 
-<div id="mywrap" style="display:none">
-  <h2>⭐ My Watchlist</h2>
-  <div class="grid" id="mygrid"></div>
-</div>
-
-<h2>👥 Shared List</h2>
-<div class="grid" id="grid"></div>
 <div class="foot">Green cards have bounced up from today's low. Tap any stock for details & today's chart. Data: Finnhub, ~15 min delayed on the free tier.</div>
 
 <div id="overlay" onclick="if(event.target===this)closeDetail()">
@@ -759,24 +678,20 @@ input{font:inherit;font-size:13px;padding:7px 10px;border:1px solid #d1d5db;bord
   </div>
 </div>
 <script>
-let LAST={shared:[],mine:[]}, ME={logged_in:false}, _chart=null, prevAlerts=new Set(), firstLoad=true;
+let LAST={mine:[]}, ME={logged_in:false}, _chart=null, prevAlerts=new Set(), firstLoad=true;
 function pctSpan(v){if(v===null||v===undefined)return '<span class="muted">—</span>';var s=(v>=0?"+":"")+v.toFixed(2)+"%";return '<span class="'+(v>=0?'up':'dn')+'">'+s+'</span>';}
 function money(v){return (v===null||v===undefined)?'<span class="muted">—</span>':'$'+v.toFixed(2);}
 function beep(){try{var a=new (window.AudioContext||window.webkitAudioContext)();var o=a.createOscillator(),g=a.createGain();o.connect(g);g.connect(a.destination);o.type='sine';o.frequency.value=880;g.gain.setValueAtTime(0.0001,a.currentTime);g.gain.exponentialRampToValueAtTime(0.12,a.currentTime+0.02);g.gain.exponentialRampToValueAtTime(0.0001,a.currentTime+0.5);o.start();o.stop(a.currentTime+0.52);}catch(e){}}
-function card(t,removable,shared,alerting){
- let cls='card';if(t.near)cls+=' near';if(alerting)cls+=' alerting';
- const fn=shared?'delShared':'delSym';
- let tip='Remove from my list';
- if(shared){tip=t.added_by?('Added by '+t.added_by+' — remove from shared'):'Original list — remove from shared';}
- const x=removable?'<button class="x" title="'+tip+'" onclick="event.stopPropagation();'+fn+'(\\''+t.ticker+'\\')">✕</button>':'';
- const by=(shared&&t.added_by)?'<div class="row muted">added by '+t.added_by+'</div>':'';
+function card(t){
+ let cls='card';if(t.near)cls+=' near alerting';
+ const x='<button class="x" title="Remove" onclick="event.stopPropagation();delSym(\\''+t.ticker+'\\')">✕</button>';
  return '<div class="'+cls+'" onclick="openDetail(\\''+t.ticker+'\\')">'+x+'<span class="tk">'+t.ticker+'</span><span class="pr">'+money(t.price)+'</span>'+
   '<div class="row">change: '+pctSpan(t.change)+'</div>'+
   '<div class="row">from day low: '+pctSpan(t.from_low)+'</div>'+
   '<div class="row muted">open: '+(t.open==null?'—':'$'+t.open.toFixed(2))+' · prev: '+(t.prev_close==null?'—':'$'+t.prev_close.toFixed(2))+'</div>'+
-  '<div class="row muted">'+(t.as_of||'')+'</div>'+by+'</div>';
+  '<div class="row muted">'+(t.as_of||'')+'</div></div>';
 }
-function findRow(tk){return (LAST.shared||[]).concat(LAST.mine||[]).find(function(r){return r.ticker===tk;});}
+function findRow(tk){return (LAST.mine||[]).find(function(r){return r.ticker===tk;});}
 async function openDetail(tk){
  const t=findRow(tk)||{ticker:tk};
  document.getElementById('overlay').style.display='flex';
@@ -814,10 +729,8 @@ function renderAuth(){
    const note=(ME.email_on||ME.push_on)?'':' <span class="muted">(alerts not set up by site owner)</span>';
    b.innerHTML='<div class="who">Signed in as <b>'+ME.email+'</b> · <a href="#" onclick="logout();return false">Log out</a>'+
      ' · <label><input type="checkbox" id="altog" '+al+' onchange="toggleAlerts()"> Send me alerts</label>'+note+'</div>';
-   document.getElementById('mywrap').style.display='block';
  }else{
-   document.getElementById('mywrap').style.display='none';
-   b.innerHTML='<div class="card-auth"><b>Sign in</b> to edit lists & get alerts'+
+   b.innerHTML='<div class="card-auth"><b>Sign in</b> to build your watchlist & get alerts'+
      '<div class="bar" style="margin-top:8px"><input id="em" placeholder="email" style="flex:1"></div>'+
      '<div class="bar"><input id="pw" type="password" placeholder="password" style="flex:1"></div>'+
      '<div class="bar"><button class="primary" onclick="auth(\\'login\\')">Log in</button>'+
@@ -839,12 +752,6 @@ async function addSym(){
  if(d.error){document.getElementById('msg').textContent=d.error;}else{document.getElementById('addsym').value='';load();}
 }
 async function delSym(s){await fetch('/api/watch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'remove',symbol:s})});load();}
-async function addShared(){
- const v=document.getElementById('sharedsym').value.trim();if(!v)return;
- const d=await (await fetch('/api/shared',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'add',symbol:v})})).json();
- if(d.error){document.getElementById('msg').textContent=d.error;}else{document.getElementById('sharedsym').value='';load();}
-}
-async function delShared(s){await fetch('/api/shared',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'remove',symbol:s})});load();}
 function b64ToU8(b){b=(b||'').replace(/[^A-Za-z0-9_-]/g,'');const p='='.repeat((4-b.length%4)%4);const s=(b+p).replace(/-/g,'+').replace(/_/g,'/');const raw=atob(s);const a=new Uint8Array(raw.length);for(let i=0;i<raw.length;i++)a[i]=raw.charCodeAt(i);return a;}
 async function enablePush(){
  const m=document.getElementById('msg');m.style.color='#b91c1c';
@@ -860,18 +767,6 @@ async function enablePush(){
   m.style.color='#047857';m.textContent='Phone alerts enabled on this device!';
  }catch(e){m.textContent='Could not enable alerts: '+(e.message||e);}
 }
-function renderAlerts(){
- const mine=(LAST.mine||[]);
- const alerting=mine.filter(function(t){return t.near && t.price!=null;}).sort((a,b)=>(b.from_low??-99)-(a.from_low??-99));
- const box=document.getElementById('alerts');
- if(!ME.logged_in){box.innerHTML='<div class="alerts-empty">Sign in and add stocks to <b>My Watchlist</b> to get alerts here.</div>';return;}
- if(!mine.length){box.innerHTML='<div class="alerts-empty">Add stocks to <b>My Watchlist</b> below — alerts for them show here.</div>';return;}
- box.innerHTML=alerting.length?alerting.map(t=>card(t,false,false,true)).join(''):'<div class="alerts-empty">No alerts right now. A stock appears here when it climbs 0.5%+ from today\\'s low.</div>';
- const sndOn=document.getElementById('sndtog')&&document.getElementById('sndtog').checked;
- let isNew=false;alerting.forEach(function(t){if(!prevAlerts.has(t.ticker))isNew=true;});
- if(isNew && sndOn && !firstLoad) beep();
- prevAlerts=new Set(alerting.map(function(t){return t.ticker;}));
-}
 async function load(){
  try{
   const d=await (await fetch('/api/quotes',{cache:'no-store'})).json();LAST=d;
@@ -880,13 +775,19 @@ async function load(){
   document.getElementById('warn').innerHTML=d.meta.have_key?'':'<div class="warn">No data key set. Add FINNHUB_API_KEY.</div>';
   const ses=d.meta.session||'';const sc=(ses==='Open')?'open':'closed';
   document.getElementById('status').innerHTML='<span class="'+sc+'">● '+ses+'</span>';
-  const sh=d.shared.slice().sort((a,b)=>(b.from_low??-99)-(a.from_low??-99));
-  document.getElementById('grid').innerHTML=sh.map(t=>card(t,ME.logged_in,true,false)).join('');
+  document.getElementById('signedout').style.display=ME.logged_in?'none':'block';
+  const grid=document.getElementById('mygrid');
   if(ME.logged_in){
     const mine=(d.mine||[]).slice().sort((a,b)=>(b.from_low??-99)-(a.from_low??-99));
-    document.getElementById('mygrid').innerHTML=mine.length?mine.map(t=>card(t,true,false,t.near)).join(''):'<div class="muted" style="font-size:13px">No stocks yet — add one in the box at the top.</div>';
+    grid.innerHTML=mine.length?mine.map(card).join(''):'<div class="empty">No stocks yet — add one in the box above.</div>';
+    const alerting=mine.filter(t=>t.near && t.price!=null);
+    const sndOn=document.getElementById('sndtog')&&document.getElementById('sndtog').checked;
+    let isNew=false;alerting.forEach(t=>{if(!prevAlerts.has(t.ticker))isNew=true;});
+    if(isNew && sndOn && !firstLoad) beep();
+    prevAlerts=new Set(alerting.map(t=>t.ticker));
+  }else{
+    grid.innerHTML='';
   }
-  renderAlerts();
   firstLoad=false;
  }catch(e){document.getElementById('asof').textContent='could not load data';}
 }
@@ -895,9 +796,7 @@ function copyList(kind){
  const priceHdr=(kind==='pre')?'Pre-Market Price':'Intraday Price';
  const h=["Date","Ticker","Prev Close",priceHdr];
  const rowsOf=(arr)=>arr.map(t=>[date,t.ticker,t.prev_close??"",t.price??""].join("\\t"));
- let all=[];
- if(ME.logged_in && LAST.mine && LAST.mine.length) all=all.concat(rowsOf(LAST.mine));
- all=all.concat(rowsOf(LAST.shared));
+ const all=rowsOf(LAST.mine||[]);
  const text=[h.join("\\t")].concat(all).join("\\n");
  navigator.clipboard.writeText(text).then(()=>{document.getElementById('msg').style.color='#047857';document.getElementById('msg').textContent='Copied '+(kind==='pre'?'pre-market':'intraday')+' list ('+all.length+' rows)!';setTimeout(()=>document.getElementById('msg').textContent='',2600);});
 }
@@ -962,12 +861,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"logged_in": False, "email_on": EMAIL_ON, "push_on": PUSH_ON})
         elif self.path.startswith("/api/quotes"):
             uid = self._uid()
-            shared = rows_for(get_shared_list())
-            added = get_shared_added()
-            for r in shared:
-                who = added.get(r["ticker"])
-                r["added_by"] = who.split("@")[0] if who else None
-            out = {"meta": meta(), "shared": shared, "mine": []}
+            out = {"meta": meta(), "mine": []}
             if uid:
                 out["mine"] = rows_for(get_watchlist(uid))
             self._json(out)
@@ -1015,19 +909,6 @@ class Handler(BaseHTTPRequestHandler):
             ep = body.get("endpoint")
             if ep:
                 delete_sub(ep)
-            return self._json({"ok": True})
-        elif self.path.startswith("/api/shared"):
-            uid = self._uid()
-            if not uid:
-                return self._json({"error": "Please log in first."})
-            sym = clean_symbol(body.get("symbol"))
-            if not sym:
-                return self._json({"error": "That doesn't look like a valid symbol."})
-            if body.get("action") == "add":
-                if not add_shared(sym, get_email(uid)):
-                    return self._json({"error": f"Shared list limit is {MAX_SHARED}."})
-            elif body.get("action") == "remove":
-                remove_shared(sym)
             return self._json({"ok": True})
         elif self.path.startswith("/api/watch"):
             uid = self._uid()
