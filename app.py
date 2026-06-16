@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Stock Watch — full app (dashboard + accounts + shared list + email + push + detail view)
-Two Copy buttons: pre-market list and intraday list. Friendly highlight note.
+Stock Watch — full app. Layout: add boxes on top, bold card text, Alerts section,
+blinking + sound for your own watchlist alerts.
 ENV: FINNHUB_API_KEY, DATABASE_URL, SECRET_KEY, SMTP_* (email), VAPID_* (push), APP_URL
 RUN: export FINNHUB_API_KEY=your_key ; python3 app.py  -> http://localhost:8765
 """
@@ -687,9 +687,9 @@ PAGE = """<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
 <style>
 :root{color-scheme:light}*{box-sizing:border-box}
 body{margin:0;padding:18px;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;background:#f6f7f9;color:#16181d}
-h1{font-size:20px;margin:0 0 2px}h2{font-size:15px;margin:18px 0 8px}
-.meta{color:#6b7280;font-size:12px}.rule{color:#374151;font-size:12px;margin:2px 0 10px}
-.bar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:12px}
+h1{font-size:20px;margin:0 0 2px}h2{font-size:15px;margin:16px 0 8px}
+.meta{color:#374151;font-size:12px}.rule{color:#374151;font-size:12px;margin:2px 0 10px}
+.bar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px}
 button{font:inherit;font-size:13px;padding:7px 12px;border-radius:8px;border:1px solid #d1d5db;background:#fff;cursor:pointer}
 button:hover{background:#f3f4f6}.primary{background:#1d4ed8;color:#fff;border-color:#1d4ed8}.primary:hover{background:#1e40af}
 input{font:inherit;font-size:13px;padding:7px 10px;border:1px solid #d1d5db;border-radius:8px}
@@ -697,18 +697,23 @@ input{font:inherit;font-size:13px;padding:7px 10px;border:1px solid #d1d5db;bord
 .closed{background:#fef2f2;color:#b91c1c;border:1px solid #fecaca;padding:5px 11px;border-radius:999px;font-size:12px}
 .warn{background:#fffbeb;color:#92400e;border:1px solid #fde68a;padding:10px 12px;border-radius:8px;font-size:13px;margin-bottom:12px}
 .card-auth{background:#fff;border:1px solid #e7e9ee;border-radius:12px;padding:16px;max-width:340px;margin-bottom:14px}
-.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:10px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(155px,1fr));gap:10px}
 .card{background:#fff;border:1px solid #e7e9ee;border-left:4px solid #cbd5e1;border-radius:10px;padding:10px 12px;position:relative;cursor:pointer}
 .card:hover{border-color:#c7ccd6}.card.near{border-left-color:#16a34a;background:#f0fdf4}
-.tk{font-weight:700;font-size:15px}.pr{float:right;font-weight:600}
-.row{font-size:12px;color:#4b5563;margin-top:3px}.up{color:#16a34a;font-weight:600}.dn{color:#dc2626;font-weight:600}
-.muted{color:#9ca3af}.foot{color:#9ca3af;font-size:11px;margin-top:18px}
+.tk{font-weight:700;font-size:15px}.pr{float:right;font-weight:700}
+.row{font-size:12px;color:#16181d;margin-top:3px;font-weight:600}
+.card .muted{color:#1f2430;font-weight:700}
+.up{color:#16a34a;font-weight:700}.dn{color:#dc2626;font-weight:700}
+.muted{color:#9ca3af}.foot{color:#6b7280;font-size:11px;margin-top:18px}
 .x{position:absolute;top:6px;right:8px;cursor:pointer;color:#9ca3af;font-size:14px;border:none;background:none;padding:2px 5px}
 .x:hover{color:#dc2626}#msg,#authmsg{font-size:12px;color:#b91c1c}
 .who{font-size:12px;color:#374151;display:flex;gap:10px;align-items:center;flex-wrap:wrap}
 #overlay{position:fixed;inset:0;background:rgba(15,18,25,.45);display:none;align-items:center;justify-content:center;padding:16px;z-index:50}
 #modal{background:#fff;border-radius:14px;max-width:440px;width:100%;padding:18px;position:relative}
 .stat{display:flex;justify-content:space-between;font-size:13px;padding:5px 0;border-bottom:1px solid #f1f1f1}
+@keyframes blink{0%,100%{background:#dcfce7;border-color:#16a34a}50%{background:#fff7ed;border-color:#f59e0b}}
+.card.alerting{animation:blink 1.1s ease-in-out infinite}
+.alerts-empty{font-size:13px;color:#374151}
 </style></head><body>
 <h1>📈 Stock Watch</h1>
 <div class="meta" id="asof">loading…</div>
@@ -720,23 +725,26 @@ input{font:inherit;font-size:13px;padding:7px 10px;border:1px solid #d1d5db;bord
   <button onclick="load()">Refresh</button>
   <button onclick="copyList('pre')">Copy pre-market</button>
   <button onclick="copyList('intra')">Copy intraday</button>
+  <label style="font-size:13px"><input type="checkbox" id="sndtog" checked> 🔊 Sound</label>
   <button id="pushbtn" style="display:none" onclick="enablePush()">🔔 Enable phone alerts</button>
   <span id="msg"></span>
 </div>
-<div id="mywrap" style="display:none">
-  <h2>⭐ My Watchlist</h2>
-  <div class="bar">
-    <input id="addsym" placeholder="Add to my list (e.g. NFLX)" maxlength="10" onkeydown="if(event.key==='Enter')addSym()">
-    <button class="primary" onclick="addSym()">Add</button>
-  </div>
-  <div class="grid" id="mygrid"></div>
-</div>
-<h2>👥 Shared List</h2>
-<div id="sharededit" class="bar" style="display:none">
+<div id="addbar" class="bar" style="display:none">
+  <input id="addsym" placeholder="Add to my list (e.g. NFLX)" maxlength="10" onkeydown="if(event.key==='Enter')addSym()">
+  <button class="primary" onclick="addSym()">Add</button>
   <input id="sharedsym" placeholder="Add to shared list" maxlength="10" onkeydown="if(event.key==='Enter')addShared()">
   <button onclick="addShared()">Add to shared</button>
-  <span class="muted" style="font-size:12px">Everyone sees changes to the shared list.</span>
 </div>
+
+<h2>🔔 Alerts</h2>
+<div class="grid" id="alerts"></div>
+
+<div id="mywrap" style="display:none">
+  <h2>⭐ My Watchlist</h2>
+  <div class="grid" id="mygrid"></div>
+</div>
+
+<h2>👥 Shared List</h2>
 <div class="grid" id="grid"></div>
 <div class="foot">Green cards have bounced up from today's low. Tap any stock for details & today's chart. Data: Finnhub, ~15 min delayed on the free tier.</div>
 
@@ -751,11 +759,12 @@ input{font:inherit;font-size:13px;padding:7px 10px;border:1px solid #d1d5db;bord
   </div>
 </div>
 <script>
-let LAST={shared:[],mine:[]}, ME={logged_in:false}, _chart=null;
+let LAST={shared:[],mine:[]}, ME={logged_in:false}, _chart=null, prevAlerts=new Set(), firstLoad=true;
 function pctSpan(v){if(v===null||v===undefined)return '<span class="muted">—</span>';var s=(v>=0?"+":"")+v.toFixed(2)+"%";return '<span class="'+(v>=0?'up':'dn')+'">'+s+'</span>';}
 function money(v){return (v===null||v===undefined)?'<span class="muted">—</span>':'$'+v.toFixed(2);}
-function card(t,removable,shared){
- const cls=t.near?'card near':'card';
+function beep(){try{var a=new (window.AudioContext||window.webkitAudioContext)();var o=a.createOscillator(),g=a.createGain();o.connect(g);g.connect(a.destination);o.type='sine';o.frequency.value=880;g.gain.setValueAtTime(0.0001,a.currentTime);g.gain.exponentialRampToValueAtTime(0.12,a.currentTime+0.02);g.gain.exponentialRampToValueAtTime(0.0001,a.currentTime+0.5);o.start();o.stop(a.currentTime+0.52);}catch(e){}}
+function card(t,removable,shared,alerting){
+ let cls='card';if(t.near)cls+=' near';if(alerting)cls+=' alerting';
  const fn=shared?'delShared':'delSym';
  let tip='Remove from my list';
  if(shared){tip=t.added_by?('Added by '+t.added_by+' — remove from shared'):'Original list — remove from shared';}
@@ -798,7 +807,7 @@ function drawChart(points,prevClose){
 async function whoami(){ME=await (await fetch('/api/me',{cache:'no-store'})).json();renderAuth();}
 function renderAuth(){
  const b=document.getElementById('authbox');
- document.getElementById('sharededit').style.display=ME.logged_in?'flex':'none';
+ document.getElementById('addbar').style.display=ME.logged_in?'flex':'none';
  document.getElementById('pushbtn').style.display=(ME.logged_in&&ME.push_on)?'inline-block':'none';
  if(ME.logged_in){
    const al=ME.alerts_on?'checked':'';
@@ -851,6 +860,19 @@ async function enablePush(){
   m.style.color='#047857';m.textContent='Phone alerts enabled on this device!';
  }catch(e){m.textContent='Could not enable alerts: '+(e.message||e);}
 }
+function renderAlerts(){
+ const mine=(LAST.mine||[]);
+ const alerting=mine.filter(function(t){return t.near && t.price!=null;}).sort((a,b)=>(b.from_low??-99)-(a.from_low??-99));
+ const box=document.getElementById('alerts');
+ if(!ME.logged_in){box.innerHTML='<div class="alerts-empty">Sign in and add stocks to <b>My Watchlist</b> to get alerts here.</div>';return;}
+ if(!mine.length){box.innerHTML='<div class="alerts-empty">Add stocks to <b>My Watchlist</b> below — alerts for them show here.</div>';return;}
+ box.innerHTML=alerting.length?alerting.map(t=>card(t,false,false,true)).join(''):'<div class="alerts-empty">No alerts right now. A stock appears here when it climbs 0.5%+ from today\\'s low.</div>';
+ // sound on NEW alert
+ const sndOn=document.getElementById('sndtog')&&document.getElementById('sndtog').checked;
+ let isNew=false;alerting.forEach(function(t){if(!prevAlerts.has(t.ticker))isNew=true;});
+ if(isNew && sndOn && !firstLoad) beep();
+ prevAlerts=new Set(alerting.map(function(t){return t.ticker;}));
+}
 async function load(){
  try{
   const d=await (await fetch('/api/quotes',{cache:'no-store'})).json();LAST=d;
@@ -860,11 +882,13 @@ async function load(){
   const ses=d.meta.session||'';const sc=(ses==='Open')?'open':'closed';
   document.getElementById('status').innerHTML='<span class="'+sc+'">● '+ses+'</span>';
   const sh=d.shared.slice().sort((a,b)=>(b.from_low??-99)-(a.from_low??-99));
-  document.getElementById('grid').innerHTML=sh.map(t=>card(t,ME.logged_in,true)).join('');
+  document.getElementById('grid').innerHTML=sh.map(t=>card(t,ME.logged_in,true,false)).join('');
   if(ME.logged_in){
     const mine=(d.mine||[]).slice().sort((a,b)=>(b.from_low??-99)-(a.from_low??-99));
-    document.getElementById('mygrid').innerHTML=mine.length?mine.map(t=>card(t,true,false)).join(''):'<div class="muted" style="font-size:13px">No stocks yet — add one above.</div>';
+    document.getElementById('mygrid').innerHTML=mine.length?mine.map(t=>card(t,true,false,t.near)).join(''):'<div class="muted" style="font-size:13px">No stocks yet — add one in the box at the top.</div>';
   }
+  renderAlerts();
+  firstLoad=false;
  }catch(e){document.getElementById('asof').textContent='could not load data';}
 }
 function copyList(kind){
