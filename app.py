@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Stock Watch — single-list version. One "My Watchlist" per account (no shared list,
-no separate Alerts tab). Alerting cards blink + play a sound right in the list.
+Stock Watch — single watchlist. Add box at very top. Alerting cards flash amber
+for ~10 seconds (then settle to green) and play a sound when newly triggered.
 ENV: FINNHUB_API_KEY, DATABASE_URL, SECRET_KEY, SMTP_* (email), VAPID_* (push), APP_URL
 RUN: export FINNHUB_API_KEY=your_key ; python3 app.py  -> http://localhost:8765
 """
@@ -617,6 +617,7 @@ body{margin:0;padding:18px;font-family:-apple-system,BlinkMacSystemFont,"Segoe U
 h1{font-size:20px;margin:0 0 2px}h2{font-size:15px;margin:16px 0 8px}
 .meta{color:#374151;font-size:12px}.rule{color:#374151;font-size:12px;margin:2px 0 10px}
 .bar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px}
+.addtop{background:#eef3fb;border:1px solid #cfe0f5;border-radius:10px;padding:10px;margin-bottom:12px}
 button{font:inherit;font-size:13px;padding:7px 12px;border-radius:8px;border:1px solid #d1d5db;background:#fff;cursor:pointer}
 button:hover{background:#f3f4f6}.primary{background:#1d4ed8;color:#fff;border-color:#1d4ed8}.primary:hover{background:#1e40af}
 input{font:inherit;font-size:13px;padding:7px 10px;border:1px solid #d1d5db;border-radius:8px}
@@ -638,10 +639,14 @@ input{font:inherit;font-size:13px;padding:7px 10px;border:1px solid #d1d5db;bord
 #overlay{position:fixed;inset:0;background:rgba(15,18,25,.45);display:none;align-items:center;justify-content:center;padding:16px;z-index:50}
 #modal{background:#fff;border-radius:14px;max-width:440px;width:100%;padding:18px;position:relative}
 .stat{display:flex;justify-content:space-between;font-size:13px;padding:5px 0;border-bottom:1px solid #f1f1f1}
-@keyframes blink{0%,100%{background:#dcfce7;border-color:#16a34a}50%{background:#fff7ed;border-color:#f59e0b}}
-.card.alerting{animation:blink 1.1s ease-in-out infinite}
+@keyframes blinkamber{0%,100%{background:#fff7ed;border-color:#f59e0b}50%{background:#fde68a;border-color:#b45309}}
+.card.alerting{animation:blinkamber 1s ease-in-out 10}
 .empty{font-size:14px;color:#16181d;font-weight:600;margin-top:8px}
 </style></head><body>
+<div id="addbar" class="bar addtop" style="display:none">
+  <input id="addsym" placeholder="Add a stock (e.g. NFLX)" maxlength="10" onkeydown="if(event.key==='Enter')addSym()" style="flex:1;min-width:160px">
+  <button class="primary" onclick="addSym()">Add</button>
+</div>
 <h1>📈 Stock Watch</h1>
 <div class="meta" id="asof">loading…</div>
 <div class="rule" id="rule"></div>
@@ -655,10 +660,6 @@ input{font:inherit;font-size:13px;padding:7px 10px;border:1px solid #d1d5db;bord
   <label style="font-size:13px"><input type="checkbox" id="sndtog" checked> 🔊 Sound</label>
   <button id="pushbtn" style="display:none" onclick="enablePush()">🔔 Enable phone alerts</button>
   <span id="msg"></span>
-</div>
-<div id="addbar" class="bar" style="display:none">
-  <input id="addsym" placeholder="Add a stock (e.g. NFLX)" maxlength="10" onkeydown="if(event.key==='Enter')addSym()">
-  <button class="primary" onclick="addSym()">Add</button>
 </div>
 
 <h2>⭐ My Watchlist</h2>
@@ -682,8 +683,8 @@ let LAST={mine:[]}, ME={logged_in:false}, _chart=null, prevAlerts=new Set(), fir
 function pctSpan(v){if(v===null||v===undefined)return '<span class="muted">—</span>';var s=(v>=0?"+":"")+v.toFixed(2)+"%";return '<span class="'+(v>=0?'up':'dn')+'">'+s+'</span>';}
 function money(v){return (v===null||v===undefined)?'<span class="muted">—</span>':'$'+v.toFixed(2);}
 function beep(){try{var a=new (window.AudioContext||window.webkitAudioContext)();var o=a.createOscillator(),g=a.createGain();o.connect(g);g.connect(a.destination);o.type='sine';o.frequency.value=880;g.gain.setValueAtTime(0.0001,a.currentTime);g.gain.exponentialRampToValueAtTime(0.12,a.currentTime+0.02);g.gain.exponentialRampToValueAtTime(0.0001,a.currentTime+0.5);o.start();o.stop(a.currentTime+0.52);}catch(e){}}
-function card(t){
- let cls='card';if(t.near)cls+=' near alerting';
+function card(t,blink){
+ let cls='card';if(t.near)cls+=' near';if(blink)cls+=' alerting';
  const x='<button class="x" title="Remove" onclick="event.stopPropagation();delSym(\\''+t.ticker+'\\')">✕</button>';
  return '<div class="'+cls+'" onclick="openDetail(\\''+t.ticker+'\\')">'+x+'<span class="tk">'+t.ticker+'</span><span class="pr">'+money(t.price)+'</span>'+
   '<div class="row">change: '+pctSpan(t.change)+'</div>'+
@@ -779,15 +780,13 @@ async function load(){
   const grid=document.getElementById('mygrid');
   if(ME.logged_in){
     const mine=(d.mine||[]).slice().sort((a,b)=>(b.from_low??-99)-(a.from_low??-99));
-    grid.innerHTML=mine.length?mine.map(card).join(''):'<div class="empty">No stocks yet — add one in the box above.</div>';
-    const alerting=mine.filter(t=>t.near && t.price!=null);
+    const cur=new Set(mine.filter(t=>t.near && t.price!=null).map(t=>t.ticker));
+    const newOnes=new Set([...cur].filter(x=>!prevAlerts.has(x)));
+    grid.innerHTML=mine.length?mine.map(t=>card(t,newOnes.has(t.ticker))).join(''):'<div class="empty">No stocks yet — add one in the box at the top.</div>';
     const sndOn=document.getElementById('sndtog')&&document.getElementById('sndtog').checked;
-    let isNew=false;alerting.forEach(t=>{if(!prevAlerts.has(t.ticker))isNew=true;});
-    if(isNew && sndOn && !firstLoad) beep();
-    prevAlerts=new Set(alerting.map(t=>t.ticker));
-  }else{
-    grid.innerHTML='';
-  }
+    if(newOnes.size && sndOn && !firstLoad) beep();
+    prevAlerts=cur;
+  }else{grid.innerHTML='';}
   firstLoad=false;
  }catch(e){document.getElementById('asof').textContent='could not load data';}
 }
