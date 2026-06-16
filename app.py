@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-Stock Watch — single watchlist. Add box at very top. Alerting cards flash amber
-for ~10 seconds (then settle to green) and play a sound when newly triggered.
-ENV: FINNHUB_API_KEY, DATABASE_URL, SECRET_KEY, SMTP_* (email), VAPID_* (push), APP_URL
-RUN: export FINNHUB_API_KEY=your_key ; python3 app.py  -> http://localhost:8765
+Stock Watch — single watchlist, REAL-TIME data via Alpaca (IEX feed, free).
+Add box at top, amber 10s flash + sound on new alerts, tap for chart, email/push.
+ENV: ALPACA_KEY, ALPACA_SECRET, DATABASE_URL, SECRET_KEY,
+     SMTP_* (email, optional), VAPID_* (push, optional), APP_URL
+RUN: export ALPACA_KEY=... ALPACA_SECRET=... ; python3 app.py  -> http://localhost:8765
 """
 
 import base64
@@ -19,7 +20,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import datetime, timezone
 from email.message import EmailMessage
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -31,7 +32,10 @@ except ImportError:
 
 # ----------------------------- CONFIG -----------------------------
 HERE            = os.path.dirname(os.path.abspath(__file__))
-FINNHUB_KEY     = os.environ.get("FINNHUB_API_KEY", "").strip()
+ALPACA_KEY      = os.environ.get("ALPACA_KEY", "").strip()
+ALPACA_SECRET   = os.environ.get("ALPACA_SECRET", "").strip()
+ALPACA_FEED     = os.environ.get("ALPACA_FEED", "iex").strip()   # free tier = iex
+DATA_URL        = "https://data.alpaca.markets/v2/stocks/snapshots"
 DATABASE_URL    = os.environ.get("DATABASE_URL", "").strip()
 SECRET_KEY      = os.environ.get("SECRET_KEY", "").strip() or base64.b64encode(os.urandom(24)).decode()
 DB_PATH         = os.path.join(HERE, "stockwatch.db")
@@ -39,11 +43,11 @@ ICON_PATH       = os.path.join(HERE, "icon.png")
 ET              = ZoneInfo("America/New_York")
 PORT            = int(os.environ.get("PORT", "8765"))
 REFRESH_SECONDS = 60
-MAX_WORKERS     = 4
 RISE_PCT        = 0.005
 MAX_PER_USER    = 80
 ALERT_SESSIONS  = {"Pre-market", "Open"}
 APP_URL         = os.environ.get("APP_URL", "").strip()
+HAVE_DATA       = bool(ALPACA_KEY and ALPACA_SECRET)
 
 SMTP_HOST = os.environ.get("SMTP_HOST", "").strip()
 SMTP_PORT = int(os.environ.get("SMTP_PORT", "587") or 587)
@@ -331,7 +335,7 @@ def clean_symbol(s):
     return None
 
 
-# =========================== QUOTES + HISTORY ===========================
+# =========================== QUOTES (Alpaca) + HISTORY ===========================
 _quotes = {}
 _qlock = threading.Lock()
 _hist = {}
@@ -387,35 +391,66 @@ def session_label(dt):
     return "Closed"
 
 
-def fh_quote(sym, retries=3):
-    url = f"https://finnhub.io/api/v1/quote?symbol={urllib.parse.quote(sym)}&token={FINNHUB_KEY}"
-    req = urllib.request.Request(url, headers={"User-Agent": "stock-watch"})
-    for attempt in range(retries):
-        try:
-            with urllib.request.urlopen(req, timeout=12) as r:
-                return json.loads(r.read().decode())
-        except urllib.error.HTTPError as e:
-            if e.code == 429 and attempt < retries - 1:
-                time.sleep(1.5 * (attempt + 1)); continue
-            raise
-        except Exception:
-            if attempt < retries - 1:
-                time.sleep(0.8 * (attempt + 1)); continue
-            raise
+def _chunks(lst, n):
+    for i in range(0, len(lst), n):
+        yield lst[i:i + n]
 
 
-def one_row(t):
+def fetch_snapshots(syms):
+    """Alpaca multi-symbol snapshots -> {symbol: snapshot dict}."""
+    out = {}
+    headers = {"APCA-API-KEY-ID": ALPACA_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET,
+               "User-Agent": "stock-watch"}
+    for chunk in _chunks(sorted(syms), 90):
+        url = DATA_URL + "?symbols=" + urllib.parse.quote(",".join(chunk)) + "&feed=" + urllib.parse.quote(ALPACA_FEED)
+        req = urllib.request.Request(url, headers=headers)
+        for attempt in range(3):
+            try:
+                with urllib.request.urlopen(req, timeout=15) as r:
+                    data = json.loads(r.read().decode())
+                snaps = data.get("snapshots", data) if isinstance(data, dict) else {}
+                if isinstance(snaps, dict):
+                    out.update(snaps)
+                break
+            except urllib.error.HTTPError as e:
+                if e.code == 429 and attempt < 2:
+                    time.sleep(1.5 * (attempt + 1)); continue
+                break
+            except Exception:
+                if attempt < 2:
+                    time.sleep(0.8 * (attempt + 1)); continue
+                break
+    return out
+
+
+def _as_of(ts):
+    if not ts:
+        return ""
     try:
-        q = fh_quote(t)
-        c, low, pc, ts = q.get("c"), q.get("l"), q.get("pc"), q.get("t")
-        o, hi = q.get("o"), q.get("h")
+        dt = datetime.strptime(ts[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
+        return dt.astimezone(ET).strftime("%H:%M ET")
+    except Exception:
+        return ""
+
+
+def build_row(t, snap):
+    blank = {"ticker": t, "price": None, "from_low": None, "prev_close": None,
+             "change": None, "open": None, "high": None, "low": None, "as_of": "", "near": False}
+    try:
+        if not snap:
+            return blank
+        lt = snap.get("latestTrade") or {}
+        db = snap.get("dailyBar") or {}
+        pdb = snap.get("prevDailyBar") or {}
+        c = lt.get("p") or db.get("c")
+        low = db.get("l")
+        o = db.get("o")
+        hi = db.get("h")
+        pc = pdb.get("c")
         if not c:
-            return {"ticker": t, "price": None, "from_low": None, "prev_close": None,
-                    "change": None, "open": None, "high": None, "low": None,
-                    "as_of": "", "near": False}
+            return blank
         from_low = (c - low) / low * 100 if low else None
         change = (c - pc) / pc * 100 if pc else None
-        as_of = datetime.fromtimestamp(ts, ET).strftime("%H:%M ET") if ts else ""
         return {"ticker": t, "price": round(c, 2),
                 "from_low": None if from_low is None else round(from_low, 2),
                 "prev_close": None if not pc else round(pc, 2),
@@ -423,22 +458,19 @@ def one_row(t):
                 "open": None if not o else round(o, 2),
                 "high": None if not hi else round(hi, 2),
                 "low": None if not low else round(low, 2),
-                "as_of": as_of,
+                "as_of": _as_of(lt.get("t")),
                 "near": bool(from_low is not None and from_low >= RISE_PCT * 100)}
     except Exception:
-        return {"ticker": t, "price": None, "from_low": None, "prev_close": None,
-                "change": None, "open": None, "high": None, "low": None,
-                "as_of": "err", "near": False}
+        return blank
 
 
 def refresh_symbols(syms):
-    if not FINNHUB_KEY or not syms:
+    if not HAVE_DATA or not syms:
         return
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        results = list(ex.map(lambda s: (s, one_row(s)), syms))
+    snaps = fetch_snapshots(list(syms))
     with _qlock:
-        for s, row in results:
-            _quotes[s] = row
+        for s in syms:
+            _quotes[s] = build_row(s, snaps.get(s))
 
 
 def rows_for(syms):
@@ -569,7 +601,7 @@ def meta():
             "session": session_label(now),
             "rule": f"Stocks turning green have climbed {RISE_PCT*100:.1f}%+ from their lowest price today. "
                     f"You'll get an alert when one of your stocks does this.",
-            "have_key": bool(FINNHUB_KEY),
+            "have_key": HAVE_DATA,
             "email_on": EMAIL_ON, "push_on": PUSH_ON}
 
 
@@ -666,7 +698,7 @@ input{font:inherit;font-size:13px;padding:7px 10px;border:1px solid #d1d5db;bord
 <div class="grid" id="mygrid"></div>
 <div id="signedout" class="empty" style="display:none">Sign in above to build your watchlist.</div>
 
-<div class="foot">Green cards have bounced up from today's low. Tap any stock for details & today's chart. Data: Finnhub, ~15 min delayed on the free tier.</div>
+<div class="foot">Green cards have bounced up from today's low. Tap any stock for details & today's chart. Data: Alpaca (IEX) — real-time.</div>
 
 <div id="overlay" onclick="if(event.target===this)closeDetail()">
   <div id="modal">
@@ -773,7 +805,7 @@ async function load(){
   const d=await (await fetch('/api/quotes',{cache:'no-store'})).json();LAST=d;
   document.getElementById('asof').textContent='As of '+d.meta.as_of;
   document.getElementById('rule').textContent=d.meta.rule||'';
-  document.getElementById('warn').innerHTML=d.meta.have_key?'':'<div class="warn">No data key set. Add FINNHUB_API_KEY.</div>';
+  document.getElementById('warn').innerHTML=d.meta.have_key?'':'<div class="warn">No data keys set. Add ALPACA_KEY and ALPACA_SECRET.</div>';
   const ses=d.meta.session||'';const sc=(ses==='Open')?'open':'closed';
   document.getElementById('status').innerHTML='<span class="'+sc+'">● '+ses+'</span>';
   document.getElementById('signedout').style.display=ME.logged_in?'none':'block';
@@ -927,10 +959,10 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     init_db()
-    if not FINNHUB_KEY:
-        print("WARNING: FINNHUB_API_KEY not set.")
+    if not HAVE_DATA:
+        print("WARNING: ALPACA_KEY / ALPACA_SECRET not set.")
     print(f"Storage: {'Postgres' if DATABASE_URL else 'local SQLite ('+DB_PATH+')'}")
-    print(f"Email alerts: {'ON' if EMAIL_ON else 'OFF'} | Push alerts: {'ON' if PUSH_ON else 'OFF'}")
+    print(f"Data: Alpaca feed={ALPACA_FEED} | Email: {'ON' if EMAIL_ON else 'OFF'} | Push: {'ON' if PUSH_ON else 'OFF'}")
     print(f"Icon: {'icon.png found' if os.path.exists(ICON_PATH) else 'using fallback (add icon.png)'}")
     threading.Thread(target=refresher, daemon=True).start()
     srv = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
