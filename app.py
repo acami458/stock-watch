@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Stock Watch — full app (dashboard + accounts + shared list + email + push + detail view)
-Two Copy buttons: pre-market list and intraday list.
+Two Copy buttons: pre-market list and intraday list. Friendly highlight note.
 ENV: FINNHUB_API_KEY, DATABASE_URL, SECRET_KEY, SMTP_* (email), VAPID_* (push), APP_URL
 RUN: export FINNHUB_API_KEY=your_key ; python3 app.py  -> http://localhost:8765
 """
@@ -640,7 +640,8 @@ def meta():
             "date": now.strftime("%Y-%m-%d"),
             "market_open": market_open(now),
             "session": session_label(now),
-            "rule": f"highlighted when ≥ +{RISE_PCT*100:.1f}% above the day's low",
+            "rule": f"Stocks turning green have climbed {RISE_PCT*100:.1f}%+ from their lowest price today. "
+                    f"You'll get an alert when one of your own stocks does this.",
             "have_key": bool(FINNHUB_KEY),
             "email_on": EMAIL_ON, "push_on": PUSH_ON}
 
@@ -737,7 +738,7 @@ input{font:inherit;font-size:13px;padding:7px 10px;border:1px solid #d1d5db;bord
   <span class="muted" style="font-size:12px">Everyone sees changes to the shared list.</span>
 </div>
 <div class="grid" id="grid"></div>
-<div class="foot">Data: Finnhub · free tier delayed ~15 min · tap a stock for details & today's chart · alerts fire when one of YOUR stocks rises ≥0.5% above the day's low.</div>
+<div class="foot">Green cards have bounced up from today's low. Tap any stock for details & today's chart. Data: Finnhub, ~15 min delayed on the free tier.</div>
 
 <div id="overlay" onclick="if(event.target===this)closeDetail()">
   <div id="modal">
@@ -854,7 +855,7 @@ async function load(){
  try{
   const d=await (await fetch('/api/quotes',{cache:'no-store'})).json();LAST=d;
   document.getElementById('asof').textContent='As of '+d.meta.as_of;
-  document.getElementById('rule').textContent='Note: '+d.meta.rule;
+  document.getElementById('rule').textContent=d.meta.rule||'';
   document.getElementById('warn').innerHTML=d.meta.have_key?'':'<div class="warn">No data key set. Add FINNHUB_API_KEY.</div>';
   const ses=d.meta.session||'';const sc=(ses==='Open')?'open':'closed';
   document.getElementById('status').innerHTML='<span class="'+sc+'">● '+ses+'</span>';
