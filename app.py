@@ -794,11 +794,6 @@ input{font:inherit;font-size:13px;padding:7px 10px;border:1px solid #d1d5db;bord
 @keyframes blinkamber{0%,100%{background:#fff7ed;border-color:#f59e0b}50%{background:#fde68a;border-color:#b45309}}
 .card.alerting{animation:blinkamber 1s ease-in-out 30}
 .empty{font-size:14px;color:#16181d;font-weight:600;margin-top:8px}
-#cyclewrap{overflow:hidden;border:1px solid #e7e9ee;border-radius:10px;padding:8px;background:#fbfdff}
-#cycletrack{will-change:transform;animation:cyclescroll var(--cycdur,14s) linear infinite}
-#cycletrack .card{margin-bottom:10px;width:100%;float:none}
-#cyclewrap:hover #cycletrack{animation-play-state:paused}
-@keyframes cyclescroll{from{transform:translateY(-50%)}to{transform:translateY(0)}}
 .tabs{display:flex;gap:4px;margin:10px 0 14px;border-bottom:1px solid #e7e9ee}
 .tab{border:none;background:none;border-radius:0;border-bottom:2px solid transparent;padding:8px 14px;color:#374151;font-weight:600}
 .tab:hover{background:#f3f4f6}
@@ -835,11 +830,6 @@ input{font:inherit;font-size:13px;padding:7px 10px;border:1px solid #d1d5db;bord
 <h2>⭐ My Watchlist</h2>
 <div class="grid" id="mygrid"></div>
 <div id="signedout" class="empty" style="display:none">Sign in above to build your watchlist.</div>
-
-<div id="cyclesec" style="display:none">
-  <h2>📈 On the move — climbing 0.5%+</h2>
-  <div id="cyclewrap"></div>
-</div>
 
 <div class="foot">Green cards have bounced up from today's low. Tap any stock for details & today's chart. Data: Alpaca (IEX) — real-time.</div>
 </div>
@@ -953,15 +943,6 @@ async function enablePush(){
   m.style.color='#047857';m.textContent='Phone alerts enabled on this device!';
  }catch(e){m.textContent='Could not enable alerts: '+(e.message||e);}
 }
-function renderCycle(climbers,newOnes){
- const sec=document.getElementById('cyclesec'),wrap=document.getElementById('cyclewrap');
- if(!climbers.length){sec.style.display='none';wrap.innerHTML='';return;}
- sec.style.display='block';
- wrap.style.maxHeight=Math.min(300,climbers.length*128)+'px';
- const dur=Math.max(8,climbers.length*5);
- const html=climbers.map(t=>card(t,newOnes&&newOnes.has(t.ticker))).join('');
- wrap.innerHTML='<div id="cycletrack" style="--cycdur:'+dur+'s">'+html+html+'</div>';
-}
 async function load(){
  try{
   const d=await (await fetch('/api/quotes',{cache:'no-store'})).json();LAST=d;
@@ -973,17 +954,14 @@ async function load(){
   document.getElementById('signedout').style.display=ME.logged_in?'none':'block';
   const grid=document.getElementById('mygrid');
   if(ME.logged_in){
-    const mine=(d.mine||[]).slice().sort((a,b)=>(b.from_low??-99)-(a.from_low??-99));
+    const mine=(d.mine||[]).slice().sort((a,b)=>((a.near?1:0)-(b.near?1:0))||((b.from_low??-99)-(a.from_low??-99)));
     const cur=new Set(mine.filter(t=>t.near && t.price!=null).map(t=>t.ticker));
     const newOnes=new Set([...cur].filter(x=>!prevAlerts.has(x)));
-    const climbers=mine.filter(t=>t.near && t.price!=null);
-    const rest=mine.filter(t=>!(t.near && t.price!=null));
-    grid.innerHTML=rest.length?rest.map(t=>card(t,false)).join(''):(mine.length?'':'<div class="empty">No stocks yet — add one in the box at the top.</div>');
-    renderCycle(climbers,newOnes);
+    grid.innerHTML=mine.length?mine.map(t=>card(t,newOnes.has(t.ticker))).join(''):'<div class="empty">No stocks yet — add one in the box at the top.</div>';
     const sndOn=document.getElementById('sndtog')&&document.getElementById('sndtog').checked;
     if(newOnes.size && sndOn && !firstLoad) beep();
     prevAlerts=cur;
-  }else{grid.innerHTML='';renderCycle([],new Set());}
+  }else{grid.innerHTML='';}
   firstLoad=false;
  }catch(e){document.getElementById('asof').textContent='could not load data';}
 }
