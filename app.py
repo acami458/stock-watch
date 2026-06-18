@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Stock Watch — single watchlist, REAL-TIME data via Alpaca (IEX feed, free).
-Add box at top, amber 10s flash + sound on new alerts, tap for chart, email/push.
+Add box at top, amber 30s flash + sound on new alerts, tap for chart, email/push.
 ENV: ALPACA_KEY, ALPACA_SECRET, DATABASE_URL, SECRET_KEY,
      SMTP_* (email, optional), VAPID_* (push, optional), APP_URL
 RUN: export ALPACA_KEY=... ALPACA_SECRET=... ; python3 app.py  -> http://localhost:8765
@@ -99,6 +99,13 @@ def init_db():
             PRIMARY KEY(user_id, symbol, day))""")
         cur.execute("""CREATE TABLE IF NOT EXISTS push_subs(
             endpoint TEXT PRIMARY KEY, user_id INTEGER NOT NULL, sub TEXT NOT NULL)""")
+        cur.execute("""CREATE TABLE IF NOT EXISTS alert_log(
+            user_id INTEGER NOT NULL, symbol TEXT NOT NULL, day TEXT NOT NULL,
+            ts TEXT, price REAL, from_low REAL, change REAL,
+            PRIMARY KEY(user_id, symbol, day))""")
+        cur.execute("""CREATE TABLE IF NOT EXISTS daily_history(
+            symbol TEXT NOT NULL, day TEXT NOT NULL, close REAL, low REAL,
+            high REAL, prev_close REAL, PRIMARY KEY(symbol, day))""")
         conn.commit()
     finally:
         conn.close()
@@ -289,6 +296,81 @@ def subs_for_user(uid):
         cur = conn.cursor()
         cur.execute(_ph("SELECT endpoint, sub FROM push_subs WHERE user_id=%s", kind), (uid,))
         return [(r[0], json.loads(r[1])) for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+def all_user_ids():
+    conn, kind = _db()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT id FROM users")
+        return [r[0] for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+def log_alert(uid, symbol, day, ts, price, from_low, change):
+    conn, kind = _db()
+    try:
+        cur = conn.cursor()
+        try:
+            if kind == "pg":
+                cur.execute("""INSERT INTO alert_log(user_id, symbol, day, ts, price, from_low, change)
+                               VALUES(%s,%s,%s,%s,%s,%s,%s)
+                               ON CONFLICT (user_id, symbol, day) DO NOTHING""",
+                            (uid, symbol, day, ts, price, from_low, change))
+            else:
+                cur.execute("""INSERT OR IGNORE INTO alert_log(user_id, symbol, day, ts, price, from_low, change)
+                               VALUES(?,?,?,?,?,?,?)""", (uid, symbol, day, ts, price, from_low, change))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+    finally:
+        conn.close()
+
+
+def get_alert_log(uid, limit=200):
+    conn, kind = _db()
+    try:
+        cur = conn.cursor()
+        cur.execute(_ph("""SELECT symbol, day, ts, price, from_low, change FROM alert_log
+                           WHERE user_id=%s ORDER BY day DESC, ts DESC LIMIT %s""", kind), (uid, limit))
+        return [{"symbol": r[0], "day": r[1], "ts": r[2], "price": r[3],
+                 "from_low": r[4], "change": r[5]} for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+def upsert_daily(symbol, day, close, low, high, prev_close):
+    conn, kind = _db()
+    try:
+        cur = conn.cursor()
+        if kind == "pg":
+            cur.execute("""INSERT INTO daily_history(symbol, day, close, low, high, prev_close)
+                           VALUES(%s,%s,%s,%s,%s,%s)
+                           ON CONFLICT (symbol, day) DO UPDATE SET
+                             close=EXCLUDED.close, low=EXCLUDED.low,
+                             high=EXCLUDED.high, prev_close=EXCLUDED.prev_close""",
+                        (symbol, day, close, low, high, prev_close))
+        else:
+            cur.execute("""INSERT OR REPLACE INTO daily_history(symbol, day, close, low, high, prev_close)
+                           VALUES(?,?,?,?,?,?)""", (symbol, day, close, low, high, prev_close))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_daily_history(symbol, limit=180):
+    conn, kind = _db()
+    try:
+        cur = conn.cursor()
+        cur.execute(_ph("""SELECT day, close, low, high, prev_close FROM daily_history
+                           WHERE symbol=%s ORDER BY day DESC LIMIT %s""", kind), (symbol, limit))
+        rows = [{"d": r[0], "close": r[1], "low": r[2], "high": r[3], "prev_close": r[4]}
+                for r in cur.fetchall()]
+        rows.reverse()
+        return rows
     finally:
         conn.close()
 
@@ -571,6 +653,36 @@ def alert_check():
                         mark_alerted(uid, s, day)
 
 
+def record_daily_all():
+    """Persist a daily price snapshot per watched symbol (survives restarts)."""
+    day = datetime.now(ET).strftime("%Y-%m-%d")
+    with _qlock:
+        snap = {s: dict(r) for s, r in _quotes.items()}
+    for s, r in snap.items():
+        if r.get("price") is None:
+            continue
+        try:
+            upsert_daily(s, day, r.get("price"), r.get("low"), r.get("high"), r.get("prev_close"))
+        except Exception:
+            pass
+
+
+def log_crossings():
+    """Log every stock that crosses 0.5%+ from its day low, once per user/symbol/day.
+    Recorded regardless of whether email/push alerts are configured."""
+    now = datetime.now(ET)
+    if session_label(now) not in ALERT_SESSIONS:
+        return
+    day = now.strftime("%Y-%m-%d")
+    ts = now.strftime("%H:%M ET")
+    for uid in all_user_ids():
+        for s in get_watchlist(uid):
+            with _qlock:
+                row = _quotes.get(s)
+            if row and row.get("near") and row.get("price") is not None:
+                log_alert(uid, s, day, ts, row.get("price"), row.get("from_low"), row.get("change"))
+
+
 def refresher():
     while True:
         try:
@@ -582,6 +694,14 @@ def refresher():
             refresh_symbols(sorted(syms))
             try:
                 record_history()
+            except Exception:
+                pass
+            try:
+                record_daily_all()
+            except Exception:
+                pass
+            try:
+                log_crossings()
             except Exception:
                 pass
             try:
@@ -599,8 +719,8 @@ def meta():
             "date": now.strftime("%Y-%m-%d"),
             "market_open": market_open(now),
             "session": session_label(now),
-            "rule": f"Stocks turning green have climbed {RISE_PCT*100:.1f}%+ from their lowest price today. "
-                    f"You'll get an alert when one of your stocks does this.",
+            "rule": f"stocks turning green have climbed {RISE_PCT*100:.1f}%+ from their lowest price today. "
+                    f"You'll get an alarm when one of your stocks meet logical code.",
             "have_key": HAVE_DATA,
             "email_on": EMAIL_ON, "push_on": PUSH_ON}
 
@@ -672,23 +792,41 @@ input{font:inherit;font-size:13px;padding:7px 10px;border:1px solid #d1d5db;bord
 #modal{background:#fff;border-radius:14px;max-width:440px;width:100%;padding:18px;position:relative}
 .stat{display:flex;justify-content:space-between;font-size:13px;padding:5px 0;border-bottom:1px solid #f1f1f1}
 @keyframes blinkamber{0%,100%{background:#fff7ed;border-color:#f59e0b}50%{background:#fde68a;border-color:#b45309}}
-.card.alerting{animation:blinkamber 1s ease-in-out 10}
+.card.alerting{animation:blinkamber 1s ease-in-out 30}
 .empty{font-size:14px;color:#16181d;font-weight:600;margin-top:8px}
+#cyclewrap{overflow:hidden;border:1px solid #e7e9ee;border-radius:10px;padding:8px;background:#fbfdff}
+#cycletrack{will-change:transform;animation:cyclescroll var(--cycdur,14s) linear infinite}
+#cycletrack .card{margin-bottom:10px;width:100%;float:none}
+#cyclewrap:hover #cycletrack{animation-play-state:paused}
+@keyframes cyclescroll{from{transform:translateY(-50%)}to{transform:translateY(0)}}
+.tabs{display:flex;gap:4px;margin:10px 0 14px;border-bottom:1px solid #e7e9ee}
+.tab{border:none;background:none;border-radius:0;border-bottom:2px solid transparent;padding:8px 14px;color:#374151;font-weight:600}
+.tab:hover{background:#f3f4f6}
+.tab.active{color:#1d4ed8;border-bottom-color:#1d4ed8}
+.histtbl .stat span{flex:1}
+.histtbl .stat span:nth-child(2){text-align:center}
+.histtbl .stat span:nth-child(3),.histtbl .stat span:nth-child(4){text-align:right}
 </style></head><body>
-<div id="addbar" class="bar addtop" style="display:none">
-  <input id="addsym" placeholder="Add a stock (e.g. NFLX)" maxlength="10" onkeydown="if(event.key==='Enter')addSym()" style="flex:1;min-width:160px">
-  <button class="primary" onclick="addSym()">Add</button>
-</div>
 <h1>📈 Stock Watch</h1>
 <div class="meta" id="asof">loading…</div>
 <div class="rule" id="rule"></div>
 <div id="warn"></div>
 <div id="authbox"></div>
+
+<div class="tabs">
+  <button id="tab-watch" class="tab active" onclick="showTab('watch')">⭐ Watchlist</button>
+  <button id="tab-hist" class="tab" onclick="showTab('history')">🕘 History</button>
+</div>
+
+<div id="view-watch">
+<div id="addbar" class="bar addtop" style="display:none">
+  <input id="addsym" placeholder="Add a stock (e.g. NFLX)" maxlength="10" onkeydown="if(event.key==='Enter')addSym()" style="flex:1;min-width:160px">
+  <button class="primary" onclick="addSym()">Add</button>
+</div>
 <div class="bar">
   <span id="status"></span>
   <button onclick="load()">Refresh</button>
   <button onclick="copyList('pre')">Copy pre-market</button>
-  <button onclick="copyList('intra')">Copy intraday</button>
   <label style="font-size:13px"><input type="checkbox" id="sndtog" checked> 🔊 Sound</label>
   <button id="pushbtn" style="display:none" onclick="enablePush()">🔔 Enable phone alerts</button>
   <span id="msg"></span>
@@ -698,7 +836,22 @@ input{font:inherit;font-size:13px;padding:7px 10px;border:1px solid #d1d5db;bord
 <div class="grid" id="mygrid"></div>
 <div id="signedout" class="empty" style="display:none">Sign in above to build your watchlist.</div>
 
+<div id="cyclesec" style="display:none">
+  <h2>📈 On the move — climbing 0.5%+</h2>
+  <div id="cyclewrap"></div>
+</div>
+
 <div class="foot">Green cards have bounced up from today's low. Tap any stock for details & today's chart. Data: Alpaca (IEX) — real-time.</div>
+</div>
+
+<div id="view-history" style="display:none">
+  <h2>🔔 Alert history &nbsp;<button onclick="loadHistory()" style="font-weight:600;font-size:12px;padding:4px 9px">Refresh</button></h2>
+  <div id="histalerts" class="empty">Loading…</div>
+  <h2 style="margin-top:18px">📊 Price history</h2>
+  <div class="bar"><label style="font-size:13px">Stock:&nbsp;</label><select id="histsym" onchange="loadDaily()" style="min-width:120px"></select></div>
+  <div style="height:240px;margin-top:6px"><canvas id="hist_chart"></canvas></div>
+  <div class="muted" id="hist_note" style="font-size:12px;margin-top:6px"></div>
+</div>
 
 <div id="overlay" onclick="if(event.target===this)closeDetail()">
   <div id="modal">
@@ -711,7 +864,7 @@ input{font:inherit;font-size:13px;padding:7px 10px;border:1px solid #d1d5db;bord
   </div>
 </div>
 <script>
-let LAST={mine:[]}, ME={logged_in:false}, _chart=null, prevAlerts=new Set(), firstLoad=true;
+let LAST={mine:[]}, ME={logged_in:false}, _chart=null, prevAlerts=new Set(), firstLoad=true, _curTab='watch', _histChart=null;
 function pctSpan(v){if(v===null||v===undefined)return '<span class="muted">—</span>';var s=(v>=0?"+":"")+v.toFixed(2)+"%";return '<span class="'+(v>=0?'up':'dn')+'">'+s+'</span>';}
 function money(v){return (v===null||v===undefined)?'<span class="muted">—</span>':'$'+v.toFixed(2);}
 function beep(){try{var a=new (window.AudioContext||window.webkitAudioContext)();var o=a.createOscillator(),g=a.createGain();o.connect(g);g.connect(a.destination);o.type='sine';o.frequency.value=880;g.gain.setValueAtTime(0.0001,a.currentTime);g.gain.exponentialRampToValueAtTime(0.12,a.currentTime+0.02);g.gain.exponentialRampToValueAtTime(0.0001,a.currentTime+0.5);o.start();o.stop(a.currentTime+0.52);}catch(e){}}
@@ -800,6 +953,15 @@ async function enablePush(){
   m.style.color='#047857';m.textContent='Phone alerts enabled on this device!';
  }catch(e){m.textContent='Could not enable alerts: '+(e.message||e);}
 }
+function renderCycle(climbers,newOnes){
+ const sec=document.getElementById('cyclesec'),wrap=document.getElementById('cyclewrap');
+ if(!climbers.length){sec.style.display='none';wrap.innerHTML='';return;}
+ sec.style.display='block';
+ wrap.style.maxHeight=Math.min(300,climbers.length*128)+'px';
+ const dur=Math.max(8,climbers.length*5);
+ const html=climbers.map(t=>card(t,newOnes&&newOnes.has(t.ticker))).join('');
+ wrap.innerHTML='<div id="cycletrack" style="--cycdur:'+dur+'s">'+html+html+'</div>';
+}
 async function load(){
  try{
   const d=await (await fetch('/api/quotes',{cache:'no-store'})).json();LAST=d;
@@ -814,11 +976,14 @@ async function load(){
     const mine=(d.mine||[]).slice().sort((a,b)=>(b.from_low??-99)-(a.from_low??-99));
     const cur=new Set(mine.filter(t=>t.near && t.price!=null).map(t=>t.ticker));
     const newOnes=new Set([...cur].filter(x=>!prevAlerts.has(x)));
-    grid.innerHTML=mine.length?mine.map(t=>card(t,newOnes.has(t.ticker))).join(''):'<div class="empty">No stocks yet — add one in the box at the top.</div>';
+    const climbers=mine.filter(t=>t.near && t.price!=null);
+    const rest=mine.filter(t=>!(t.near && t.price!=null));
+    grid.innerHTML=rest.length?rest.map(t=>card(t,false)).join(''):(mine.length?'':'<div class="empty">No stocks yet — add one in the box at the top.</div>');
+    renderCycle(climbers,newOnes);
     const sndOn=document.getElementById('sndtog')&&document.getElementById('sndtog').checked;
     if(newOnes.size && sndOn && !firstLoad) beep();
     prevAlerts=cur;
-  }else{grid.innerHTML='';}
+  }else{grid.innerHTML='';renderCycle([],new Set());}
   firstLoad=false;
  }catch(e){document.getElementById('asof').textContent='could not load data';}
 }
@@ -830,6 +995,53 @@ function copyList(kind){
  const all=rowsOf(LAST.mine||[]);
  const text=[h.join("\\t")].concat(all).join("\\n");
  navigator.clipboard.writeText(text).then(()=>{document.getElementById('msg').style.color='#047857';document.getElementById('msg').textContent='Copied '+(kind==='pre'?'pre-market':'intraday')+' list ('+all.length+' rows)!';setTimeout(()=>document.getElementById('msg').textContent='',2600);});
+}
+function showTab(t){
+ _curTab=t;
+ document.getElementById('view-watch').style.display=(t==='watch')?'block':'none';
+ document.getElementById('view-history').style.display=(t==='history')?'block':'none';
+ document.getElementById('tab-watch').classList.toggle('active',t==='watch');
+ document.getElementById('tab-hist').classList.toggle('active',t==='history');
+ if(t==='history')loadHistory();
+}
+async function loadHistory(){
+ const box=document.getElementById('histalerts');
+ if(!ME.logged_in){box.innerHTML='<div class="empty">Sign in to see your history.</div>';document.getElementById('histsym').innerHTML='';drawDaily([],'');return;}
+ try{
+  const d=await (await fetch('/api/hist/alerts',{cache:'no-store'})).json();
+  const rows=d.rows||[];
+  if(!rows.length){box.innerHTML='<div class="empty">No alerts yet. When a stock climbs 0.5%+ during pre-market or market hours, it’ll be saved here.</div>';}
+  else{
+   const head='<div class="stat" style="font-weight:700;color:#374151"><span>Date / time</span><span>Ticker</span><span>Price</span><span>From low</span></div>';
+   box.innerHTML='<div class="histtbl">'+head+rows.map(function(r){
+     return '<div class="stat"><span class="muted">'+r.day+' '+(r.ts||'')+'</span><span class="tk">'+r.symbol+'</span><span>'+money(r.price)+'</span><span>'+pctSpan(r.from_low)+'</span></div>';
+   }).join('')+'</div>';
+  }
+ }catch(e){box.innerHTML='<div class="empty">Could not load alert history.</div>';}
+ const syms=(LAST.mine||[]).map(function(t){return t.ticker;});
+ const sel=document.getElementById('histsym');const prev=sel.value;
+ sel.innerHTML=syms.length?syms.map(function(s){return '<option value="'+s+'">'+s+'</option>';}).join(''):'<option value="">(no stocks)</option>';
+ if(prev&&syms.indexOf(prev)>=0)sel.value=prev;
+ loadDaily();
+}
+async function loadDaily(){
+ const sym=document.getElementById('histsym').value;
+ const note=document.getElementById('hist_note');
+ if(!sym){drawDaily([],'');note.textContent='Add stocks to your watchlist to see their price history.';return;}
+ try{
+  const d=await (await fetch('/api/hist/daily?symbol='+encodeURIComponent(sym),{cache:'no-store'})).json();
+  drawDaily(d.points||[],sym);
+ }catch(e){note.textContent='Could not load price history.';}
+}
+function drawDaily(points,sym){
+ const cv=document.getElementById('hist_chart'),note=document.getElementById('hist_note');
+ if(_histChart){_histChart.destroy();_histChart=null;}
+ if(!points.length){cv.style.display='none';if(sym)note.textContent='No saved history yet for '+sym+'. History builds up one point per day from now on.';return;}
+ cv.style.display='block';note.textContent=sym+' · daily closing price · '+points.length+' day'+(points.length===1?'':'s');
+ const labels=points.map(function(p){return p.d;}),data=points.map(function(p){return p.close;});
+ const up=data[data.length-1]>=data[0];
+ _histChart=new Chart(cv,{type:'line',data:{labels:labels,datasets:[{data:data,borderColor:up?'#16a34a':'#dc2626',borderWidth:2,pointRadius:2,tension:0.2,fill:false}]},
+   options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{ticks:{maxTicksLimit:8,font:{size:10}}},y:{ticks:{font:{size:10}}}}}});
 }
 if('serviceWorker' in navigator){navigator.serviceWorker.register('/sw.js').catch(function(){});}
 whoami();load();setInterval(load,30000);
@@ -877,6 +1089,13 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, SW_JS.encode("utf-8"), "application/javascript")
         elif self.path.startswith("/icon.png") or self.path.startswith("/apple-touch-icon"):
             self._send(200, icon_bytes(), "image/png")
+        elif self.path.startswith("/api/hist/alerts"):
+            uid = self._uid()
+            self._json({"rows": get_alert_log(uid) if uid else []})
+        elif self.path.startswith("/api/hist/daily"):
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            sym = clean_symbol((q.get("symbol") or [""])[0])
+            self._json({"symbol": sym, "points": get_daily_history(sym) if sym else []})
         elif self.path.startswith("/api/history"):
             q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             sym = clean_symbol((q.get("symbol") or [""])[0])
