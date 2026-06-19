@@ -43,10 +43,22 @@ ICON_PATH       = os.path.join(HERE, "icon.png")
 ET              = ZoneInfo("America/New_York")
 PORT            = int(os.environ.get("PORT", "8765"))
 REFRESH_SECONDS = 60
-RISE_PCT        = 0.005
+RISE_PCT        = 0.005          # condition 1: price must rise >= 0.5% off the intraday low
+VOL_SPIKE_MULT  = 1.5           # condition 4: last-3-min volume > 150% of the average
+ABOVE_OPEN_STOP = 1.01          # condition 6: stop watching once price >= 1.01 x open
 MAX_PER_USER    = 80
 ALERT_SESSIONS  = {"Pre-market", "Open"}
 APP_URL         = os.environ.get("APP_URL", "").strip()
+
+# JT WatchList (06-15-2026). New accounts start empty; this list is loaded into a
+# specific account on request via the seed_watchlist.py helper script.
+DEFAULT_WATCHLIST = [
+    "AAPL", "ADI", "ADMA", "AMZN", "BABA", "CBRL", "CL", "COPX",
+    "CUBE", "CVX", "DE", "FUTU", "GE", "GEV", "GLD", "GOOG",
+    "IEP", "INTU", "JNJ", "JPM", "KO", "LLY", "LMT", "MA",
+    "MAIN", "META", "MSFT", "MU", "NVDA", "PFE", "RIO", "SLV",
+    "TSLA", "VZ", "WMT", "ADSK", "AVGO", "SPCX",
+]
 HAVE_DATA       = bool(ALPACA_KEY and ALPACA_SECRET)
 
 SMTP_HOST = os.environ.get("SMTP_HOST", "").strip()
@@ -61,6 +73,13 @@ VAPID_PUBLIC_KEY  = os.environ.get("VAPID_PUBLIC_KEY", "").strip()
 VAPID_PRIVATE_KEY = os.environ.get("VAPID_PRIVATE_KEY", "").strip()
 VAPID_SUBJECT     = os.environ.get("VAPID_SUBJECT", "").strip() or ("mailto:" + (EMAIL_FROM or "admin@example.com"))
 PUSH_ON = bool(VAPID_PUBLIC_KEY and VAPID_PRIVATE_KEY)
+
+# Pushover (https://pushover.net) — keys come from env vars, not the source file.
+#   export PUSHOVER_USER_KEY=...      export PUSHOVER_API_TOKEN=...
+PUSHOVER_USER_KEY  = os.environ.get("PUSHOVER_USER_KEY", "").strip()
+PUSHOVER_API_TOKEN = os.environ.get("PUSHOVER_API_TOKEN", "").strip()
+PUSHOVER_URL       = "https://api.pushover.net/1/messages.json"
+PUSHOVER_ON = bool(PUSHOVER_USER_KEY and PUSHOVER_API_TOKEN)
 
 _FALLBACK_ICON = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==")
@@ -425,6 +444,14 @@ _hist_lock = threading.Lock()
 _hist_state = {"day": None}
 HIST_MAX = 480
 
+# Rolling per-symbol minute bars, used for the 3-minute average and the volume
+# spike test. Each entry is {symbol: [[minute_str, close, volume], ...]} and is
+# cleared at the start of each new trading day.
+_bars = {}
+_bars_lock = threading.Lock()
+_bars_state = {"day": None}
+BARS_MAX = 480
+
 
 def record_history():
     now = datetime.now(ET)
@@ -515,35 +542,134 @@ def _as_of(ts):
         return ""
 
 
+def _blank_row(t):
+    return {"ticker": t, "price": None, "from_low": None, "prev_close": None,
+            "change": None, "open": None, "high": None, "low": None, "vwap": None,
+            "as_of": "", "near": False, "alert": False, "signal": None, "conditions": []}
+
+
 def build_row(t, snap):
-    blank = {"ticker": t, "price": None, "from_low": None, "prev_close": None,
-             "change": None, "open": None, "high": None, "low": None, "as_of": "", "near": False}
+    blank = _blank_row(t)
     try:
         if not snap:
             return blank
         lt = snap.get("latestTrade") or {}
         db = snap.get("dailyBar") or {}
         pdb = snap.get("prevDailyBar") or {}
+        mb = snap.get("minuteBar") or {}
         c = lt.get("p") or db.get("c")
         low = db.get("l")
         o = db.get("o")
         hi = db.get("h")
         pc = pdb.get("c")
+        vwap = db.get("vw")          # Alpaca daily VWAP
         if not c:
             return blank
         from_low = (c - low) / low * 100 if low else None
         change = (c - pc) / pc * 100 if pc else None
-        return {"ticker": t, "price": round(c, 2),
-                "from_low": None if from_low is None else round(from_low, 2),
-                "prev_close": None if not pc else round(pc, 2),
-                "change": None if change is None else round(change, 2),
-                "open": None if not o else round(o, 2),
-                "high": None if not hi else round(hi, 2),
-                "low": None if not low else round(low, 2),
-                "as_of": _as_of(lt.get("t")),
-                "near": bool(from_low is not None and from_low >= RISE_PCT * 100)}
+        row = {"ticker": t, "price": round(c, 2),
+               "from_low": None if from_low is None else round(from_low, 2),
+               "prev_close": None if not pc else round(pc, 2),
+               "change": None if change is None else round(change, 2),
+               "open": None if not o else round(o, 2),
+               "high": None if not hi else round(hi, 2),
+               "low": None if not low else round(low, 2),
+               "vwap": None if not vwap else round(vwap, 2),
+               "as_of": _as_of(lt.get("t")),
+               # condition 1: price is >= 0.5% above the intraday low
+               "near": bool(from_low is not None and from_low >= RISE_PCT * 100),
+               "alert": False, "signal": None, "conditions": [],
+               # raw minute bar, used by evaluate_signal for the 3-min tests
+               "_mb_t": mb.get("t"), "_mb_c": mb.get("c"), "_mb_v": mb.get("v")}
+        evaluate_signal(row)
+        return row
     except Exception:
         return blank
+
+
+def _update_bars(sym, minute_ts, close, vol):
+    """Append the latest minute bar (deduped by minute) to the rolling buffer."""
+    if not minute_ts or close is None:
+        return
+    today = datetime.now(ET).strftime("%Y-%m-%d")
+    minute = str(minute_ts)[:16]   # 'YYYY-MM-DDTHH:MM'
+    with _bars_lock:
+        if _bars_state["day"] != today:
+            _bars.clear()
+            _bars_state["day"] = today
+        lst = _bars.setdefault(sym, [])
+        v = 0.0 if vol is None else float(vol)
+        if lst and lst[-1][0] == minute:
+            lst[-1] = [minute, float(close), v]
+        else:
+            lst.append([minute, float(close), v])
+        if len(lst) > BARS_MAX:
+            del lst[:len(lst) - BARS_MAX]
+        return list(lst)
+
+
+def evaluate_signal(row):
+    """Apply grandpa's multi-condition logic and attach a confidence score.
+
+    Conditions (from the WatchList "Python" tab):
+      1. price rose >= 0.5% off the intraday low
+      2. price > 3-minute average
+      3. price > VWAP
+      4. last-3-min volume > 150% of the average minute volume
+      5. price < open  (only hunting for a bounce while still below the open)
+      6. stop once price >= 1.01 x open (the setup has played out)
+    Confidence:  1+2 = Good, 1+2+3 = Very Good, 1+2+3+4 = Excellent.
+    A push/email/Pushover alert fires only when 1 AND 2 AND 5 hold and the
+    stop (6) has not triggered. Conditions 3 and 4 raise the confidence label.
+    """
+    sym = row["ticker"]
+    price = row.get("price")
+    o = row.get("open")
+    bars = _update_bars(sym, row.pop("_mb_t", None), row.pop("_mb_c", None), row.pop("_mb_v", None))
+    if price is None:
+        return row
+
+    # Condition 1 — already computed as row["near"].
+    c1 = bool(row.get("near"))
+
+    # Condition 2 — price above the average close of the last 3 minute bars.
+    avg3 = None
+    if bars and len(bars) >= 1:
+        last3 = bars[-3:]
+        avg3 = sum(b[1] for b in last3) / len(last3)
+    c2 = bool(avg3 is not None and price > avg3)
+
+    # Condition 3 — price above the daily VWAP.
+    vwap = row.get("vwap")
+    c3 = bool(vwap is not None and price > vwap)
+
+    # Condition 4 — last-3-min volume exceeds 150% of the average minute volume.
+    c4 = False
+    if bars and len(bars) >= 4:
+        vol3 = sum(b[2] for b in bars[-3:])
+        baseline = sum(b[2] for b in bars) / len(bars)   # avg volume per minute
+        c4 = bool(baseline > 0 and vol3 > VOL_SPIKE_MULT * baseline * 3)
+
+    # Condition 5 — still trading below the open.
+    c5 = bool(o is not None and price < o)
+    # Condition 6 — stop watching once price has recovered to >= 1.01 x open.
+    stopped = bool(o is not None and price >= ABOVE_OPEN_STOP * o)
+
+    met = [i for i, ok in [(1, c1), (2, c2), (3, c3), (4, c4), (5, c5)] if ok]
+    row["conditions"] = met
+    row["vwap"] = None if vwap is None else round(vwap, 2)
+
+    # Confidence ladder requires the 1+2 base.
+    signal = None
+    if c1 and c2:
+        signal = "Good"
+        if c3:
+            signal = "Very Good"
+            if c4:
+                signal = "Excellent"
+    row["signal"] = signal
+    row["alert"] = bool(c1 and c2 and c5 and not stopped)
+    return row
 
 
 def refresh_symbols(syms):
@@ -563,25 +689,28 @@ def rows_for(syms):
     out = []
     with _qlock:
         for s in syms:
-            out.append(_quotes.get(s) or {"ticker": s, "price": None, "from_low": None,
-                       "prev_close": None, "change": None, "open": None, "high": None,
-                       "low": None, "as_of": "", "near": False})
+            out.append(_quotes.get(s) or _blank_row(s))
     return out
 
 
-# =========================== ALERTS (email + push) ===========================
+# ==================== ALERTS (email + web push + Pushover) ====================
 def send_alert_email(to_email, row):
     if not EMAIL_ON:
         return False
     t = row["ticker"]
+    sig = row.get("signal")
+    vwap_line = "" if row.get("vwap") is None else f"VWAP: ${row['vwap']:.2f}\n"
     body = (f"{t} just rose {row['from_low']:.2f}% above today's low.\n\n"
+            f"Signal: {sig or 'n/a'} (conditions met: {row.get('conditions') or '—'})\n"
             f"Price: ${row['price']:.2f}\nDay low: ${row['low']:.2f}\n"
+            f"{vwap_line}"
             f"Change vs prev close: {row['change']:+.2f}%\nAs of: {row['as_of']}\n")
     if APP_URL:
         body += f"\nOpen the dashboard: {APP_URL}\n"
     try:
         msg = EmailMessage()
-        msg["Subject"] = f"📈 {t} alert — +{row['from_low']:.2f}% from the day's low"
+        sig_tag = f" [{sig}]" if sig else ""
+        msg["Subject"] = f"📈 {t} alert{sig_tag} — +{row['from_low']:.2f}% from the day's low"
         msg["From"] = EMAIL_FROM
         msg["To"] = to_email
         msg.set_content(body)
@@ -620,12 +749,35 @@ def send_push(sub, title, body):
         return False
 
 
+def send_pushover(title, body):
+    """Send a Pushover push notification to the configured user key."""
+    if not PUSHOVER_ON:
+        return None
+    try:
+        data = urllib.parse.urlencode({
+            "token": PUSHOVER_API_TOKEN,
+            "user": PUSHOVER_USER_KEY,
+            "title": title,
+            "message": body,
+            "url": APP_URL or "",
+        }).encode()
+        req = urllib.request.Request(PUSHOVER_URL, data=data, headers={"User-Agent": "stock-watch"})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            r.read()
+        return True
+    except Exception as e:
+        print(f"  (pushover failed: {str(e)[:90]})", flush=True)
+        return False
+
+
 def notify_user(uid, email, row):
     sent = False
+    sig = row.get("signal")
+    sig_tag = f" [{sig}]" if sig else ""
     if EMAIL_ON and send_alert_email(email, row):
         sent = True
     if PUSH_ON:
-        title = f"📈 {row['ticker']} +{row['from_low']:.2f}% from low"
+        title = f"📈 {row['ticker']}{sig_tag} +{row['from_low']:.2f}% from low"
         body = f"${row['price']:.2f} · {row['change']:+.2f}% on the day"
         for endpoint, sub in subs_for_user(uid):
             res = send_push(sub, title, body)
@@ -633,11 +785,16 @@ def notify_user(uid, email, row):
                 delete_sub(endpoint)
             elif res:
                 sent = True
+    if PUSHOVER_ON:
+        title = f"📈 {row['ticker']}{sig_tag} +{row['from_low']:.2f}% from low"
+        body = f"${row['price']:.2f} · {row['change']:+.2f}% on the day · signal: {sig or 'n/a'}"
+        if send_pushover(title, body):
+            sent = True
     return sent
 
 
 def alert_check():
-    if not (EMAIL_ON or PUSH_ON):
+    if not (EMAIL_ON or PUSH_ON or PUSHOVER_ON):
         return
     now = datetime.now(ET)
     if session_label(now) not in ALERT_SESSIONS:
@@ -647,7 +804,8 @@ def alert_check():
         for s in get_watchlist(uid):
             with _qlock:
                 row = _quotes.get(s)
-            if row and row.get("near") and row.get("price") is not None:
+            # Fire only on the full multi-condition signal (1 AND 2 AND 5, not stopped).
+            if row and row.get("alert") and row.get("price") is not None:
                 if not already_alerted(uid, s, day):
                     if notify_user(uid, email, row):
                         mark_alerted(uid, s, day)
@@ -781,6 +939,7 @@ input{font:inherit;font-size:13px;padding:7px 10px;border:1px solid #d1d5db;bord
 .card{background:#fff;border:1px solid #e7e9ee;border-left:4px solid #cbd5e1;border-radius:10px;padding:10px 12px;position:relative;cursor:pointer}
 .card:hover{border-color:#c7ccd6}.card.near{border-left-color:#16a34a;background:#f0fdf4}
 .tk{font-weight:700;font-size:15px}.pr{float:right;font-weight:700}
+.sig{margin-left:8px;font-size:11px;font-weight:700;padding:1px 7px;border-radius:999px;vertical-align:middle}
 .row{font-size:12px;color:#16181d;margin-top:3px;font-weight:600}
 .card .muted{color:#1f2430;font-weight:700}
 .up{color:#16a34a;font-weight:700}.dn{color:#dc2626;font-weight:700}
@@ -858,13 +1017,20 @@ let LAST={mine:[]}, ME={logged_in:false}, _chart=null, prevAlerts=new Set(), fir
 function pctSpan(v){if(v===null||v===undefined)return '<span class="muted">—</span>';var s=(v>=0?"+":"")+v.toFixed(2)+"%";return '<span class="'+(v>=0?'up':'dn')+'">'+s+'</span>';}
 function money(v){return (v===null||v===undefined)?'<span class="muted">—</span>':'$'+v.toFixed(2);}
 function beep(){try{var a=new (window.AudioContext||window.webkitAudioContext)();var o=a.createOscillator(),g=a.createGain();o.connect(g);g.connect(a.destination);o.type='sine';o.frequency.value=880;g.gain.setValueAtTime(0.0001,a.currentTime);g.gain.exponentialRampToValueAtTime(0.12,a.currentTime+0.02);g.gain.exponentialRampToValueAtTime(0.0001,a.currentTime+0.5);o.start();o.stop(a.currentTime+0.52);}catch(e){}}
+function sigBadge(t){
+ if(!t.signal)return '';
+ var bg={'Good':'#fef3c7','Very Good':'#dbeafe','Excellent':'#dcfce7'}[t.signal]||'#eee';
+ var fg={'Good':'#92400e','Very Good':'#1e40af','Excellent':'#166534'}[t.signal]||'#333';
+ return '<span class="sig" style="background:'+bg+';color:'+fg+'">'+t.signal+'</span>';
+}
 function card(t,blink){
  let cls='card';if(t.near)cls+=' near';if(blink)cls+=' alerting';
  const x='<button class="x" title="Remove" onclick="event.stopPropagation();delSym(\\''+t.ticker+'\\')">✕</button>';
- return '<div class="'+cls+'" onclick="openDetail(\\''+t.ticker+'\\')">'+x+'<span class="tk">'+t.ticker+'</span><span class="pr">'+money(t.price)+'</span>'+
+ return '<div class="'+cls+'" onclick="openDetail(\\''+t.ticker+'\\')">'+x+'<span class="tk">'+t.ticker+'</span>'+sigBadge(t)+'<span class="pr">'+money(t.price)+'</span>'+
   '<div class="row">change: '+pctSpan(t.change)+'</div>'+
   '<div class="row">from day low: '+pctSpan(t.from_low)+'</div>'+
   '<div class="row muted">open: '+(t.open==null?'—':'$'+t.open.toFixed(2))+' · prev: '+(t.prev_close==null?'—':'$'+t.prev_close.toFixed(2))+'</div>'+
+  '<div class="row muted">VWAP: '+(t.vwap==null?'—':'$'+t.vwap.toFixed(2))+'</div>'+
   '<div class="row muted">'+(t.as_of||'')+'</div></div>';
 }
 function findRow(tk){return (LAST.mine||[]).find(function(r){return r.ticker===tk;});}
@@ -1159,7 +1325,8 @@ def main():
     if not HAVE_DATA:
         print("WARNING: ALPACA_KEY / ALPACA_SECRET not set.")
     print(f"Storage: {'Postgres' if DATABASE_URL else 'local SQLite ('+DB_PATH+')'}")
-    print(f"Data: Alpaca feed={ALPACA_FEED} | Email: {'ON' if EMAIL_ON else 'OFF'} | Push: {'ON' if PUSH_ON else 'OFF'}")
+    print(f"Data: Alpaca feed={ALPACA_FEED} | Email: {'ON' if EMAIL_ON else 'OFF'} | "
+          f"Push: {'ON' if PUSH_ON else 'OFF'} | Pushover: {'ON' if PUSHOVER_ON else 'OFF'}")
     print(f"Icon: {'icon.png found' if os.path.exists(ICON_PATH) else 'using fallback (add icon.png)'}")
     threading.Thread(target=refresher, daemon=True).start()
     srv = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
