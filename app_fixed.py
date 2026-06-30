@@ -1367,8 +1367,31 @@ class Handler(BaseHTTPRequestHandler):
         self._send(404, b"not found", "text/plain")
 
 
+def _ensure_db_ready():
+    """Initialise the DB, retrying in the background until it succeeds.
+
+    Lets the web server boot even when the database is temporarily unreachable
+    (Neon suspended, over quota, or briefly down) instead of crashing on
+    startup with exit status 1.
+    """
+    delay = 30
+    while True:
+        try:
+            init_db()
+            print("DB ready.", flush=True)
+            return
+        except Exception as e:
+            print(f"  (DB not ready, retrying in {delay}s: {str(e)[:120]})", flush=True)
+            time.sleep(delay)
+            delay = min(delay * 2, 600)
+
+
 def main():
-    init_db()
+    try:
+        init_db()
+    except Exception as e:
+        print(f"  (initial DB init failed: {str(e)[:120]}; starting web server anyway, will retry)", flush=True)
+        threading.Thread(target=_ensure_db_ready, daemon=True).start()
     if not HAVE_DATA:
         print("WARNING: ALPACA_KEY / ALPACA_SECRET not set.")
     print(f"Storage: {'Postgres' if DATABASE_URL else 'local SQLite ('+DB_PATH+')'}")
