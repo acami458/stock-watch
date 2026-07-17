@@ -51,6 +51,14 @@ DAILY_SAVE_MINUTE    = 55    # ...at 15:55 ET, instead of rewriting it every min
 RISE_PCT        = 0.005          # condition 1: price must rise >= 0.5% off the intraday low
 VOL_SPIKE_MULT  = 1.5           # condition 4: last-3-min volume > 150% of the average
 ABOVE_OPEN_STOP = 1.01          # condition 6: stop watching once price >= 1.01 x open
+# Grandpa's numbered-alarm model (see the INTRADAY sketch): a *new* alarm fires
+# each time the stock carves a fresh lower intraday low and then bounces
+# RISE_PCT off it. Alarm #1 may be a "false alarm"; if the stock keeps making
+# lower lows you get #2, #3 ... and the bounce off the deepest low is the real
+# signal. NEW_LOW_MIN_DROP keeps trivial new lows from each firing an alarm:
+# the new low must be at least this fraction below the low that fired the
+# previous alarm.
+NEW_LOW_MIN_DROP = float(os.environ.get("NEW_LOW_MIN_DROP", "0.003"))  # 0.3%
 MAX_PER_USER    = 80
 ALERT_SESSIONS  = {"Pre-market", "Open"}
 APP_URL         = os.environ.get("APP_URL", "").strip()
@@ -127,6 +135,17 @@ def init_db():
             user_id INTEGER NOT NULL, symbol TEXT NOT NULL, day TEXT NOT NULL,
             ts TEXT, price REAL, from_low REAL, change REAL,
             PRIMARY KEY(user_id, symbol, day))""")
+        # One row per numbered alarm (grandpa's model): the Nth new-low bounce
+        # for a user/symbol on a given day. Powers the alert-history table.
+        cur.execute("""CREATE TABLE IF NOT EXISTS alarm_events(
+            user_id INTEGER NOT NULL, symbol TEXT NOT NULL, day TEXT NOT NULL,
+            num INTEGER NOT NULL, ts TEXT, price REAL, from_low REAL, change REAL,
+            PRIMARY KEY(user_id, symbol, day, num))""")
+        # Highest alarm number we've already *notified* a user about, so each new
+        # numbered alarm pushes exactly once (instead of once per whole day).
+        cur.execute("""CREATE TABLE IF NOT EXISTS alarm_progress(
+            user_id INTEGER NOT NULL, symbol TEXT NOT NULL, day TEXT NOT NULL,
+            last_num INTEGER DEFAULT 0, PRIMARY KEY(user_id, symbol, day))""")
         cur.execute("""CREATE TABLE IF NOT EXISTS daily_history(
             symbol TEXT NOT NULL, day TEXT NOT NULL, close REAL, low REAL,
             high REAL, prev_close REAL, PRIMARY KEY(symbol, day))""")
@@ -366,6 +385,84 @@ def get_alert_log(uid, limit=200):
         conn.close()
 
 
+# --- numbered alarms (grandpa's model) ---
+def log_alarm_event(uid, symbol, day, num, ts, price, from_low, change):
+    """Record the Nth new-low bounce for a user/symbol/day (once, idempotent)."""
+    conn, kind = _db()
+    try:
+        cur = conn.cursor()
+        try:
+            if kind == "pg":
+                cur.execute("""INSERT INTO alarm_events(user_id, symbol, day, num, ts, price, from_low, change)
+                               VALUES(%s,%s,%s,%s,%s,%s,%s,%s)
+                               ON CONFLICT (user_id, symbol, day, num) DO NOTHING""",
+                            (uid, symbol, day, num, ts, price, from_low, change))
+            else:
+                cur.execute("""INSERT OR IGNORE INTO alarm_events(user_id, symbol, day, num, ts, price, from_low, change)
+                               VALUES(?,?,?,?,?,?,?,?)""", (uid, symbol, day, num, ts, price, from_low, change))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+    finally:
+        conn.close()
+
+
+def max_logged_alarm(uid, symbol, day):
+    """Highest alarm number already saved to history for this user/symbol/day."""
+    conn, kind = _db()
+    try:
+        cur = conn.cursor()
+        cur.execute(_ph("SELECT MAX(num) FROM alarm_events WHERE user_id=%s AND symbol=%s AND day=%s", kind),
+                    (uid, symbol, day))
+        r = cur.fetchone()
+        return int(r[0]) if r and r[0] is not None else 0
+    finally:
+        conn.close()
+
+
+def get_alarm_events(uid, limit=200):
+    """Most recent numbered alarms for the history table."""
+    conn, kind = _db()
+    try:
+        cur = conn.cursor()
+        cur.execute(_ph("""SELECT symbol, day, num, ts, price, from_low, change FROM alarm_events
+                           WHERE user_id=%s ORDER BY day DESC, ts DESC, num DESC LIMIT %s""", kind),
+                    (uid, limit))
+        return [{"symbol": r[0], "day": r[1], "num": r[2], "ts": r[3], "price": r[4],
+                 "from_low": r[5], "change": r[6]} for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+def get_notified_alarm(uid, symbol, day):
+    """Highest alarm number we've already pushed/emailed for this user/symbol/day."""
+    conn, kind = _db()
+    try:
+        cur = conn.cursor()
+        cur.execute(_ph("SELECT last_num FROM alarm_progress WHERE user_id=%s AND symbol=%s AND day=%s", kind),
+                    (uid, symbol, day))
+        r = cur.fetchone()
+        return int(r[0]) if r and r[0] is not None else 0
+    finally:
+        conn.close()
+
+
+def set_notified_alarm(uid, symbol, day, num):
+    conn, kind = _db()
+    try:
+        cur = conn.cursor()
+        if kind == "pg":
+            cur.execute("""INSERT INTO alarm_progress(user_id, symbol, day, last_num) VALUES(%s,%s,%s,%s)
+                           ON CONFLICT (user_id, symbol, day) DO UPDATE SET last_num=EXCLUDED.last_num""",
+                        (uid, symbol, day, num))
+        else:
+            cur.execute("INSERT OR REPLACE INTO alarm_progress(user_id, symbol, day, last_num) VALUES(?,?,?,?)",
+                        (uid, symbol, day, num))
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def upsert_daily(symbol, day, close, low, high, prev_close):
     conn, kind = _db()
     try:
@@ -456,6 +553,38 @@ _bars = {}
 _bars_lock = threading.Lock()
 _bars_state = {"day": None}
 BARS_MAX = 480
+
+# Grandpa's numbered-alarm tracker. Per symbol, per day:
+#   count      -> how many alarms have fired today (1st, 2nd, 3rd bounce...)
+#   armed_low  -> the intraday low that fired the last alarm; a new alarm can
+#                 only fire once the stock prints a low meaningfully BELOW this.
+# Shared across all users (it's a property of the stock's price action).
+_alarm = {}
+_alarm_lock = threading.Lock()
+_alarm_state = {"day": None}
+
+
+def _update_alarm(sym, day_low, bounced):
+    """Advance the numbered-alarm counter for one symbol on one tick.
+
+    Fires (increments the count) when the price has bounced RISE_PCT off the
+    intraday low (`bounced`) AND that low is a fresh new low at least
+    NEW_LOW_MIN_DROP below the low that fired the previous alarm. Returns
+    (current_count, fired_this_tick).
+    """
+    today = datetime.now(ET).strftime("%Y-%m-%d")
+    with _alarm_lock:
+        if _alarm_state["day"] != today:
+            _alarm.clear()
+            _alarm_state["day"] = today
+        st = _alarm.setdefault(sym, {"count": 0, "armed_low": None})
+        fired = False
+        if bounced and day_low is not None:
+            if st["armed_low"] is None or day_low <= st["armed_low"] * (1 - NEW_LOW_MIN_DROP):
+                st["count"] += 1
+                st["armed_low"] = day_low
+                fired = True
+        return st["count"], fired
 
 
 def record_history():
@@ -550,7 +679,8 @@ def _as_of(ts):
 def _blank_row(t):
     return {"ticker": t, "price": None, "from_low": None, "prev_close": None,
             "change": None, "open": None, "high": None, "low": None, "vwap": None,
-            "as_of": "", "near": False, "alert": False, "signal": None, "conditions": []}
+            "as_of": "", "near": False, "alert": False, "signal": None, "conditions": [],
+            "alarm_num": 0, "new_alarm": False}
 
 
 def build_row(t, snap):
@@ -584,6 +714,7 @@ def build_row(t, snap):
                # condition 1: price is >= 0.5% above the intraday low
                "near": bool(from_low is not None and from_low >= RISE_PCT * 100),
                "alert": False, "signal": None, "conditions": [],
+               "alarm_num": 0, "new_alarm": False,
                # raw minute bar, used by evaluate_signal for the 3-min tests
                "_mb_t": mb.get("t"), "_mb_c": mb.get("c"), "_mb_v": mb.get("v")}
         evaluate_signal(row)
@@ -673,6 +804,14 @@ def evaluate_signal(row):
             if c4:
                 signal = "Excellent"
     row["signal"] = signal
+
+    # Grandpa's numbered alarm: a fresh alarm each time a NEW lower intraday low
+    # bounces >= RISE_PCT. Independent of the confidence ladder above, which is
+    # kept intact as the quality label shown alongside the number.
+    count, fired = _update_alarm(sym, row.get("low"), c1)
+    row["alarm_num"] = count
+    row["new_alarm"] = fired
+    # Kept for reference/UI: the old full-confidence alert state.
     row["alert"] = bool(c1 and c2 and c5 and not stopped)
     return row
 
@@ -704,8 +843,11 @@ def send_alert_email(to_email, row):
         return False
     t = row["ticker"]
     sig = row.get("signal")
+    num = row.get("alarm_num") or 1
     vwap_line = "" if row.get("vwap") is None else f"VWAP: ${row['vwap']:.2f}\n"
-    body = (f"{t} just rose {row['from_low']:.2f}% above today's low.\n\n"
+    body = (f"Alarm #{num} for {t}: it just bounced {row['from_low']:.2f}% off a new intraday low.\n\n"
+            f"This is the #{num} new-low bounce today — the higher the number, the more the "
+            f"stock has been driven down and re-tested.\n\n"
             f"Signal: {sig or 'n/a'} (conditions met: {row.get('conditions') or '—'})\n"
             f"Price: ${row['price']:.2f}\nDay low: ${row['low']:.2f}\n"
             f"{vwap_line}"
@@ -715,7 +857,7 @@ def send_alert_email(to_email, row):
     try:
         msg = EmailMessage()
         sig_tag = f" [{sig}]" if sig else ""
-        msg["Subject"] = f"📈 {t} alert{sig_tag} — +{row['from_low']:.2f}% from the day's low"
+        msg["Subject"] = f"🔔 {t} Alarm #{num}{sig_tag} — +{row['from_low']:.2f}% off a new low"
         msg["From"] = EMAIL_FROM
         msg["To"] = to_email
         msg.set_content(body)
@@ -778,11 +920,12 @@ def send_pushover(title, body):
 def notify_user(uid, email, row):
     sent = False
     sig = row.get("signal")
+    num = row.get("alarm_num") or 1
     sig_tag = f" [{sig}]" if sig else ""
     if EMAIL_ON and send_alert_email(email, row):
         sent = True
     if PUSH_ON:
-        title = f"📈 {row['ticker']}{sig_tag} +{row['from_low']:.2f}% from low"
+        title = f"🔔 {row['ticker']} Alarm #{num}{sig_tag} +{row['from_low']:.2f}% off new low"
         body = f"${row['price']:.2f} · {row['change']:+.2f}% on the day"
         for endpoint, sub in subs_for_user(uid):
             res = send_push(sub, title, body)
@@ -791,7 +934,7 @@ def notify_user(uid, email, row):
             elif res:
                 sent = True
     if PUSHOVER_ON:
-        title = f"📈 {row['ticker']}{sig_tag} +{row['from_low']:.2f}% from low"
+        title = f"🔔 {row['ticker']} Alarm #{num}{sig_tag} +{row['from_low']:.2f}% off new low"
         body = f"${row['price']:.2f} · {row['change']:+.2f}% on the day · signal: {sig or 'n/a'}"
         if send_pushover(title, body):
             sent = True
@@ -809,11 +952,14 @@ def alert_check():
         for s in get_watchlist(uid):
             with _qlock:
                 row = _quotes.get(s)
-            # Fire only on the full multi-condition signal (1 AND 2 AND 5, not stopped).
-            if row and row.get("alert") and row.get("price") is not None:
-                if not already_alerted(uid, s, day):
+            # Grandpa's model: fire once per NEW numbered alarm (each new-low
+            # bounce), not just once per day. Notify only when this symbol's
+            # alarm count has climbed past what we've already sent this user.
+            if row and row.get("price") is not None:
+                num = row.get("alarm_num") or 0
+                if num > 0 and num > get_notified_alarm(uid, s, day):
                     if notify_user(uid, email, row):
-                        mark_alerted(uid, s, day)
+                        set_notified_alarm(uid, s, day, num)
 
 
 def record_daily_all():
@@ -848,9 +994,11 @@ def record_daily_all():
         conn.close()
 
 
-def log_crossings():
-    """Log every stock that crosses 0.5%+ from its day low, once per user/symbol/day.
-    Recorded regardless of whether email/push alerts are configured."""
+def record_alarms():
+    """Save every numbered alarm to history, one row per (user, symbol, day, num).
+
+    Runs regardless of whether email/push alerts are configured, so the History
+    tab always shows the 1st / 2nd / 3rd ... new-low bounces for the day."""
     now = datetime.now(ET)
     if session_label(now) not in ALERT_SESSIONS:
         return
@@ -860,8 +1008,16 @@ def log_crossings():
         for s in get_watchlist(uid):
             with _qlock:
                 row = _quotes.get(s)
-            if row and row.get("near") and row.get("price") is not None:
-                log_alert(uid, s, day, ts, row.get("price"), row.get("from_low"), row.get("change"))
+            if not (row and row.get("price") is not None):
+                continue
+            num = row.get("alarm_num") or 0
+            if num <= 0:
+                continue
+            already = max_logged_alarm(uid, s, day)
+            # Backfill any alarm numbers we haven't logged yet (usually just one).
+            for n in range(already + 1, num + 1):
+                log_alarm_event(uid, s, day, n, ts, row.get("price"),
+                                row.get("from_low"), row.get("change"))
 
 
 def refresher():
@@ -906,7 +1062,7 @@ def refresher():
                 except Exception:
                     pass
             try:
-                log_crossings()
+                record_alarms()
             except Exception:
                 pass
             try:
@@ -924,8 +1080,9 @@ def meta():
             "date": now.strftime("%Y-%m-%d"),
             "market_open": market_open(now),
             "session": session_label(now),
-            "rule": f"stocks turning green have climbed {RISE_PCT*100:.1f}%+ from their lowest price today. "
-                    f"You'll get an alarm when one of your stocks meet logical code.",
+            "rule": f"You get a new numbered alarm each time a stock bounces {RISE_PCT*100:.1f}%+ off a "
+                    f"fresh intraday low. Alarm #1 can be a false alarm — if the stock keeps making "
+                    f"lower lows you'll see #2, #3… and the bounce off the deepest low is the real signal.",
             "have_key": HAVE_DATA,
             "email_on": EMAIL_ON, "push_on": PUSH_ON}
 
@@ -987,6 +1144,8 @@ input{font:inherit;font-size:13px;padding:7px 10px;border:1px solid #d1d5db;bord
 .card:hover{border-color:#c7ccd6}.card.near{border-left-color:#16a34a;background:#f0fdf4}
 .tk{font-weight:700;font-size:15px}.pr{float:right;font-weight:700}
 .sig{margin-left:8px;font-size:11px;font-weight:700;padding:1px 7px;border-radius:999px;vertical-align:middle}
+.alrm{margin-left:6px;font-size:11px;font-weight:800;padding:1px 7px;border-radius:999px;vertical-align:middle;background:#fef3c7;color:#92400e;border:1px solid #fcd34d}
+.alrm.deep{background:#fee2e2;color:#991b1b;border-color:#fca5a5}
 .row{font-size:12px;color:#16181d;margin-top:3px;font-weight:600}
 .card .muted{color:#1f2430;font-weight:700}
 .up{color:#16a34a;font-weight:700}.dn{color:#dc2626;font-weight:700}
@@ -1005,8 +1164,8 @@ input{font:inherit;font-size:13px;padding:7px 10px;border:1px solid #d1d5db;bord
 .tab:hover{background:#f3f4f6}
 .tab.active{color:#1d4ed8;border-bottom-color:#1d4ed8}
 .histtbl .stat span{flex:1}
-.histtbl .stat span:nth-child(2){text-align:center}
-.histtbl .stat span:nth-child(3),.histtbl .stat span:nth-child(4){text-align:right}
+.histtbl .stat span:nth-child(2),.histtbl .stat span:nth-child(3){text-align:center}
+.histtbl .stat span:nth-child(4),.histtbl .stat span:nth-child(5){text-align:right}
 </style></head><body>
 <h1>📈 Stock Watch</h1>
 <div class="meta" id="asof">loading…</div>
@@ -1060,7 +1219,7 @@ input{font:inherit;font-size:13px;padding:7px 10px;border:1px solid #d1d5db;bord
   </div>
 </div>
 <script>
-let LAST={mine:[]}, ME={logged_in:false}, _chart=null, prevAlerts=new Set(), firstLoad=true, _curTab='watch', _histChart=null;
+let LAST={mine:[]}, ME={logged_in:false}, _chart=null, prevAlarmNum={}, firstLoad=true, _curTab='watch', _histChart=null;
 function pctSpan(v){if(v===null||v===undefined)return '<span class="muted">—</span>';var s=(v>=0?"+":"")+v.toFixed(2)+"%";return '<span class="'+(v>=0?'up':'dn')+'">'+s+'</span>';}
 function money(v){return (v===null||v===undefined)?'<span class="muted">—</span>':'$'+v.toFixed(2);}
 function beep(){try{var a=new (window.AudioContext||window.webkitAudioContext)();var o=a.createOscillator(),g=a.createGain();o.connect(g);g.connect(a.destination);o.type='sine';o.frequency.value=880;g.gain.setValueAtTime(0.0001,a.currentTime);g.gain.exponentialRampToValueAtTime(0.12,a.currentTime+0.02);g.gain.exponentialRampToValueAtTime(0.0001,a.currentTime+0.5);o.start();o.stop(a.currentTime+0.52);}catch(e){}}
@@ -1070,10 +1229,15 @@ function sigBadge(t){
  var fg={'Good':'#92400e','Very Good':'#1e40af','Excellent':'#166534'}[t.signal]||'#333';
  return '<span class="sig" style="background:'+bg+';color:'+fg+'">'+t.signal+'</span>';
 }
+function alarmBadge(t){
+ var n=t.alarm_num||0; if(n<=0) return '';
+ var deep=(n>=3)?' deep':'';
+ return '<span class="alrm'+deep+'" title="'+n+' new-low bounce(s) today">🔔 #'+n+'</span>';
+}
 function card(t,blink){
  let cls='card';if(t.near)cls+=' near';if(blink)cls+=' alerting';
  const x='<button class="x" title="Remove" onclick="event.stopPropagation();delSym(\\''+t.ticker+'\\')">✕</button>';
- return '<div class="'+cls+'" onclick="openDetail(\\''+t.ticker+'\\')">'+x+'<span class="tk">'+t.ticker+'</span>'+sigBadge(t)+'<span class="pr">'+money(t.price)+'</span>'+
+ return '<div class="'+cls+'" onclick="openDetail(\\''+t.ticker+'\\')">'+x+'<span class="tk">'+t.ticker+'</span>'+sigBadge(t)+alarmBadge(t)+'<span class="pr">'+money(t.price)+'</span>'+
   '<div class="row">change: '+pctSpan(t.change)+'</div>'+
   '<div class="row">from day low: '+pctSpan(t.from_low)+'</div>'+
   '<div class="row muted">open: '+(t.open==null?'—':'$'+t.open.toFixed(2))+' · prev: '+(t.prev_close==null?'—':'$'+t.prev_close.toFixed(2))+'</div>'+
@@ -1086,7 +1250,9 @@ async function openDetail(tk){
  document.getElementById('overlay').style.display='flex';
  document.getElementById('d_tk').textContent=t.ticker;
  document.getElementById('d_price').innerHTML=money(t.price)+' &nbsp; '+pctSpan(t.change);
- const rows=[['From day low',(t.from_low==null?'—':(t.from_low>=0?'+':'')+t.from_low.toFixed(2)+'%')],
+ const rows=[['Alarms today',(t.alarm_num&&t.alarm_num>0)?('#'+t.alarm_num+' (new-low bounces)'):'none yet'],
+   ['Signal',t.signal||'—'],
+   ['From day low',(t.from_low==null?'—':(t.from_low>=0?'+':'')+t.from_low.toFixed(2)+'%')],
    ['Open',t.open==null?'—':'$'+t.open.toFixed(2)],['Day high',t.high==null?'—':'$'+t.high.toFixed(2)],
    ['Day low',t.low==null?'—':'$'+t.low.toFixed(2)],['Prev close',t.prev_close==null?'—':'$'+t.prev_close.toFixed(2)],
    ['As of',t.as_of||'—']];
@@ -1167,13 +1333,19 @@ async function load(){
   document.getElementById('signedout').style.display=ME.logged_in?'none':'block';
   const grid=document.getElementById('mygrid');
   if(ME.logged_in){
-    const mine=(d.mine||[]).slice().sort((a,b)=>((a.near?1:0)-(b.near?1:0))||((b.from_low??-99)-(a.from_low??-99)));
-    const cur=new Set(mine.filter(t=>t.near && t.price!=null).map(t=>t.ticker));
-    const newOnes=new Set([...cur].filter(x=>!prevAlerts.has(x)));
+    // Sort: most alarms first, then closest to a fresh bounce off the low.
+    const mine=(d.mine||[]).slice().sort((a,b)=>((b.alarm_num||0)-(a.alarm_num||0))||((b.from_low??-99)-(a.from_low??-99)));
+    // A "new" alarm = this symbol's alarm number climbed since the last poll.
+    const newOnes=new Set();
+    const curNum={};
+    mine.forEach(function(t){
+      const n=t.alarm_num||0; curNum[t.ticker]=n;
+      if(t.price!=null && n>(prevAlarmNum[t.ticker]||0)) newOnes.add(t.ticker);
+    });
     grid.innerHTML=mine.length?mine.map(t=>card(t,newOnes.has(t.ticker))).join(''):'<div class="empty">No stocks yet — add one in the box at the top.</div>';
     const sndOn=document.getElementById('sndtog')&&document.getElementById('sndtog').checked;
     if(newOnes.size && sndOn && !firstLoad) beep();
-    prevAlerts=cur;
+    prevAlarmNum=curNum;
   }else{grid.innerHTML='';}
   firstLoad=false;
  }catch(e){document.getElementById('asof').textContent='could not load data';}
@@ -1201,11 +1373,11 @@ async function loadHistory(){
  try{
   const d=await (await fetch('/api/hist/alerts',{cache:'no-store'})).json();
   const rows=d.rows||[];
-  if(!rows.length){box.innerHTML='<div class="empty">No alerts yet. When a stock climbs 0.5%+ during pre-market or market hours, it’ll be saved here.</div>';}
+  if(!rows.length){box.innerHTML='<div class="empty">No alarms yet. Each time a stock bounces 0.5%+ off a fresh intraday low during pre-market or market hours, a numbered alarm is saved here.</div>';}
   else{
-   const head='<div class="stat" style="font-weight:700;color:#374151"><span>Date / time</span><span>Ticker</span><span>Price</span><span>From low</span></div>';
+   const head='<div class="stat" style="font-weight:700;color:#374151"><span>Date / time</span><span>Ticker</span><span>Alarm</span><span>Price</span><span>From low</span></div>';
    box.innerHTML='<div class="histtbl">'+head+rows.map(function(r){
-     return '<div class="stat"><span class="muted">'+r.day+' '+(r.ts||'')+'</span><span class="tk">'+r.symbol+'</span><span>'+money(r.price)+'</span><span>'+pctSpan(r.from_low)+'</span></div>';
+     return '<div class="stat"><span class="muted">'+r.day+' '+(r.ts||'')+'</span><span class="tk">'+r.symbol+'</span><span>'+alarmBadge({alarm_num:r.num})+'</span><span>'+money(r.price)+'</span><span>'+pctSpan(r.from_low)+'</span></div>';
    }).join('')+'</div>';
   }
  }catch(e){box.innerHTML='<div class="empty">Could not load alert history.</div>';}
@@ -1282,7 +1454,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, icon_bytes(), "image/png")
         elif self.path.startswith("/api/hist/alerts"):
             uid = self._uid()
-            self._json({"rows": get_alert_log(uid) if uid else []})
+            self._json({"rows": get_alarm_events(uid) if uid else []})
         elif self.path.startswith("/api/hist/daily"):
             q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             sym = clean_symbol((q.get("symbol") or [""])[0])
