@@ -994,6 +994,86 @@ def record_daily_all():
         conn.close()
 
 
+def fetch_daily_bars(syms, days=365):
+    """Fetch historical daily OHLC bars from Alpaca -> {symbol: [bar, ...]}.
+
+    Uses the same keys/feed as the live snapshots. Handles symbol chunking and
+    Alpaca's page_token pagination. Used to backfill daily_history so the
+    Backtest tab has real data to work with immediately.
+    """
+    if not HAVE_DATA or not syms:
+        return {}
+    from datetime import timedelta
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(days=days)
+    start_s, end_s = start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")
+    headers = {"APCA-API-KEY-ID": ALPACA_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET,
+               "User-Agent": "stock-watch"}
+    bars_url = "https://data.alpaca.markets/v2/stocks/bars"
+    out = {}
+    for chunk in _chunks(sorted(set(syms)), 90):
+        page_token = None
+        for _ in range(50):  # page cap, just in case
+            params = {"symbols": ",".join(chunk), "timeframe": "1Day",
+                      "start": start_s, "end": end_s, "feed": ALPACA_FEED,
+                      "limit": "10000", "adjustment": "raw"}
+            if page_token:
+                params["page_token"] = page_token
+            url = bars_url + "?" + urllib.parse.urlencode(params)
+            req = urllib.request.Request(url, headers=headers)
+            try:
+                with urllib.request.urlopen(req, timeout=20) as r:
+                    data = json.loads(r.read().decode())
+            except urllib.error.HTTPError as e:
+                if e.code == 429:
+                    time.sleep(1.5); continue
+                break
+            except Exception:
+                break
+            for s, lst in (data.get("bars") or {}).items():
+                out.setdefault(s, []).extend(lst)
+            page_token = data.get("next_page_token")
+            if not page_token:
+                break
+    return out
+
+
+def backfill_daily_history(syms, days=365):
+    """Populate daily_history from Alpaca daily bars. Returns rows written."""
+    bars = fetch_daily_bars(syms, days)
+    rows = []
+    for s, lst in bars.items():
+        lst = sorted(lst, key=lambda b: str(b.get("t", "")))
+        prev_close = None
+        for b in lst:
+            day = str(b.get("t", ""))[:10]
+            close = b.get("c")
+            if not day or close is None:
+                continue
+            rows.append((s, day, close, b.get("l"), b.get("h"), prev_close))
+            prev_close = close
+    if not rows:
+        return 0
+    conn, kind = _db()
+    try:
+        cur = conn.cursor()
+        if kind == "pg":
+            cur.executemany(
+                """INSERT INTO daily_history(symbol, day, close, low, high, prev_close)
+                   VALUES(%s,%s,%s,%s,%s,%s)
+                   ON CONFLICT (symbol, day) DO UPDATE SET
+                     close=EXCLUDED.close, low=EXCLUDED.low,
+                     high=EXCLUDED.high, prev_close=EXCLUDED.prev_close""", rows)
+        else:
+            cur.executemany(
+                """INSERT OR REPLACE INTO daily_history(symbol, day, close, low, high, prev_close)
+                   VALUES(?,?,?,?,?,?)""", rows)
+        conn.commit()
+    finally:
+        conn.close()
+    return len(rows)
+
+
 def record_alarms():
     """Save every numbered alarm to history, one row per (user, symbol, day, num).
 
@@ -1108,6 +1188,652 @@ self.addEventListener('notificationclick', function(e){
 });"""
 
 
+SIM_JS = r"""/* ============================================================
+   Stock Watch — Backtest simulator ("buy the lowest")
+   Served at /sim.js. Depends on Chart.js (already loaded by the page)
+   and on the app's existing /api/quotes and /api/hist/daily endpoints.
+   All logic is client-side; nothing here touches the server data layer.
+   ============================================================ */
+(function () {
+  "use strict";
+
+  // ---- strategy palette (matches the app's colors) ----
+  var STRATS = [
+    { key: "oracle", name: "Perfect low",  color: "#1d4ed8", hint: "needs hindsight" },
+    { key: "dip",    name: "Buy the dip",  color: "#16a34a", hint: "realistic rule" },
+    { key: "hold",   name: "Buy & hold",   color: "#d97706", hint: "buy day one" },
+    { key: "random", name: "Random entry", color: "#64748b", hint: "no skill" }
+  ];
+  var ALARM_COLOR = "#7c3aed";
+  // Daily analog of the app's numbered-alarm rule. Mirrors the server defaults:
+  //   RISE_PCT (bounce off the low)      = 0.5%
+  //   NEW_LOW_MIN_DROP (fresh lower low) = 0.3%
+  var RISE_PCT_D = 0.005, NEW_LOW_DROP_D = 0.003;
+
+  // ---- seedable RNG (mulberry32) + normal via Marsaglia polar ----
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  function makeNormal(rng) {
+    var spare = null;
+    return function () {
+      if (spare !== null) { var s = spare; spare = null; return s; }
+      var u, v, q;
+      do { u = rng() * 2 - 1; v = rng() * 2 - 1; q = u * u + v * v; } while (q >= 1 || q === 0);
+      var m = Math.sqrt(-2 * Math.log(q) / q);
+      spare = v * m; return u * m;
+    };
+  }
+
+  // ---- formatting ----
+  function pct(x) { return (x * 100).toFixed(1) + "%"; }
+  function pctS(x) { return (x >= 0 ? "+" : "") + (x * 100).toFixed(1) + "%"; }
+  function cls(x) { return x >= 0 ? "up" : "dn"; }
+
+  // ---------------------------------------------------------
+  //  MONTE CARLO ENGINE
+  // ---------------------------------------------------------
+  function simulateMC(p) {
+    var rng = mulberry32(p.seed >>> 0);
+    var norm = makeNormal(rng);
+    var dt = 1 / 252;
+    var drift = (p.mu - 0.5 * p.sigma * p.sigma) * dt;
+    var vol = p.sigma * Math.sqrt(dt);
+
+    var returns = { oracle: [], dip: [], hold: [], random: [] };
+    var dipTriggered = 0, dipBeatHold = 0, sample = null;
+
+    for (var r = 0; r < p.runs; r++) {
+      var n = p.days + 1;
+      var path = new Float64Array(n);
+      path[0] = 100;
+      for (var t = 1; t < n; t++) path[t] = path[t - 1] * Math.exp(drift + vol * norm());
+
+      var exit = path[n - 1], start = path[0];
+
+      var minP = Infinity, minIdx = 0;
+      for (t = 0; t < n - 1; t++) { if (path[t] < minP) { minP = path[t]; minIdx = t; } }
+
+      var runMax = path[0], dipIdx = -1;
+      for (t = 0; t < n - 1; t++) {
+        if (path[t] > runMax) runMax = path[t];
+        if (path[t] <= runMax * (1 - p.dip)) { dipIdx = t; break; }
+      }
+      var dipEntry = dipIdx >= 0 ? path[dipIdx] : start;
+      if (dipIdx >= 0) dipTriggered++;
+
+      var randIdx = Math.floor(rng() * (n - 1));
+      var randEntry = path[randIdx];
+
+      var rH = exit / start - 1, rD = exit / dipEntry - 1;
+      returns.oracle.push(exit / minP - 1);
+      returns.dip.push(rD);
+      returns.hold.push(rH);
+      returns.random.push(exit / randEntry - 1);
+      if (rD > rH) dipBeatHold++;
+
+      if (r === 0) sample = { path: path, minIdx: minIdx, dipIdx: dipIdx, randIdx: randIdx };
+    }
+
+    var stats = {};
+    STRATS.forEach(function (s) {
+      var arr = returns[s.key].slice().sort(function (a, b) { return a - b; });
+      var m = arr.length;
+      stats[s.key] = {
+        mean: arr.reduce(function (x, y) { return x + y; }, 0) / m,
+        median: arr[Math.floor(m / 2)],
+        win: returns[s.key].filter(function (x) { return x > 0; }).length / m,
+        p95: arr[Math.floor(m * 0.95)],
+        p05: arr[Math.floor(m * 0.05)]
+      };
+    });
+
+    return {
+      mode: "mc", returns: returns, stats: stats, sample: sample,
+      dipTriggerRate: dipTriggered / p.runs, dipBeatHoldRate: dipBeatHold / p.runs
+    };
+  }
+
+  // ---------------------------------------------------------
+  //  APP ALARM RULE — daily analog of the numbered-alarm model
+  // ---------------------------------------------------------
+  // A new numbered alarm fires each day the stock (a) bounces >= RISE off that
+  // day's low [close is RISE above the low] AND (b) that low is a fresh new low
+  // at least DROP below the low that armed the previous alarm. This mirrors the
+  // server's _update_alarm(), applied to daily bars instead of intraday ticks.
+  function computeAlarms(points, rise, drop) {
+    // The first saved day sets the baseline reference low (no alarm — on daily
+    // bars almost every day closes >RISE above its own low, so firing on day one
+    // would be meaningless). After that, an alarm fires on a day that prints a
+    // fresh lower low (>= DROP below the last armed low) AND closes >= RISE above
+    // that day's low. Each fire arms the reference at the new, lower low — so the
+    // numbers climb only as the stock is driven to genuinely deeper lows.
+    var armed = null, count = 0, out = [];
+    for (var i = 0; i < points.length; i++) {
+      var low = points[i].low, close = points[i].close;
+      if (low == null || close == null || low <= 0) continue;
+      if (armed === null) { armed = low; continue; }             // baseline day
+      var bounced = ((close - low) / low) >= rise;               // condition 1
+      if (bounced && low <= armed * (1 - drop)) {                // fresh lower low
+        count++; armed = low;
+        out.push({ num: count, idx: i, close: close, low: low, fromLow: (close - low) / low });
+      }
+    }
+    return out;
+  }
+
+  // ---------------------------------------------------------
+  //  REAL-HISTORY ENGINE  (single actual price series)
+  // ---------------------------------------------------------
+  function backtestReal(points, dipPct, alarmN) {
+    // points: [{d, low, close}], oldest -> newest
+    var closes = points.map(function (p) { return p.close; });
+    var n = closes.length;
+    var exit = closes[n - 1], start = closes[0];
+
+    var minP = Infinity, minIdx = 0;
+    for (var i = 0; i < n - 1; i++) { if (closes[i] < minP) { minP = closes[i]; minIdx = i; } }
+
+    var runMax = closes[0], dipIdx = -1;
+    for (i = 0; i < n - 1; i++) {
+      if (closes[i] > runMax) runMax = closes[i];
+      if (closes[i] <= runMax * (1 - dipPct)) { dipIdx = i; break; }
+    }
+    var dipEntry = dipIdx >= 0 ? closes[dipIdx] : start;
+
+    // "random" benchmark on one path = average over every possible entry day
+    var sumRand = 0;
+    for (i = 0; i < n - 1; i++) sumRand += exit / closes[i] - 1;
+    var avgRandom = sumRand / (n - 1);
+
+    // the app's own signal
+    var alarms = computeAlarms(points, RISE_PCT_D, NEW_LOW_DROP_D);
+    var alarmReturns = alarms.map(function (a) {
+      return { num: a.num, idx: a.idx, d: points[a.idx].d, close: a.close, ret: exit / a.close - 1 };
+    });
+    var pick = alarms[(alarmN || 1) - 1] || null;
+
+    var res = {
+      oracle: { ret: exit / minP - 1, idx: minIdx, entry: minP },
+      dip: { ret: exit / dipEntry - 1, idx: dipIdx, entry: dipEntry, triggered: dipIdx >= 0 },
+      hold: { ret: exit / start - 1, idx: 0, entry: start },
+      random: { ret: avgRandom, idx: -1, entry: null },
+      alarm: pick
+        ? { ret: exit / pick.close - 1, idx: pick.idx, entry: pick.close, num: alarmN, fired: alarms.length }
+        : { ret: null, idx: -1, entry: null, num: alarmN, fired: alarms.length }
+    };
+    return { mode: "real", n: n, exit: exit, closes: closes, points: points,
+      res: res, alarms: alarms, alarmReturns: alarmReturns };
+  }
+
+  // ---------------------------------------------------------
+  //  RENDERING
+  // ---------------------------------------------------------
+  var pathChart = null, distChart = null, realChart = null;
+  var lastMC = null;
+
+  function tile(name, color, valHtml, meta) {
+    return '<div class="sim-tile"><div class="sim-tname"><span class="sim-dot" style="background:' +
+      color + '"></span>' + name + '</div><div class="sim-tval ' + (valHtml.indexOf("-") === 0 ? "dn" : "up") +
+      '">' + valHtml + '</div><div class="sim-tmeta">' + meta + '</div></div>';
+  }
+
+  function renderMCTiles(res) {
+    var html = STRATS.map(function (s) {
+      var st = res.stats[s.key];
+      return tile(s.name, s.color, pctS(st.mean), s.hint + " · wins " + pct(st.win) + " of runs");
+    }).join("");
+    document.getElementById("sim-tiles").innerHTML = html;
+  }
+
+  function renderMCTable(res) {
+    var body = STRATS.map(function (s) {
+      var st = res.stats[s.key];
+      return '<div class="sim-trow"><span><span class="sim-dot" style="background:' + s.color + '"></span>' +
+        s.name + '</span><span class="' + cls(st.mean) + '">' + pctS(st.mean) + '</span><span class="' +
+        cls(st.median) + '">' + pctS(st.median) + '</span><span>' + pct(st.win) + '</span><span class="up">' +
+        pctS(st.p95) + '</span><span class="dn">' + pctS(st.p05) + '</span></div>';
+    }).join("");
+    document.getElementById("sim-table").innerHTML =
+      '<div class="sim-trow sim-thead"><span>Strategy</span><span>Avg</span><span>Median</span>' +
+      '<span>Win rate</span><span>Best 5%</span><span>Worst 5%</span></div>' + body;
+  }
+
+  function renderMCPath(res) {
+    var s = res.sample, path = s.path, pts = [];
+    for (var i = 0; i < path.length; i++) pts.push({ x: i, y: path[i] });
+    var marks = [
+      { idx: s.minIdx, color: STRATS[0].color, label: "Perfect low" },
+      { idx: s.dipIdx, color: STRATS[1].color, label: "Buy the dip" },
+      { idx: 0, color: STRATS[2].color, label: "Buy & hold" },
+      { idx: s.randIdx, color: STRATS[3].color, label: "Random" }
+    ].filter(function (m) { return m.idx >= 0; });
+
+    var ds = [{ type: "line", label: "Price", data: pts, borderColor: "#94a3b8",
+      borderWidth: 1.6, pointRadius: 0, tension: 0.15, order: 2 }];
+    marks.forEach(function (m) {
+      ds.push({ type: "scatter", label: m.label,
+        data: [{ x: m.idx, y: path[m.idx] }],
+        backgroundColor: m.color, borderColor: "#fff", borderWidth: 2,
+        pointRadius: 6, pointHoverRadius: 8, order: 1 });
+    });
+
+    if (pathChart) pathChart.destroy();
+    pathChart = new Chart(document.getElementById("sim-path"), {
+      data: { datasets: ds },
+      options: {
+        responsive: true, maintainAspectRatio: false,
+        plugins: {
+          legend: { display: true, labels: { boxWidth: 10, font: { size: 11 } } },
+          tooltip: {
+            callbacks: {
+              label: function (c) {
+                if (c.dataset.type === "scatter")
+                  return c.dataset.label + ": day " + c.parsed.x + " · $" + c.parsed.y.toFixed(2);
+                return "day " + c.parsed.x + " · $" + c.parsed.y.toFixed(2);
+              }
+            }
+          }
+        },
+        scales: {
+          x: { type: "linear", title: { display: true, text: "day", font: { size: 10 } },
+            ticks: { font: { size: 10 }, maxTicksLimit: 8 } },
+          y: { title: { display: true, text: "price ($)", font: { size: 10 } },
+            ticks: { font: { size: 10 } } }
+        }
+      }
+    });
+  }
+
+  function renderMCDist(res) {
+    var all = [];
+    STRATS.forEach(function (s) { all = all.concat(res.returns[s.key]); });
+    all.sort(function (a, b) { return a - b; });
+    var lo = all[Math.floor(all.length * 0.01)], hi = all[Math.floor(all.length * 0.99)];
+    var nBins = 32, binW = (hi - lo) / nBins;
+
+    var labels = [];
+    for (var b = 0; b < nBins; b++) labels.push(((lo + (b + 0.5) * binW) * 100));
+
+    var ds = STRATS.map(function (s) {
+      var counts = new Array(nBins).fill(0);
+      res.returns[s.key].forEach(function (v) {
+        var bi = Math.floor((v - lo) / binW);
+        if (bi < 0) bi = 0; if (bi >= nBins) bi = nBins - 1;
+        counts[bi]++;
+      });
+      return { label: s.name, data: counts, borderColor: s.color, backgroundColor: "transparent",
+        borderWidth: 2, pointRadius: 0, stepped: true, tension: 0 };
+    });
+
+    if (distChart) distChart.destroy();
+    distChart = new Chart(document.getElementById("sim-dist"), {
+      type: "line",
+      data: { labels: labels, datasets: ds },
+      options: {
+        responsive: true, maintainAspectRatio: false,
+        interaction: { mode: "index", intersect: false },
+        plugins: {
+          legend: { display: true, labels: { boxWidth: 10, font: { size: 11 } } },
+          tooltip: {
+            callbacks: {
+              title: function (items) { return "return ~ " + items[0].label.slice(0, 6) + "%"; },
+              label: function (c) { return c.dataset.label + ": " + c.parsed.y + " runs"; }
+            }
+          }
+        },
+        scales: {
+          x: { title: { display: true, text: "final return (%)", font: { size: 10 } },
+            ticks: { font: { size: 10 }, maxTicksLimit: 9,
+              callback: function (v) { return Math.round(this.getLabelForValue(v)) + "%"; } } },
+          y: { title: { display: true, text: "runs", font: { size: 10 } }, ticks: { font: { size: 10 } } }
+        }
+      }
+    });
+  }
+
+  function renderMCTakeaway(res) {
+    var so = res.stats.oracle.mean, sd = res.stats.dip.mean, sh = res.stats.hold.mean;
+    var timing = so - sh;
+    var captured = timing !== 0 ? (sd - sh) / timing : 0;
+    var dipVsHold = sd - sh;
+    var edge = dipVsHold >= 0
+      ? 'beat plain buy-&-hold by <span class="up">' + pctS(dipVsHold) + '</span> on average'
+      : 'actually <span class="dn">trailed</span> buy-&-hold by ' + pct(Math.abs(dipVsHold)) + ' on average';
+    document.getElementById("sim-takeaway").innerHTML =
+      'Buying the <b>perfect low</b> returned <b>' + pctS(so) + '</b> vs <b>' + pctS(sh) +
+      '</b> for just holding — so flawless timing was worth about <b>' + pctS(timing) +
+      '</b> of extra return here. But that needs hindsight. The realistic <b>buy-the-dip</b> rule ' + edge +
+      ', capturing roughly <b>' + (captured * 100).toFixed(0) + '%</b> of what perfect timing offered, and it beat holding in <b>' +
+      pct(res.dipBeatHoldRate) + '</b> of runs. The dip trigger fired at all in <b>' + pct(res.dipTriggerRate) +
+      '</b> of runs. Dip-buying tends to shine in <b>choppy, sideways</b> markets and to cost you in <b>strong steady uptrends</b>.';
+  }
+
+  function runMC() {
+    var g = function (id) { return +document.getElementById(id).value; };
+    var p = { runs: g("sim-runs"), days: g("sim-days"), mu: g("sim-mu") / 100,
+      sigma: g("sim-sigma") / 100, dip: g("sim-dip") / 100, seed: g("sim-seed") };
+    var note = document.getElementById("sim-note");
+    note.textContent = "Running " + p.runs.toLocaleString() + " paths…";
+    setTimeout(function () {
+      var t0 = performance.now();
+      lastMC = simulateMC(p);
+      renderMCTiles(lastMC); renderMCPath(lastMC); renderMCDist(lastMC);
+      renderMCTable(lastMC); renderMCTakeaway(lastMC);
+      note.textContent = "Done — " + p.runs.toLocaleString() + " paths in " +
+        Math.round(performance.now() - t0) + " ms.";
+    }, 20);
+  }
+
+  // ---- real history ----
+  function renderReal(bt, sym) {
+    var r = bt.res, note = document.getElementById("sim-real-note");
+    note.innerHTML = sym + " · " + bt.n + " saved trading days · exit at last close $" + bt.exit.toFixed(2) +
+      " · " + bt.alarms.length + " app alarm" + (bt.alarms.length === 1 ? "" : "s") + " fired";
+
+    // tiles (incl. the app's own alarm signal)
+    var order = [["oracle", "Perfect low", STRATS[0].color], ["dip", "Buy the dip", STRATS[1].color],
+      ["hold", "Buy & hold", STRATS[2].color], ["random", "Avg random day", STRATS[3].color]];
+    var html = order.map(function (o) {
+      var d = r[o[0]];
+      var meta = o[0] === "dip" ? (d.triggered ? "bought a real dip" : "never dipped — held") :
+        (o[0] === "oracle" ? "the true bottom" : (o[0] === "random" ? "every entry averaged" : "first saved day"));
+      return tile(o[1], o[2], pctS(d.ret), meta);
+    }).join("");
+    var a = r.alarm;
+    var alarmVal = (a.ret == null) ? "—" : pctS(a.ret);
+    var alarmMeta = (a.ret == null)
+      ? "alarm #" + a.num + " never fired (" + a.fired + " total)"
+      : "bought your alarm #" + a.num + " signal";
+    html += tile("App alarm #" + a.num, ALARM_COLOR, alarmVal, alarmMeta);
+    document.getElementById("sim-real-tiles").innerHTML = html;
+
+    // price chart with entry markers + every alarm firing
+    var closes = bt.closes, pts = closes.map(function (c, i) { return { x: i, y: c }; });
+    var ds = [{ type: "line", label: sym, data: pts, borderColor: "#94a3b8",
+      borderWidth: 1.6, pointRadius: 0, tension: 0.1, order: 3 }];
+    // faint markers for all alarm firings
+    if (bt.alarms.length) {
+      ds.push({ type: "scatter", label: "Alarms", order: 2,
+        data: bt.alarms.map(function (al) { return { x: al.idx, y: closes[al.idx] }; }),
+        backgroundColor: "rgba(124,58,237,0.28)", borderColor: ALARM_COLOR, borderWidth: 1,
+        pointRadius: 4, pointHoverRadius: 6 });
+    }
+    var marks = [["oracle", "Perfect low", STRATS[0].color], ["dip", "Buy the dip", STRATS[1].color],
+      ["hold", "Buy & hold", STRATS[2].color]];
+    if (a.idx >= 0) marks.push(["alarm", "Bought alarm #" + a.num, ALARM_COLOR]);
+    marks.forEach(function (o) {
+      var d = r[o[0]];
+      if (!d || d.idx < 0) return;
+      ds.push({ type: "scatter", label: o[1], data: [{ x: d.idx, y: closes[d.idx] }],
+        backgroundColor: o[2], borderColor: "#fff", borderWidth: 2, pointRadius: 6, pointHoverRadius: 8, order: 1 });
+    });
+
+    if (realChart) realChart.destroy();
+    realChart = new Chart(document.getElementById("sim-real-chart"), {
+      data: { datasets: ds },
+      options: {
+        responsive: true, maintainAspectRatio: false,
+        plugins: { legend: { labels: { boxWidth: 10, font: { size: 11 } } },
+          tooltip: { callbacks: { label: function (c) {
+            var base = c.dataset.type === "scatter" ? c.dataset.label + ": " : "";
+            return base + "day " + c.parsed.x + " · $" + c.parsed.y.toFixed(2); } } } },
+        scales: { x: { type: "linear", title: { display: true, text: "trading day (oldest → newest)", font: { size: 10 } },
+            ticks: { font: { size: 10 }, maxTicksLimit: 8 } },
+          y: { title: { display: true, text: "close ($)", font: { size: 10 } }, ticks: { font: { size: 10 } } } }
+      }
+    });
+
+    // per-alarm breakdown — does buying a DEEPER (higher-numbered) alarm pay off?
+    var box = document.getElementById("sim-real-alarms");
+    if (!bt.alarmReturns.length) {
+      box.innerHTML = '<div class="muted" style="font-size:13px">No alarms fired on ' + sym +
+        "'s saved history — it never bounced 0.5%+ off a fresh lower low. Deeper history or a choppier stock will surface some.</div>";
+    } else {
+      var head = '<div class="sim-trow sim-thead"><span>Alarm</span><span>Bought (date)</span>' +
+        '<span>Entry $</span><span>Return to now</span></div>';
+      var rows = bt.alarmReturns.map(function (ar) {
+        var sel = (ar.num === a.num) ? ' style="background:#f5f3ff"' : "";
+        return '<div class="sim-trow sim-arow"' + sel + '><span><span class="sim-dot" style="background:' +
+          ALARM_COLOR + '"></span>#' + ar.num + '</span><span>' + (ar.d || "day " + ar.idx) + '</span><span>$' +
+          ar.close.toFixed(2) + '</span><span class="' + cls(ar.ret) + '">' + pctS(ar.ret) + '</span></div>';
+      }).join("");
+      box.innerHTML = '<div class="sim-table sim-atable">' + head + rows + '</div>';
+    }
+
+    // takeaway
+    var best = r.oracle.ret, held = r.hold.ret, dipR = r.dip.ret;
+    var gap = best - held;
+    var capt = gap !== 0 ? (dipR - held) / gap : 0;
+    var txt = 'On ' + sym + "'s real saved history, nailing the exact bottom would have returned <b>" + pctS(best) +
+      '</b> vs <b>' + pctS(held) + '</b> for buying the first day. ' +
+      (r.dip.triggered
+        ? 'The buy-the-dip rule ' + (dipR >= held ? 'added ' : 'gave up ') + pctS(Math.abs(dipR - held)) +
+          ' vs holding, capturing about <b>' + (capt * 100).toFixed(0) + '%</b> of the perfect-timing gap. '
+        : 'The stock never fell far enough to trigger the dip rule, so it fell back to buying the first day. ');
+    // grade the app's own signal
+    if (r.alarm.ret != null) {
+      txt += 'Your app’s <b>alarm #' + a.num + '</b> signal would have returned <b>' + pctS(r.alarm.ret) +
+        '</b> — ' + (r.alarm.ret >= held ? '<span class="up">' + pctS(r.alarm.ret - held) + ' better</span>'
+          : '<span class="dn">' + pctS(r.alarm.ret - held) + '</span>') + ' than just holding. ';
+      // deepest vs first, to test the "deeper low = truer signal" thesis
+      if (bt.alarmReturns.length >= 2) {
+        var first = bt.alarmReturns[0], deepest = bt.alarmReturns[bt.alarmReturns.length - 1];
+        txt += 'Testing the “deeper low is the real signal” idea: alarm #' + first.num + ' returned ' +
+          pctS(first.ret) + ' while the deepest (#' + deepest.num + ') returned ' + pctS(deepest.ret) + ' — ' +
+          (deepest.ret > first.ret ? 'the deeper alarm did pay off here.' : 'the deeper alarm did not beat the first one here.');
+        var bestA = bt.alarmReturns.slice().sort(function (x, y) { return y.ret - x.ret; })[0];
+        txt += ' With full hindsight, buying <b>alarm #' + bestA.num + '</b> was the best of the ' +
+          bt.alarmReturns.length + ' fired — it returned <b>' + pctS(bestA.ret) + '</b>.';
+      }
+    } else {
+      txt += 'Your app’s alarm #' + a.num + ' never fired on this history (' + a.fired + ' alarm' +
+        (a.fired === 1 ? '' : 's') + ' total), so there was nothing to buy on that signal.';
+    }
+    document.getElementById("sim-real-takeaway").innerHTML = txt;
+  }
+
+  function runReal() {
+    var sel = document.getElementById("sim-real-sym");
+    var sym = sel.value;
+    var note = document.getElementById("sim-real-note");
+    var dip = (+document.getElementById("sim-real-dip").value) / 100;
+    var alarmN = +document.getElementById("sim-real-alarm").value;
+    if (!sym) { note.textContent = "Add stocks to your watchlist (and let some daily history build up) to backtest real data."; return; }
+    note.textContent = "Loading " + sym + " history…";
+    fetch("/api/hist/daily?symbol=" + encodeURIComponent(sym), { cache: "no-store" })
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        var pts = (d.points || []).filter(function (p) { return p.close != null; });
+        if (pts.length < 5) {
+          note.innerHTML = '<b>Not enough saved history for ' + sym + ' yet.</b> Click <b>⬇ Load full history</b> to pull ~1 year of real daily bars from Alpaca, or let it build up one close per day over time.';
+          document.getElementById("sim-real-tiles").innerHTML = "";
+          document.getElementById("sim-real-alarms").innerHTML = "";
+          document.getElementById("sim-real-takeaway").innerHTML = "";
+          if (realChart) { realChart.destroy(); realChart = null; }
+          return;
+        }
+        renderReal(backtestReal(pts, dip, alarmN), sym);
+      })
+      .catch(function () { note.textContent = "Could not load history for " + sym + "."; });
+  }
+
+  // Pull real daily bars from Alpaca into saved history, then backtest.
+  function runBackfill() {
+    var sym = document.getElementById("sim-real-sym").value;
+    var note = document.getElementById("sim-real-note");
+    if (!sym) { note.textContent = "Pick a stock first (add one to your watchlist)."; return; }
+    var btn = document.getElementById("sim-real-load");
+    btn.disabled = true;
+    note.textContent = "Pulling " + sym + " history from Alpaca…";
+    fetch("/api/hist/backfill", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ symbol: sym }) })
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        btn.disabled = false;
+        if (d.error) { note.innerHTML = "<b>" + d.error + "</b>"; return; }
+        note.textContent = "Loaded " + (d.saved || 0) + " days for " + sym + ". Backtesting…";
+        runReal();
+      })
+      .catch(function () { btn.disabled = false; note.textContent = "Couldn’t reach Alpaca to load history."; });
+  }
+
+  function refreshRealSymbols() {
+    var sel = document.getElementById("sim-real-sym");
+    if (!sel) return;
+    var syms = (window.LAST && window.LAST.mine ? window.LAST.mine : []).map(function (t) { return t.ticker; });
+    var prev = sel.value;
+    sel.innerHTML = syms.length
+      ? syms.map(function (s) { return '<option value="' + s + '">' + s + '</option>'; }).join("")
+      : '<option value="">(no stocks in watchlist)</option>';
+    if (prev && syms.indexOf(prev) >= 0) sel.value = prev;
+  }
+
+  // ---------------------------------------------------------
+  //  UI SCAFFOLD (built once into #sim-root)
+  // ---------------------------------------------------------
+  function styleTag() {
+    var css =
+      "#sim-root{max-width:960px}" +
+      ".sim-seg{display:inline-flex;border:1px solid #d1d5db;border-radius:9px;overflow:hidden;margin:2px 0 12px}" +
+      ".sim-seg button{border:none;border-radius:0;background:#fff;padding:7px 14px;font-weight:600;color:#374151}" +
+      ".sim-seg button.on{background:#1d4ed8;color:#fff}" +
+      ".sim-card{background:#fff;border:1px solid #e7e9ee;border-radius:12px;padding:14px 16px;margin-bottom:14px}" +
+      ".sim-controls{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:14px 20px}" +
+      ".sim-ctrl label{display:flex;justify-content:space-between;font-size:12px;color:#374151;margin-bottom:5px}" +
+      ".sim-ctrl label b{color:#16181d}" +
+      ".sim-ctrl input[type=range]{width:100%;accent-color:#1d4ed8}" +
+      ".sim-tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px}" +
+      ".sim-tile{border:1px solid #e7e9ee;border-radius:10px;padding:10px 12px}" +
+      ".sim-tname{font-size:12px;color:#374151;display:flex;align-items:center;gap:6px}" +
+      ".sim-dot{width:9px;height:9px;border-radius:3px;display:inline-block;flex:none}" +
+      ".sim-tval{font-size:23px;font-weight:700;margin-top:5px}" +
+      ".sim-tmeta{font-size:11px;color:#9ca3af;margin-top:1px}" +
+      ".sim-chartbox{height:250px}" +
+      ".sim-grid2{display:grid;grid-template-columns:1fr 1fr;gap:16px}" +
+      "@media(max-width:760px){.sim-grid2{grid-template-columns:1fr}}" +
+      ".sim-table{font-size:13px}" +
+      ".sim-trow{display:grid;grid-template-columns:1.6fr 1fr 1fr 1fr 1fr 1fr;gap:6px;padding:7px 4px;border-bottom:1px solid #f1f1f1}" +
+      ".sim-trow span:not(:first-child){text-align:right;font-variant-numeric:tabular-nums}" +
+      ".sim-atable .sim-trow{grid-template-columns:1fr 1.4fr 1fr 1fr}" +
+      ".sim-atable .sim-arow span:nth-child(2){text-align:right;color:#374151}" +
+      ".sim-thead span{color:#9ca3af;font-weight:700;font-size:11px}" +
+      ".sim-take{font-size:14px;line-height:1.6}" +
+      ".sim-sub{font-size:12px;color:#374151;margin-bottom:6px}" +
+      ".sim-h{font-size:13px;font-weight:700;color:#374151;text-transform:uppercase;letter-spacing:.04em;margin:0 0 10px}";
+    var el = document.createElement("style");
+    el.textContent = css;
+    return el;
+  }
+
+  function slider(id, label, min, max, step, val, fmt) {
+    return '<div class="sim-ctrl"><label>' + label + ' <b id="' + id + '-v">' + fmt(val) +
+      '</b></label><input type="range" id="' + id + '" min="' + min + '" max="' + max +
+      '" step="' + step + '" value="' + val + '"></div>';
+  }
+
+  function buildUI(root) {
+    root.appendChild(styleTag());
+
+    var mc =
+      '<div id="sim-mc">' +
+      '<div class="sim-card"><div class="sim-h">Market &amp; strategy settings</div>' +
+      '<div class="sim-controls">' +
+      slider("sim-runs", "Simulated runs", 200, 10000, 200, 2000, function (v) { return (+v).toLocaleString(); }) +
+      slider("sim-days", "Days per run", 30, 756, 6, 252, function (v) { return v; }) +
+      slider("sim-mu", "Annual drift", -20, 30, 1, 8, function (v) { return v + "%"; }) +
+      slider("sim-sigma", "Annual volatility", 5, 80, 1, 30, function (v) { return v + "%"; }) +
+      slider("sim-dip", "Dip trigger (buy on drop of)", 2, 40, 1, 10, function (v) { return v + "%"; }) +
+      slider("sim-seed", "Random seed", 1, 999, 1, 42, function (v) { return v; }) +
+      '</div><div style="margin-top:14px"><button class="primary" id="sim-run">Run simulation</button> ' +
+      '<span class="muted" id="sim-note" style="font-size:12px">Ready.</span></div></div>' +
+      '<div class="sim-card"><div class="sim-h">Average return per strategy · hold to end</div>' +
+      '<div class="sim-tiles" id="sim-tiles"></div></div>' +
+      '<div class="sim-card"><div class="sim-grid2">' +
+      '<div><div class="sim-sub">One example path &amp; where each strategy buys</div><div class="sim-chartbox"><canvas id="sim-path"></canvas></div></div>' +
+      '<div><div class="sim-sub">Distribution of final returns across all runs</div><div class="sim-chartbox"><canvas id="sim-dist"></canvas></div></div>' +
+      '</div></div>' +
+      '<div class="sim-card"><div class="sim-h">Full results</div><div class="sim-table" id="sim-table"></div></div>' +
+      '<div class="sim-card"><div class="sim-h">The takeaway</div><div class="sim-take" id="sim-takeaway"></div></div>' +
+      '</div>';
+
+    var real =
+      '<div id="sim-real" style="display:none">' +
+      '<div class="sim-card"><div class="sim-h">Backtest on your saved daily history</div>' +
+      '<div class="bar"><label style="font-size:13px">Stock:&nbsp;</label>' +
+      '<select id="sim-real-sym" style="min-width:120px"></select>' +
+      '<label style="font-size:13px;margin-left:10px">Dip trigger:</label>' +
+      '<select id="sim-real-dip"><option value="5">5%</option><option value="10" selected>10%</option>' +
+      '<option value="15">15%</option><option value="20">20%</option></select>' +
+      '<label style="font-size:13px;margin-left:10px">Buy on alarm #:</label>' +
+      '<select id="sim-real-alarm"><option value="1" selected>1</option><option value="2">2</option>' +
+      '<option value="3">3</option><option value="4">4</option><option value="5">5</option></select>' +
+      '<button id="sim-real-load" title="Pull ~1 year of real daily bars from Alpaca into your saved history">⬇ Load full history</button>' +
+      '<button class="primary" id="sim-real-run">Backtest</button></div>' +
+      '<div class="muted" id="sim-real-note" style="font-size:12px;margin-top:8px"></div></div>' +
+      '<div class="sim-card"><div class="sim-h">Return per strategy</div><div class="sim-tiles" id="sim-real-tiles"></div></div>' +
+      '<div class="sim-card"><div class="sim-sub">Saved daily closes &amp; where each strategy buys · faint dots = every app alarm firing</div>' +
+      '<div class="sim-chartbox"><canvas id="sim-real-chart"></canvas></div></div>' +
+      '<div class="sim-card"><div class="sim-h">App alarm signal · per-alarm returns</div>' +
+      '<div class="sim-sub">Each numbered alarm your rule fired, and what buying it would have returned to the latest close. The highlighted row is the alarm # selected above.</div>' +
+      '<div id="sim-real-alarms"></div></div>' +
+      '<div class="sim-card"><div class="sim-h">The takeaway</div><div class="sim-take" id="sim-real-takeaway"></div></div>' +
+      '</div>';
+
+    var wrap = document.createElement("div");
+    wrap.innerHTML =
+      '<h2>🧪 Backtest — "buy the lowest"</h2>' +
+      '<div class="rule">Catching a stock’s exact bottom needs hindsight. This asks the real question: how much does perfect timing pay, and how much can a rule you could actually follow capture? Try it on simulated markets, or on the daily history this app has saved.</div>' +
+      '<div class="sim-seg"><button id="sim-tab-mc" class="on">Simulated</button><button id="sim-tab-real">Real history</button></div>' +
+      mc + real;
+    root.appendChild(wrap);
+
+    document.getElementById("sim-run").addEventListener("click", runMC);
+    document.getElementById("sim-real-run").addEventListener("click", runReal);
+    document.getElementById("sim-real-load").addEventListener("click", runBackfill);
+    ["sim-runs", "sim-days", "sim-mu", "sim-sigma", "sim-dip", "sim-seed"].forEach(function (id) {
+      var inp = document.getElementById(id), lab = document.getElementById(id + "-v");
+      var fmt = (id === "sim-runs") ? function (v) { return (+v).toLocaleString(); }
+        : (id === "sim-mu" || id === "sim-sigma" || id === "sim-dip") ? function (v) { return v + "%"; }
+        : function (v) { return v; };
+      inp.addEventListener("input", function () { lab.textContent = fmt(inp.value); });
+    });
+    document.getElementById("sim-tab-mc").addEventListener("click", function () { showSub("mc"); });
+    document.getElementById("sim-tab-real").addEventListener("click", function () { showSub("real"); });
+  }
+
+  function showSub(which) {
+    document.getElementById("sim-mc").style.display = which === "mc" ? "block" : "none";
+    document.getElementById("sim-real").style.display = which === "real" ? "block" : "none";
+    document.getElementById("sim-tab-mc").classList.toggle("on", which === "mc");
+    document.getElementById("sim-tab-real").classList.toggle("on", which === "real");
+    if (which === "real") {
+      refreshRealSymbols();
+      var rn = document.getElementById("sim-real-note");
+      if (rn && !document.getElementById("sim-real-tiles").children.length)
+        rn.innerHTML = 'Pick a stock and click <b>Backtest</b> to replay the four strategies on the real daily closes this app has saved. History builds up one close per day, so the more days saved, the richer this gets.';
+    }
+  }
+
+  var booted = false;
+  window.initSim = function () {
+    var root = document.getElementById("sim-root");
+    if (!root) return;
+    if (!booted) { buildUI(root); booted = true; runMC(); }
+    refreshRealSymbols();
+  };
+
+  // expose engines for testing / reuse
+  window.StockSim = { simulateMC: simulateMC, backtestReal: backtestReal };
+})();
+"""
+
+
 def icon_bytes():
     try:
         with open(ICON_PATH, "rb") as f:
@@ -1176,6 +1902,7 @@ input{font:inherit;font-size:13px;padding:7px 10px;border:1px solid #d1d5db;bord
 <div class="tabs">
   <button id="tab-watch" class="tab active" onclick="showTab('watch')">⭐ Watchlist</button>
   <button id="tab-hist" class="tab" onclick="showTab('history')">🕘 History</button>
+  <button id="tab-sim" class="tab" onclick="showTab('sim')">🧪 Backtest</button>
 </div>
 
 <div id="view-watch">
@@ -1208,6 +1935,10 @@ input{font:inherit;font-size:13px;padding:7px 10px;border:1px solid #d1d5db;bord
   <div class="muted" id="hist_note" style="font-size:12px;margin-top:6px"></div>
 </div>
 
+<div id="view-sim" style="display:none">
+  <div id="sim-root"></div>
+</div>
+
 <div id="overlay" onclick="if(event.target===this)closeDetail()">
   <div id="modal">
     <button class="x" style="font-size:18px" onclick="closeDetail()">✕</button>
@@ -1218,6 +1949,7 @@ input{font:inherit;font-size:13px;padding:7px 10px;border:1px solid #d1d5db;bord
     <div class="muted" style="font-size:12px;margin-top:8px" id="d_note"></div>
   </div>
 </div>
+<script src="/sim.js"></script>
 <script>
 let LAST={mine:[]}, ME={logged_in:false}, _chart=null, prevAlarmNum={}, firstLoad=true, _curTab='watch', _histChart=null;
 function pctSpan(v){if(v===null||v===undefined)return '<span class="muted">—</span>';var s=(v>=0?"+":"")+v.toFixed(2)+"%";return '<span class="'+(v>=0?'up':'dn')+'">'+s+'</span>';}
@@ -1363,9 +2095,12 @@ function showTab(t){
  _curTab=t;
  document.getElementById('view-watch').style.display=(t==='watch')?'block':'none';
  document.getElementById('view-history').style.display=(t==='history')?'block':'none';
+ document.getElementById('view-sim').style.display=(t==='sim')?'block':'none';
  document.getElementById('tab-watch').classList.toggle('active',t==='watch');
  document.getElementById('tab-hist').classList.toggle('active',t==='history');
+ document.getElementById('tab-sim').classList.toggle('active',t==='sim');
  if(t==='history')loadHistory();
+ if(t==='sim'&&window.initSim)window.initSim();
 }
 async function loadHistory(){
  const box=document.getElementById('histalerts');
@@ -1450,6 +2185,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, MANIFEST.encode("utf-8"), "application/manifest+json")
         elif self.path.startswith("/sw.js"):
             self._send(200, SW_JS.encode("utf-8"), "application/javascript")
+        elif self.path.startswith("/sim.js"):
+            self._send(200, SIM_JS.encode("utf-8"), "application/javascript")
         elif self.path.startswith("/icon.png") or self.path.startswith("/apple-touch-icon"):
             self._send(200, icon_bytes(), "image/png")
         elif self.path.startswith("/api/hist/alerts"):
@@ -1536,6 +2273,25 @@ class Handler(BaseHTTPRequestHandler):
             elif body.get("action") == "remove":
                 remove_watch(uid, sym)
             return self._json({"ok": True})
+        elif self.path.startswith("/api/hist/backfill"):
+            uid = self._uid()
+            if not uid:
+                return self._json({"error": "Please log in first."})
+            if not HAVE_DATA:
+                return self._json({"error": "No Alpaca data keys set on the server."})
+            sym = clean_symbol(body.get("symbol"))
+            targets = [sym] if sym else get_watchlist(uid)
+            if not targets:
+                return self._json({"error": "No symbols to load — add one to your watchlist."})
+            try:
+                days = int(body.get("days") or 365)
+            except Exception:
+                days = 365
+            try:
+                n = backfill_daily_history(targets, days=max(30, min(days, 2000)))
+                return self._json({"ok": True, "symbols": targets, "saved": n})
+            except Exception as e:
+                return self._json({"error": f"Backfill failed: {str(e)[:120]}"})
         self._send(404, b"not found", "text/plain")
 
 
