@@ -1,0 +1,766 @@
+--- original_app.py	2026-07-22 22:44:54.840400570 +0000
++++ app.py	2026-07-22 22:42:22.923596299 +0000
+@@ -1880,7 +1880,8 @@
+ .x:hover{color:#dc2626}#msg,#authmsg{font-size:12px;color:#b91c1c}
+ .who{font-size:12px;color:#374151;display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+ #overlay{position:fixed;inset:0;background:rgba(15,18,25,.45);display:none;align-items:center;justify-content:center;padding:16px;z-index:50}
+-#modal{background:#fff;border-radius:14px;max-width:440px;width:100%;padding:18px;position:relative}
++#modal{background:#fff;border-radius:14px;max-width:440px;width:100%;padding:18px;position:relative;max-height:92vh;overflow:auto}
++#modal.wide{max-width:780px}
+ .stat{display:flex;justify-content:space-between;font-size:13px;padding:5px 0;border-bottom:1px solid #f1f1f1}
+ @keyframes blinkamber{0%,100%{background:#fff7ed;border-color:#f59e0b}50%{background:#fde68a;border-color:#b45309}}
+ .card.alerting{animation:blinkamber 1s ease-in-out 30}
+@@ -1947,6 +1948,10 @@
+     <div id="d_stats"></div>
+     <div style="margin-top:14px;height:200px"><canvas id="d_chart"></canvas></div>
+     <div class="muted" style="font-size:12px;margin-top:8px" id="d_note"></div>
++    <button id="calc-btn" onclick="toggleCalc()" style="margin-top:14px;width:100%;padding:10px;border:1px solid #d1d5db;border-radius:10px;background:#f9fafb;font-size:14px;cursor:pointer">📊 Probability calculator</button>
++    <div id="calc-wrap" style="display:none;margin-top:10px">
++      <iframe id="calc-frame" title="Probability calculator" style="width:100%;height:640px;border:0;border-radius:10px;background:transparent"></iframe>
++    </div>
+   </div>
+ </div>
+ <script src="/sim.js"></script>
+@@ -1980,6 +1985,9 @@
+ async function openDetail(tk){
+  const t=findRow(tk)||{ticker:tk};
+  document.getElementById('overlay').style.display='flex';
++ window._calcSym=tk;
++ var _cw=document.getElementById('calc-wrap'),_cb=document.getElementById('calc-btn'),_cm=document.getElementById('modal'),_cf=document.getElementById('calc-frame');
++ if(_cw){_cw.style.display='none';} if(_cm){_cm.classList.remove('wide');} if(_cb){_cb.textContent='📊 Probability calculator';} if(_cf){_cf.removeAttribute('src');}
+  document.getElementById('d_tk').textContent=t.ticker;
+  document.getElementById('d_price').innerHTML=money(t.price)+' &nbsp; '+pctSpan(t.change);
+  const rows=[['Alarms today',(t.alarm_num&&t.alarm_num>0)?('#'+t.alarm_num+' (new-low bounces)'):'none yet'],
+@@ -1994,6 +2002,32 @@
+  catch(e){document.getElementById('d_note').textContent='Chart unavailable.';}
+ }
+ function closeDetail(){document.getElementById('overlay').style.display='none';if(_chart){_chart.destroy();_chart=null;}}
++function annVolFromCloses(closes){
++ var c=(closes||[]).filter(function(v){return typeof v==='number'&&v>0;});
++ if(c.length<10) return null;
++ var recent=c.slice(-64),rets=[];
++ for(var i=1;i<recent.length;i++){rets.push(Math.log(recent[i]/recent[i-1]));}
++ if(rets.length<5) return null;
++ var m=rets.reduce(function(a,b){return a+b;},0)/rets.length;
++ var v=rets.reduce(function(a,b){return a+(b-m)*(b-m);},0)/(rets.length-1);
++ return Math.sqrt(v*252);
++}
++async function toggleCalc(){
++ var wrap=document.getElementById('calc-wrap'),modal=document.getElementById('modal'),btn=document.getElementById('calc-btn'),frame=document.getElementById('calc-frame');
++ if(wrap.style.display==='none'){
++   wrap.style.display='block';modal.classList.add('wide');btn.textContent='📊 Hide probability calculator';
++   var tk=window._calcSym,row=findRow(tk)||{},price=(row.price!=null?row.price:100),sigma=30,days=60;
++   try{
++     var h=await (await fetch('/api/hist/daily?symbol='+encodeURIComponent(tk),{cache:'no-store'})).json();
++     var closes=(h.points||[]).map(function(p){return p.close;});
++     var v=annVolFromCloses(closes);
++     if(v){sigma=+(v*100).toFixed(1);}
++   }catch(e){}
++   frame.src='/calc-widget?symbol='+encodeURIComponent(tk)+'&price='+encodeURIComponent(price)+'&sigma='+encodeURIComponent(sigma)+'&days='+days;
++ } else {
++   wrap.style.display='none';modal.classList.remove('wide');btn.textContent='📊 Probability calculator';
++ }
++}
+ function drawChart(points,prevClose){
+  const cv=document.getElementById('d_chart'),note=document.getElementById('d_note');
+  if(_chart){_chart.destroy();_chart=null;}
+@@ -2146,6 +2180,690 @@
+ </script></body></html>"""
+ 
+ 
++CALC_PAGE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
++<title>Probability Calculator</title></head><body style="margin:0;background:transparent">
++<!-- =========================================================================
++     STOCK PROBABILITY CALCULATOR — embeddable widget
++     Drop this whole block into any page. Everything is namespaced under
++     .spc-widget so it will not collide with your site's CSS or JS.
++
++     Configure via data-* attributes on the root div below:
++       data-price          current price to prefill        (default 100)
++       data-symbol         ticker label to prefill         (optional)
++       data-mu             expected annual return, %        (default 8)
++       data-sigma          annual volatility, %             (default 30)
++       data-days           horizon in days                  (default 60)
++       data-quote-endpoint backend proxy URL for live fetch (optional; if
++                           omitted, the ticker/fetch row is hidden)
++
++     In a Jinja/Django template you can wire these to real data, e.g.:
++       data-symbol="{{ stock.symbol }}" data-price="{{ stock.price }}"
++     ========================================================================= -->
++<div class="spc-widget" id="spc-root"
++     data-symbol=""
++     data-price="100"
++     data-mu="8"
++     data-sigma="30"
++     data-days="60"
++     data-quote-endpoint="">
++<style>
++  .spc-widget{
++    color-scheme: light;
++    --spc-surface-1:#fcfcfb; --spc-page:#f4f4f2;
++    --spc-text-primary:#0b0b0b; --spc-text-secondary:#52514e; --spc-muted:#898781;
++    --spc-grid:#e1e0d9; --spc-baseline:#c3c2b7;
++    --spc-series-1:#2a78d6; --spc-series-2:#eb6834;
++    --spc-border:rgba(11,11,11,0.10); --spc-accent-soft:#cde2fb;
++    --spc-good:#0ca30c; --spc-good-soft:rgba(12,163,12,0.12);
++    --spc-bad:#d03b3b;  --spc-bad-soft:rgba(208,59,59,0.12);
++    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
++    line-height:1.5; color:var(--spc-text-primary);
++    background:var(--spc-page); border-radius:14px; padding:18px;
++    max-width:960px; margin:0 auto; -webkit-font-smoothing:antialiased;
++    font-size:15px; box-sizing:border-box;
++  }
++  .spc-widget.spc-dark{
++    color-scheme: dark;
++    --spc-surface-1:#1a1a19; --spc-page:#0f0f0e;
++    --spc-text-primary:#ffffff; --spc-text-secondary:#c3c2b7; --spc-muted:#898781;
++    --spc-grid:#2c2c2a; --spc-baseline:#383835;
++    --spc-series-1:#3987e5; --spc-series-2:#d95926;
++    --spc-border:rgba(255,255,255,0.10); --spc-accent-soft:#184f95;
++    --spc-good:#0ca30c; --spc-good-soft:rgba(12,163,12,0.18);
++    --spc-bad:#e05a5a;  --spc-bad-soft:rgba(224,90,90,0.18);
++  }
++  @media (prefers-color-scheme: dark){
++    .spc-widget:not(.spc-light){
++      color-scheme: dark;
++      --spc-surface-1:#1a1a19; --spc-page:#0f0f0e;
++      --spc-text-primary:#ffffff; --spc-text-secondary:#c3c2b7; --spc-muted:#898781;
++      --spc-grid:#2c2c2a; --spc-baseline:#383835;
++      --spc-series-1:#3987e5; --spc-series-2:#d95926;
++      --spc-border:rgba(255,255,255,0.10); --spc-accent-soft:#184f95;
++      --spc-good:#0ca30c; --spc-good-soft:rgba(12,163,12,0.18);
++      --spc-bad:#e05a5a; --spc-bad-soft:rgba(224,90,90,0.18);
++    }
++  }
++  .spc-widget *{box-sizing:border-box;}
++  .spc-widget .spc-head{display:flex; align-items:flex-start; justify-content:space-between; gap:16px; margin-bottom:6px;}
++  .spc-widget .spc-title{font-size:21px; margin:0 0 2px; letter-spacing:-0.02em; font-weight:700;}
++  .spc-widget .spc-sub{color:var(--spc-text-secondary); font-size:13.5px; margin:0 0 16px;}
++  .spc-widget .spc-theme{flex:none; cursor:pointer; border:1px solid var(--spc-border); background:var(--spc-surface-1);
++    color:var(--spc-text-secondary); border-radius:8px; padding:6px 11px; font-size:13px; font-family:inherit;}
++  .spc-widget .spc-theme:hover{color:var(--spc-text-primary);}
++  .spc-widget .spc-card{background:var(--spc-surface-1); border:1px solid var(--spc-border); border-radius:12px; padding:18px; margin-bottom:16px;}
++  .spc-widget .spc-h2{font-size:16px; margin:0 0 4px; letter-spacing:-0.01em; font-weight:600;}
++  .spc-widget .spc-h3{font-size:12px; color:var(--spc-muted); text-transform:uppercase; letter-spacing:0.05em; margin:0 0 12px; font-weight:600;}
++  .spc-widget .spc-hint{color:var(--spc-text-secondary); font-size:13px; margin:0 0 14px;}
++  .spc-widget label{display:block; font-size:12px; color:var(--spc-text-secondary); margin-bottom:5px; font-weight:500;}
++  /* form controls hardened with !important so an aggressive host reset
++     (e.g. `input{...!important}`) can't override the widget's own look */
++  .spc-widget input, .spc-widget select, .spc-widget textarea{width:100% !important;
++    font-family:inherit !important; font-size:14px !important; line-height:1.4 !important; padding:8px 10px !important;
++    background:var(--spc-page) !important; color:var(--spc-text-primary) !important;
++    border:1px solid var(--spc-border) !important; border-radius:8px !important; text-decoration:none !important;
++    letter-spacing:normal !important; text-transform:none; box-shadow:none !important;}
++  .spc-widget input[style*="uppercase"]{text-transform:uppercase !important;}
++  .spc-widget input:focus, .spc-widget select:focus, .spc-widget textarea:focus{outline:2px solid var(--spc-series-1); outline-offset:-1px; border-color:transparent;}
++  .spc-widget textarea{resize:vertical; min-height:90px; font-variant-numeric:tabular-nums;}
++  .spc-widget .spc-inputgrid{display:grid; grid-template-columns:repeat(auto-fit,minmax(120px,1fr)); gap:12px 14px; align-items:end;}
++  .spc-widget .spc-suffix{position:relative;}
++  .spc-widget .spc-suffix .spc-u{position:absolute; right:10px; top:50%; transform:translateY(-50%); color:var(--spc-muted); font-size:13px; pointer-events:none;}
++  .spc-widget .spc-suffix.spc-pre .spc-u{right:auto; left:10px;}
++  .spc-widget .spc-suffix.spc-pre input{padding-left:20px;}
++  .spc-widget .spc-btn{cursor:pointer; border:1px solid var(--spc-series-1); background:var(--spc-series-1); color:#fff;
++    border-radius:8px; padding:8px 14px; font-size:13px; font-family:inherit; font-weight:500; white-space:nowrap;}
++  .spc-widget .spc-btn:hover{filter:brightness(1.06);}
++  .spc-widget .spc-btn.spc-ghost{background:var(--spc-page); color:var(--spc-series-1);}
++  .spc-widget .spc-fetchrow{display:flex; gap:8px; align-items:flex-end; grid-column:span 2;}
++  .spc-widget .spc-fetchrow > div{flex:1;}
++  .spc-widget .spc-status{font-size:12px; color:var(--spc-muted); margin-top:8px; min-height:16px;}
++  .spc-widget .spc-status.spc-ok{color:var(--spc-good);} .spc-widget .spc-status.spc-warn{color:var(--spc-bad);}
++  .spc-widget .spc-tabs{display:flex; flex-wrap:wrap; gap:4px; border-bottom:1px solid var(--spc-grid); margin-bottom:20px;}
++  .spc-widget .spc-tab{cursor:pointer; border:none; background:none; font-family:inherit; font-size:14px; color:var(--spc-text-secondary);
++    padding:9px 13px; border-bottom:2px solid transparent; margin-bottom:-1px; border-radius:6px 6px 0 0;}
++  .spc-widget .spc-tab:hover{color:var(--spc-text-primary); background:var(--spc-surface-1);}
++  .spc-widget .spc-tab[aria-selected="true"]{color:var(--spc-series-1); border-bottom-color:var(--spc-series-1); font-weight:600;}
++  .spc-widget .spc-panel{display:none;} .spc-widget .spc-panel.spc-active{display:block;}
++  .spc-widget .spc-row{display:flex; gap:16px; flex-wrap:wrap; align-items:flex-end;}
++  .spc-widget .spc-field{flex:1 1 140px; min-width:120px;}
++  .spc-widget .spc-results{margin-top:16px; display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:12px;}
++  .spc-widget .spc-stat{background:var(--spc-page); border:1px solid var(--spc-border); border-radius:10px; padding:11px 13px;}
++  .spc-widget .spc-stat.spc-hl{background:var(--spc-accent-soft);}
++  .spc-widget .spc-stat.spc-pos{background:var(--spc-good-soft);} .spc-widget .spc-stat.spc-neg{background:var(--spc-bad-soft);}
++  .spc-widget .spc-k{font-size:11px; color:var(--spc-muted); text-transform:uppercase; letter-spacing:0.04em; margin-bottom:4px;}
++  .spc-widget .spc-stat.spc-hl .spc-k, .spc-widget .spc-stat.spc-pos .spc-k, .spc-widget .spc-stat.spc-neg .spc-k{color:var(--spc-text-secondary);}
++  .spc-widget .spc-v{font-size:19px; font-variant-numeric:tabular-nums; letter-spacing:-0.01em;}
++  .spc-widget .spc-v.spc-small{font-size:15px;}
++  .spc-widget .spc-err{color:var(--spc-bad); font-size:13px; margin-top:12px; min-height:0;}
++  .spc-widget .spc-chartwrap{margin-top:20px;}
++  .spc-widget .spc-charttitle{font-size:13px; color:var(--spc-text-secondary); margin:0 0 6px;}
++  .spc-widget .spc-chart{width:100%; height:auto; display:block; touch-action:none;}
++  .spc-widget .spc-chart text{fill:var(--spc-muted); font-size:10px; font-family:inherit;}
++  .spc-widget .spc-legend{display:flex; gap:16px; flex-wrap:wrap; font-size:12px; color:var(--spc-text-secondary); margin:2px 0 6px;}
++  .spc-widget .spc-legend span{display:inline-flex; align-items:center; gap:5px;}
++  .spc-widget .spc-legend i{width:14px; height:3px; border-radius:2px; display:inline-block;}
++  .spc-widget .spc-note{font-size:12px; color:var(--spc-muted); margin-top:14px;}
++  .spc-widget code{background:var(--spc-page); border:1px solid var(--spc-border); border-radius:5px; padding:1px 5px; font-size:12px;}
++  .spc-widget .spc-seg{display:inline-flex; border:1px solid var(--spc-border); border-radius:8px; overflow:hidden;}
++  .spc-widget .spc-seg button{border:none; background:var(--spc-page); color:var(--spc-text-secondary); font-family:inherit; font-size:13px; padding:7px 12px; cursor:pointer;}
++  .spc-widget .spc-seg button[aria-pressed="true"]{background:var(--spc-series-1); color:#fff;}
++  .spc-widget table{border:none;}
++  .spc-widget .spc-pct{width:100%; border:none; border-collapse:collapse; font-size:13px; margin-top:16px; font-variant-numeric:tabular-nums;}
++  .spc-widget .spc-pct th, .spc-widget .spc-pct td{text-align:right; padding:7px 10px; border-bottom:1px solid var(--spc-grid);}
++  .spc-widget .spc-pct th:first-child, .spc-widget .spc-pct td:first-child{text-align:left;}
++  .spc-widget .spc-pct th{color:var(--spc-muted); font-weight:500; font-size:11px; text-transform:uppercase; letter-spacing:0.03em;}
++  .spc-widget .spc-disc{font-size:12px; color:var(--spc-muted); border-top:1px solid var(--spc-grid); margin-top:22px; padding-top:14px;}
++  /* tooltip lives on <body>, single class, unlikely to collide */
++  .spc-tt{position:fixed; pointer-events:none; z-index:2147483000; background:#fff; border:1px solid rgba(0,0,0,0.15);
++    border-radius:8px; padding:6px 9px; font-size:12px; color:#0b0b0b; box-shadow:0 4px 14px rgba(0,0,0,0.16);
++    opacity:0; transition:opacity .08s; font-variant-numeric:tabular-nums; white-space:nowrap;
++    font-family:system-ui,-apple-system,"Segoe UI",sans-serif;}
++  @media (prefers-color-scheme: dark){ .spc-tt{background:#1a1a19; color:#fff; border-color:rgba(255,255,255,0.14);} }
++</style>
++
++  <div class="spc-head">
++    <div>
++      <div class="spc-title">Probability Calculator</div>
++      <div class="spc-sub">Model where this stock might go — probabilities, simulations, and risk.</div>
++    </div>
++    <button class="spc-theme" id="spc-themeBtn" type="button">◐ Theme</button>
++  </div>
++
++  <div class="spc-card">
++    <div class="spc-h3">Assumptions — used by every tab</div>
++    <div class="spc-inputgrid">
++      <div class="spc-fetchrow" id="spc-fetchrow">
++        <div><label for="spc-ticker">Ticker</label><input type="text" id="spc-ticker" placeholder="e.g. AAPL" autocomplete="off" spellcheck="false" style="text-transform:uppercase;"></div>
++        <button class="spc-btn" id="spc-fetchBtn" type="button">Fetch</button>
++      </div>
++      <div><label for="spc-price">Current price</label><div class="spc-suffix spc-pre"><span class="spc-u">$</span><input type="number" id="spc-price" step="any" value="100"></div></div>
++      <div><label for="spc-mu">Expected annual return</label><div class="spc-suffix"><input type="number" id="spc-mu" step="any" value="8"><span class="spc-u">%</span></div></div>
++      <div><label for="spc-sigma">Annual volatility</label><div class="spc-suffix"><input type="number" id="spc-sigma" step="any" value="30"><span class="spc-u">%</span></div></div>
++      <div><label for="spc-days">Horizon</label><div class="spc-suffix"><input type="number" id="spc-days" step="1" value="60"><span class="spc-u">days</span></div></div>
++    </div>
++    <div class="spc-status" id="spc-fetchStatus"></div>
++  </div>
++
++  <div class="spc-tabs" role="tablist">
++    <button class="spc-tab" role="tab" aria-selected="true" data-p="prob">Price probability</button>
++    <button class="spc-tab" role="tab" aria-selected="false" data-p="mc">Monte Carlo</button>
++    <button class="spc-tab" role="tab" aria-selected="false" data-p="risk">Return &amp; risk</button>
++    <button class="spc-tab" role="tab" aria-selected="false" data-p="opt">Options</button>
++    <button class="spc-tab" role="tab" aria-selected="false" data-p="est">Estimate inputs</button>
++  </div>
++
++  <div class="spc-panel spc-active" id="spc-p-prob">
++    <div class="spc-card">
++      <div class="spc-h2">Probability of reaching a price</div>
++      <div class="spc-hint">The odds the stock is above or below a target at your horizon — and the chance it <em>touches</em> that level at any point along the way.</div>
++      <div class="spc-row">
++        <div class="spc-field"><label for="spc-target">Target price</label><div class="spc-suffix spc-pre"><span class="spc-u">$</span><input type="number" id="spc-target" step="any" value="115"></div></div>
++      </div>
++      <div class="spc-results" id="spc-probResults"></div>
++      <div class="spc-err" id="spc-probErr"></div>
++      <div class="spc-chartwrap">
++        <div class="spc-charttitle">Where the price could be at your horizon — shaded = beyond target</div>
++        <div class="spc-legend">
++          <span><i style="background:var(--spc-series-1)"></i>probability density</span>
++          <span><i style="background:var(--spc-series-2)"></i>current price</span>
++          <span><i style="background:var(--spc-muted)"></i>target</span>
++        </div>
++        <svg class="spc-chart" id="spc-probChart" viewBox="0 0 660 260" preserveAspectRatio="xMidYMid meet"></svg>
++      </div>
++      <table class="spc-pct" id="spc-probTable"></table>
++    </div>
++  </div>
++
++  <div class="spc-panel" id="spc-p-mc">
++    <div class="spc-card">
++      <div class="spc-h2">Monte Carlo simulation</div>
++      <div class="spc-hint">Simulate thousands of possible price paths and read the outcomes empirically. Values are checked against the exact formulas from the first tab.</div>
++      <div class="spc-row">
++        <div class="spc-field"><label for="spc-mcTarget">Target price</label><div class="spc-suffix spc-pre"><span class="spc-u">$</span><input type="number" id="spc-mcTarget" step="any" value="115"></div></div>
++        <div class="spc-field"><label for="spc-mcN">Simulations</label>
++          <select id="spc-mcN"><option>2000</option><option selected>5000</option><option>10000</option><option>20000</option></select></div>
++        <div class="spc-field" style="flex:0 0 auto;"><label>&nbsp;</label><button class="spc-btn" id="spc-mcRun" type="button">Run again</button></div>
++      </div>
++      <div class="spc-results" id="spc-mcResults"></div>
++      <div class="spc-err" id="spc-mcErr"></div>
++      <div class="spc-chartwrap">
++        <div class="spc-charttitle">Simulated price paths — band = 5th–95th percentile, line = median</div>
++        <svg class="spc-chart" id="spc-mcFan" viewBox="0 0 660 280" preserveAspectRatio="xMidYMid meet"></svg>
++      </div>
++      <div class="spc-chartwrap">
++        <div class="spc-charttitle">Distribution of prices at horizon</div>
++        <svg class="spc-chart" id="spc-mcHist" viewBox="0 0 660 240" preserveAspectRatio="xMidYMid meet"></svg>
++      </div>
++    </div>
++  </div>
++
++  <div class="spc-panel" id="spc-p-risk">
++    <div class="spc-card">
++      <div class="spc-h2">Return &amp; risk</div>
++      <div class="spc-hint">The distribution of your return over the horizon, with downside risk measures. Enter a position size for dollar figures.</div>
++      <div class="spc-row">
++        <div class="spc-field"><label for="spc-posVal">Position value</label><div class="spc-suffix spc-pre"><span class="spc-u">$</span><input type="number" id="spc-posVal" step="any" value="10000"></div></div>
++      </div>
++      <div class="spc-results" id="spc-riskResults"></div>
++      <div class="spc-err" id="spc-riskErr"></div>
++      <div class="spc-chartwrap">
++        <div class="spc-charttitle">Distribution of return at horizon — red = 5% worst-case zone (VaR)</div>
++        <svg class="spc-chart" id="spc-riskChart" viewBox="0 0 660 260" preserveAspectRatio="xMidYMid meet"></svg>
++      </div>
++      <table class="spc-pct" id="spc-riskTable"></table>
++      <div class="spc-note">VaR (Value at Risk) at 95%: with 95% confidence, losses won't exceed this over the horizon. CVaR (expected shortfall): the average loss in the worst 5% of cases.</div>
++    </div>
++  </div>
++
++  <div class="spc-panel" id="spc-p-opt">
++    <div class="spc-card">
++      <div class="spc-h2">Option probability of profit</div>
++      <div class="spc-hint">For buying a single call or put: the chance it pays off and the expected profit/loss <em>under your return assumption</em>. This is not an option-pricing model — see the note below.</div>
++      <div class="spc-row">
++        <div class="spc-field"><label>Type</label>
++          <div class="spc-seg" role="group" id="spc-optType">
++            <button type="button" data-t="call" aria-pressed="true">Buy call</button>
++            <button type="button" data-t="put" aria-pressed="false">Buy put</button>
++          </div>
++        </div>
++        <div class="spc-field"><label for="spc-strike">Strike</label><div class="spc-suffix spc-pre"><span class="spc-u">$</span><input type="number" id="spc-strike" step="any" value="110"></div></div>
++        <div class="spc-field"><label for="spc-premium">Premium (per share)</label><div class="spc-suffix spc-pre"><span class="spc-u">$</span><input type="number" id="spc-premium" step="any" value="3.50"></div></div>
++        <div class="spc-field"><label for="spc-contracts">Contracts (×100)</label><input type="number" id="spc-contracts" step="1" value="1"></div>
++      </div>
++      <div class="spc-results" id="spc-optResults"></div>
++      <div class="spc-err" id="spc-optErr"></div>
++      <div class="spc-chartwrap">
++        <div class="spc-charttitle">Profit / loss at expiration vs stock price</div>
++        <div class="spc-legend">
++          <span><i style="background:var(--spc-good)"></i>profit</span>
++          <span><i style="background:var(--spc-bad)"></i>loss</span>
++          <span><i style="background:var(--spc-series-2)"></i>current price</span>
++        </div>
++        <svg class="spc-chart" id="spc-optChart" viewBox="0 0 660 260" preserveAspectRatio="xMidYMid meet"></svg>
++      </div>
++      <div class="spc-note" id="spc-optNote"></div>
++    </div>
++  </div>
++
++  <div class="spc-panel" id="spc-p-est">
++    <div class="spc-card">
++      <div class="spc-h2">Estimate volatility &amp; return from history</div>
++      <div class="spc-hint">Paste recent closing prices (oldest first), separated by commas, spaces, or new lines. You can also paste <code>date,close</code> rows — the last number on each line is used.</div>
++      <div><label for="spc-hist">Closing prices</label><textarea id="spc-hist" style="min-height:110px;" placeholder="185.2, 187.9, 186.1, 190.4, …"></textarea></div>
++      <div class="spc-results" id="spc-estResults"></div>
++      <div class="spc-err" id="spc-estErr"></div>
++      <div style="margin-top:16px;"><button class="spc-btn spc-ghost" id="spc-useEst" type="button">Use these values in Assumptions ↑</button></div>
++      <div class="spc-note">Volatility is annualized assuming 252 trading days. The estimated expected return is just the historical average — a notoriously poor predictor of the future, so you'll usually want to set it by hand.</div>
++    </div>
++  </div>
++
++  <div class="spc-disc">
++    <strong>How this works &amp; what it isn't.</strong> Every calculation assumes prices follow a lognormal random walk (geometric Brownian motion) with the constant expected return and volatility you enter. Real markets have fat tails, jumps, and changing volatility, so treat these as rough scenario odds, not predictions. Time is in calendar days (÷365); volatility is annualized on 252 trading days. Not investment advice — a modeling tool whose output is only as good as your assumptions. All computation runs locally in the browser.
++  </div>
++
++<script>
++(function(){
++"use strict";
++var R=document.getElementById('spc-root');
++if(!R || R._spcInit) return; R._spcInit=true;
++function g(id){ return R.querySelector('#'+id); }
++function css(v){ return getComputedStyle(R).getPropertyValue(v).trim(); }
++
++/* tooltip on body (single shared) */
++var tooltip=document.getElementById('spc-tooltip');
++if(!tooltip){ tooltip=document.createElement('div'); tooltip.className='spc-tt'; tooltip.id='spc-tooltip'; document.body.appendChild(tooltip); }
++function showTip(html,evt){ tooltip.innerHTML=html; tooltip.style.opacity=1; tooltip.style.left=(evt.clientX+14)+'px'; tooltip.style.top=(evt.clientY-10)+'px'; }
++function hideTip(){ tooltip.style.opacity=0; }
++
++/* ---------- normal helpers (verified) ---------- */
++function erf(x){ var s=x<0?-1:1; x=Math.abs(x); var t=1/(1+0.5*x);
++  var tau=t*Math.exp(-x*x-1.26551223+t*(1.00002368+t*(0.37409196+t*(0.09678418+
++    t*(-0.18628806+t*(0.27886807+t*(-1.13520398+t*(1.48851587+
++    t*(-0.82215223+t*0.17087277))))))))); return s*(1-tau); }
++function normCdf(x){ return 0.5*(1+erf(x/Math.SQRT2)); }
++function normPdf(x){ return Math.exp(-0.5*x*x)/Math.sqrt(2*Math.PI); }
++function normInv(p){ if(p<=0)return -Infinity; if(p>=1)return Infinity;
++  var a=[-3.969683028665376e+01,2.209460984245205e+02,-2.759285104469687e+02,1.383577518672690e+02,-3.066479806614716e+01,2.506628277459239e+00];
++  var b=[-5.447609879822406e+01,1.615858368580409e+02,-1.556989798598866e+02,6.680131188771972e+01,-1.328068155288572e+01];
++  var c=[-7.784894002430293e-03,-3.223964580411365e-01,-2.400758277161838e+00,-2.549732539343734e+00,4.374664141464968e+00,2.938163982698783e+00];
++  var d=[7.784695709041462e-03,3.224671290700398e-01,2.445134137142996e+00,3.754408661907416e+00];
++  var pl=0.02425,ph=1-pl,q,r,z;
++  if(p<pl){ q=Math.sqrt(-2*Math.log(p)); z=(((((c[0]*q+c[1])*q+c[2])*q+c[3])*q+c[4])*q+c[5])/((((d[0]*q+d[1])*q+d[2])*q+d[3])*q+1); }
++  else if(p<=ph){ q=p-0.5; r=q*q; z=(((((a[0]*r+a[1])*r+a[2])*r+a[3])*r+a[4])*r+a[5])*q/(((((b[0]*r+b[1])*r+b[2])*r+b[3])*r+b[4])*r+1); }
++  else { q=Math.sqrt(-2*Math.log(1-p)); z=-(((((c[0]*q+c[1])*q+c[2])*q+c[3])*q+c[4])*q+c[5])/((((d[0]*q+d[1])*q+d[2])*q+d[3])*q+1); }
++  var e=normCdf(z)-p; var u=e*Math.sqrt(2*Math.PI)*Math.exp(z*z/2); z=z-u/(1+z*u/2); return z; }
++
++/* ---------- GBM engine (verified vs MC) ---------- */
++function getA(){
++  var S0=parseFloat(g('spc-price').value), mu=parseFloat(g('spc-mu').value)/100,
++      sigma=parseFloat(g('spc-sigma').value)/100, days=parseFloat(g('spc-days').value), T=days/365;
++  var m=Math.log(S0)+(mu-0.5*sigma*sigma)*T, s=sigma*Math.sqrt(T);
++  return {S0:S0,mu:mu,sigma:sigma,days:days,T:T,m:m,s:s,valid:(S0>0&&sigma>0&&T>0&&isFinite(m))};
++}
++function pAbove(a,K){ return normCdf((a.m-Math.log(K))/a.s); }
++function pctile(a,p){ return Math.exp(a.m+a.s*normInv(p)); }
++function expectedPrice(a){ return a.S0*Math.exp(a.mu*a.T); }
++function medianPrice(a){ return Math.exp(a.m); }
++function lnpdf(a,x){ if(x<=0)return 0; var z=(Math.log(x)-a.m)/a.s; return normPdf(z)/(x*a.s); }
++function touchProb(a,B){ var nu=a.mu-0.5*a.sigma*a.sigma, sT=a.sigma*Math.sqrt(a.T), b=Math.log(B/a.S0);
++  if(Math.abs(B-a.S0)<1e-12) return 1;
++  if(B>a.S0) return Math.min(1, normCdf((-b+nu*a.T)/sT)+Math.exp(2*nu*b/(a.sigma*a.sigma))*normCdf((-b-nu*a.T)/sT));
++  return Math.min(1, normCdf((b-nu*a.T)/sT)+Math.exp(2*nu*b/(a.sigma*a.sigma))*normCdf((b+nu*a.T)/sT)); }
++function cvarPrice(a,alpha){ var q=pctile(a,alpha), A=(Math.log(q)-a.m)/a.s;
++  return Math.exp(a.m+0.5*a.s*a.s)*normCdf(A-a.s)/normCdf(A); }
++function callExp(a,K){ var d2=(a.m-Math.log(K))/a.s,d1=d2+a.s; return Math.exp(a.m+0.5*a.s*a.s)*normCdf(d1)-K*normCdf(d2); }
++function putExp(a,K){ var d2=(a.m-Math.log(K))/a.s,d1=d2+a.s; return K*normCdf(-d2)-Math.exp(a.m+0.5*a.s*a.s)*normCdf(-d1); }
++
++/* ---------- formatting ---------- */
++function money(x){ if(!isFinite(x))return "—"; var n=Math.abs(x), dp=n>=1000?0:2;
++  return (x<0?"-$":"$")+Math.abs(x).toLocaleString(undefined,{minimumFractionDigits:dp,maximumFractionDigits:dp}); }
++function pct(x,dp){ if(!isFinite(x))return "—"; return (x*100).toFixed(dp===undefined?1:dp)+"%"; }
++function num(x,dp){ if(!isFinite(x))return "—"; return x.toFixed(dp===undefined?2:dp); }
++function statHTML(k,v,cls){ return '<div class="spc-stat'+(cls?' spc-'+cls:'')+'"><div class="spc-k">'+k+'</div><div class="spc-v'+(String(v).length>11?' spc-small':'')+'">'+v+'</div></div>'; }
++
++/* ---------- svg util ---------- */
++var NS="http://www.w3.org/2000/svg";
++function el(t,at){ var e=document.createElementNS(NS,t); for(var k in at) e.setAttribute(k,at[k]); return e; }
++function clear(svg){ while(svg.firstChild) svg.removeChild(svg.firstChild); }
++function axes(svg,W,H,xmin,xmax,ymin,ymax,fmtX,fmtY){
++  var mL=52,mR=16,mT=14,mB=30, plotW=W-mL-mR, plotH=H-mT-mB;
++  if(xmax<=xmin)xmax=xmin+1; if(ymax<=ymin)ymax=ymin+1;
++  var sx=function(x){return mL+(x-xmin)/(xmax-xmin)*plotW;}, sy=function(y){return mT+plotH-(y-ymin)/(ymax-ymin)*plotH;};
++  for(var i=0;i<=4;i++){ var yv=ymin+(ymax-ymin)*i/4, yy=sy(yv);
++    svg.appendChild(el('line',{x1:mL,y1:yy,x2:W-mR,y2:yy,stroke:css('--spc-grid'),'stroke-width':1}));
++    var t=el('text',{x:mL-6,y:yy+3,'text-anchor':'end'}); t.textContent=fmtY(yv); svg.appendChild(t); }
++  for(var j=0;j<=5;j++){ var xv=xmin+(xmax-xmin)*j/5, xx=sx(xv);
++    var t2=el('text',{x:xx,y:H-mB+16,'text-anchor':'middle'}); t2.textContent=fmtX(xv); svg.appendChild(t2); }
++  var zeroY=(ymin<0&&ymax>0)?0:ymin;
++  svg.appendChild(el('line',{x1:mL,y1:sy(zeroY),x2:W-mR,y2:sy(zeroY),stroke:css('--spc-baseline'),'stroke-width':1}));
++  return {sx:sx,sy:sy,mL:mL,mR:mR,mT:mT,mB:mB,plotW:plotW,plotH:plotH,xmin:xmin,xmax:xmax,ymin:ymin,ymax:ymax};
++}
++function vline(svg,ax,x,color,label){ if(x<ax.xmin||x>ax.xmax)return;
++  var zeroY=(ax.ymin<0&&ax.ymax>0)?0:ax.ymin;
++  svg.appendChild(el('line',{x1:ax.sx(x),y1:ax.mT,x2:ax.sx(x),y2:ax.sy(zeroY),stroke:color,'stroke-width':1.5,'stroke-dasharray':'4 3'}));
++  if(label){ var t=el('text',{x:ax.sx(x),y:ax.mT+2,'text-anchor':'middle',fill:color}); t.setAttribute('font-size','9'); t.textContent=label; svg.appendChild(t); } }
++function hoverPts(svg,ax,pts,fx,fy,yl){
++  var col=css('--spc-series-1');
++  var hl=el('line',{x1:0,y1:ax.mT,x2:0,y2:ax.sy(ax.ymin),stroke:css('--spc-muted'),'stroke-width':1,opacity:0});
++  var dot=el('circle',{r:4,fill:col,stroke:css('--spc-surface-1'),'stroke-width':2,opacity:0});
++  svg.appendChild(hl); svg.appendChild(dot);
++  var ov=el('rect',{x:ax.mL,y:ax.mT,width:ax.plotW,height:ax.plotH,fill:'transparent'}); svg.appendChild(ov);
++  function mv(evt){ var r=svg.getBoundingClientRect(), px=(evt.clientX-r.left)/r.width*660,
++    dx=ax.xmin+(px-ax.mL)/ax.plotW*(ax.xmax-ax.xmin);
++    if(dx<ax.xmin||dx>ax.xmax){lv();return;}
++    var best=pts[0],bd=Infinity; for(var i=0;i<pts.length;i++){var dd=Math.abs(pts[i].x-dx); if(dd<bd){bd=dd;best=pts[i];}}
++    hl.setAttribute('x1',ax.sx(best.x)); hl.setAttribute('x2',ax.sx(best.x)); hl.setAttribute('opacity',0.5);
++    dot.setAttribute('cx',ax.sx(best.x)); dot.setAttribute('cy',ax.sy(best.y)); dot.setAttribute('opacity',1);
++    showTip(fx(best.x)+'<br>'+yl+' = <b>'+fy(best.y)+'</b>',evt); }
++  function lv(){ hl.setAttribute('opacity',0); dot.setAttribute('opacity',0); hideTip(); }
++  ov.addEventListener('mousemove',mv); ov.addEventListener('mouseleave',lv);
++  ov.addEventListener('touchmove',function(e){if(e.touches[0])mv(e.touches[0]);},{passive:true}); ov.addEventListener('touchend',lv);
++}
++
++/* ---------- TAB 1: PRICE PROBABILITY ---------- */
++function renderProb(){
++  var a=getA(), err=g('spc-probErr'); err.textContent='';
++  var K=parseFloat(g('spc-target').value), res=g('spc-probResults'), tbl=g('spc-probTable');
++  if(!a.valid){ err.textContent='Check your assumptions — price, volatility, and horizon must be positive.'; res.innerHTML=''; return; }
++  if(!(K>0)) err.textContent='Enter a positive target price.';
++  var above=pAbove(a,K), touch=touchProb(a,K), dir=K>=a.S0?'up to':'down to';
++  res.innerHTML=
++    statHTML('P(≥ '+money(K)+') at horizon', pct(above,1),'hl')+
++    statHTML('P(≤ '+money(K)+') at horizon', pct(1-above,1))+
++    statHTML('P(touches '+dir+' '+money(K)+')', pct(touch,1),'hl')+
++    statHTML('Expected price', money(expectedPrice(a)))+
++    statHTML('Median price', money(medianPrice(a)));
++  var ps=[0.05,0.10,0.25,0.5,0.75,0.90,0.95], rows='<tr><th>Percentile</th><th>Price</th><th>Return</th></tr>';
++  for(var i=0;i<ps.length;i++){ var pr=pctile(a,ps[i]); rows+='<tr><td>'+(ps[i]*100)+'th</td><td>'+money(pr)+'</td><td>'+pct(pr/a.S0-1,1)+'</td></tr>'; }
++  tbl.innerHTML=rows;
++  var svg=g('spc-probChart'); clear(svg);
++  var lo=Math.max(0.01,pctile(a,0.002)), hi=pctile(a,0.998), N=200, pts=[], ymax=0;
++  for(var k=0;k<=N;k++){ var x=lo+(hi-lo)*k/N, y=lnpdf(a,x); pts.push({x:x,y:y}); if(y>ymax)ymax=y; }
++  var ax=axes(svg,660,260,lo,hi,0,ymax*1.12,function(v){return '$'+num(v,0);},function(){return '';});
++  var beyond=function(x){ return K>=a.S0? x>=K : x<=K; };
++  var dArea='',open=false, ii;
++  for(ii=0;ii<pts.length;ii++){ var p=pts[ii];
++    if(beyond(p.x)){ if(!open){dArea+='M '+ax.sx(p.x)+' '+ax.sy(0); open=true;} dArea+=' L '+ax.sx(p.x)+' '+ax.sy(p.y); }
++    else if(open){ dArea+=' L '+ax.sx(pts[ii-1].x)+' '+ax.sy(0)+' Z'; open=false; } }
++  if(open) dArea+=' L '+ax.sx(pts[pts.length-1].x)+' '+ax.sy(0)+' Z';
++  if(dArea) svg.appendChild(el('path',{d:dArea,fill:css('--spc-series-1'),'fill-opacity':0.22}));
++  var dFill='M '+ax.sx(pts[0].x)+' '+ax.sy(0), dLine='';
++  for(ii=0;ii<pts.length;ii++){ dFill+=' L '+ax.sx(pts[ii].x)+' '+ax.sy(pts[ii].y); dLine+=(ii?' L ':'M ')+ax.sx(pts[ii].x)+' '+ax.sy(pts[ii].y); }
++  dFill+=' L '+ax.sx(pts[pts.length-1].x)+' '+ax.sy(0)+' Z';
++  svg.appendChild(el('path',{d:dFill,fill:css('--spc-series-1'),'fill-opacity':0.07}));
++  svg.appendChild(el('path',{d:dLine,fill:'none',stroke:css('--spc-series-1'),'stroke-width':2,'stroke-linejoin':'round'}));
++  vline(svg,ax,a.S0,css('--spc-series-2'),'now'); vline(svg,ax,K,css('--spc-muted'),'target');
++  hoverPts(svg,ax,pts,function(v){return '$'+num(v,2);},function(v){return num(v,5);},'density');
++}
++
++/* ---------- TAB 2: MONTE CARLO ---------- */
++function randn(){ var u=0,v=0; while(u===0)u=Math.random(); while(v===0)v=Math.random(); return Math.sqrt(-2*Math.log(u))*Math.cos(2*Math.PI*v); }
++function renderMC(){
++  var a=getA(), err=g('spc-mcErr'); err.textContent=''; var res=g('spc-mcResults');
++  if(!a.valid){ err.textContent='Check your assumptions.'; res.innerHTML=''; clear(g('spc-mcFan')); clear(g('spc-mcHist')); return; }
++  var K=parseFloat(g('spc-mcTarget').value), N=parseInt(g('spc-mcN').value,10),
++      M=Math.max(20,Math.min(120,Math.round(a.days))),
++      dt=a.T/M, drift=(a.mu-0.5*a.sigma*a.sigma)*dt, vol=a.sigma*Math.sqrt(dt), s2dt=a.sigma*a.sigma*dt,
++      lK=Math.log(K), up=K>a.S0;
++  var stepVals=[]; for(var j0=0;j0<=M;j0++) stepVals.push(new Float64Array(N));
++  var nSample=Math.min(120,N), samplePaths=[], terminals=new Float64Array(N), touchAcc=0, aboveCnt=0;
++  for(var i=0;i<N;i++){
++    var x=Math.log(a.S0); stepVals[0][i]=a.S0; var hit=false, pNo=1, keep=i<nSample, path=keep?[a.S0]:null;
++    for(var j=1;j<=M;j++){ var xn=x+drift+vol*randn();
++      if(K>0){ if(up){ if(x>=lK||xn>=lK) hit=true; else pNo*=(1-Math.exp(-2*(lK-x)*(lK-xn)/s2dt)); }
++               else  { if(x<=lK||xn<=lK) hit=true; else pNo*=(1-Math.exp(-2*(x-lK)*(xn-lK)/s2dt)); } }
++      x=xn; var S=Math.exp(x); stepVals[j][i]=S; if(keep) path.push(S); }
++    terminals[i]=Math.exp(x); if(terminals[i]>=K) aboveCnt++;
++    if(K>0) touchAcc+=hit?1:(1-pNo); if(keep) samplePaths.push(path);
++  }
++  var sortedT=Float64Array.from(terminals).sort(); var q=function(p){return sortedT[Math.min(N-1,Math.floor(p*N))];};
++  var mean=0; for(i=0;i<N;i++) mean+=terminals[i]; mean/=N;
++  res.innerHTML=
++    statHTML('Mean price', money(mean),'hl')+
++    statHTML('Median (P50)', money(q(0.5)))+
++    statHTML('P5 – P95', money(q(0.05))+' – '+money(q(0.95)))+
++    statHTML('P(≥ '+money(K)+')', pct(aboveCnt/N,1)+' <span style="font-size:11px;color:var(--spc-muted)">· exact '+pct(pAbove(a,K),1)+'</span>','hl')+
++    statHTML('P(touches '+money(K)+')', pct(touchAcc/N,1)+' <span style="font-size:11px;color:var(--spc-muted)">· exact '+pct(touchProb(a,K),1)+'</span>');
++  var p5=[],p50=[],p95=[]; for(j=0;j<=M;j++){ var col=Float64Array.from(stepVals[j]).sort();
++    p5.push(col[Math.floor(0.05*N)]); p50.push(col[Math.floor(0.5*N)]); p95.push(col[Math.floor(0.95*N)]); }
++  drawFan(samplePaths,p5,p50,p95,a,M,K); drawHist('spc-mcHist',terminals,K);
++}
++function drawFan(paths,p5,p50,p95,a,M,K){
++  var svg=g('spc-mcFan'); clear(svg); var W=660,H=280, ymax=0,ymin=Infinity, ii,jj;
++  for(ii=0;ii<p95.length;ii++) if(p95[ii]>ymax)ymax=p95[ii];
++  for(ii=0;ii<p5.length;ii++) if(p5[ii]<ymin)ymin=p5[ii];
++  for(ii=0;ii<paths.length;ii++) for(jj=0;jj<paths[ii].length;jj++){ var v=paths[ii][jj]; if(v>ymax)ymax=v; if(v<ymin)ymin=v; }
++  ymin=Math.max(0,Math.min(ymin,a.S0)); ymax=Math.max(ymax,a.S0);
++  var ax=axes(svg,W,H,0,a.days,ymin*0.98,ymax*1.04,function(v){return num(v,0)+'d';},function(v){return '$'+num(v,0);});
++  var tx=function(j){return ax.sx(a.days*j/M);};
++  var band='M '+tx(0)+' '+ax.sy(p95[0]);
++  for(jj=1;jj<=M;jj++) band+=' L '+tx(jj)+' '+ax.sy(p95[jj]);
++  for(jj=M;jj>=0;jj--) band+=' L '+tx(jj)+' '+ax.sy(p5[jj]); band+=' Z';
++  svg.appendChild(el('path',{d:band,fill:css('--spc-series-1'),'fill-opacity':0.13}));
++  for(ii=0;ii<paths.length;ii++){ var d=''; for(jj=0;jj<paths[ii].length;jj++) d+=(jj?' L ':'M ')+tx(jj)+' '+ax.sy(paths[ii][jj]);
++    svg.appendChild(el('path',{d:d,fill:'none',stroke:css('--spc-series-1'),'stroke-width':0.6,'stroke-opacity':0.16})); }
++  var dm=''; for(jj=0;jj<=M;jj++) dm+=(jj?' L ':'M ')+tx(jj)+' '+ax.sy(p50[jj]);
++  svg.appendChild(el('path',{d:dm,fill:'none',stroke:css('--spc-series-1'),'stroke-width':2.2}));
++  if(K>0&&K>=ax.ymin&&K<=ax.ymax){ svg.appendChild(el('line',{x1:ax.mL,y1:ax.sy(K),x2:W-ax.mR,y2:ax.sy(K),stroke:css('--spc-series-2'),'stroke-width':1.4,'stroke-dasharray':'5 4'}));
++    var t=el('text',{x:W-ax.mR,y:ax.sy(K)-4,'text-anchor':'end',fill:css('--spc-series-2')}); t.setAttribute('font-size','9'); t.textContent='target '+money(K); svg.appendChild(t); }
++  var ov=el('rect',{x:ax.mL,y:ax.mT,width:ax.plotW,height:ax.plotH,fill:'transparent'}); svg.appendChild(ov);
++  var vl=el('line',{x1:0,y1:ax.mT,x2:0,y2:ax.mT+ax.plotH,stroke:css('--spc-muted'),'stroke-width':1,opacity:0}); svg.appendChild(vl);
++  ov.addEventListener('mousemove',function(evt){ var r=svg.getBoundingClientRect(), px=(evt.clientX-r.left)/r.width*W;
++    var jsel=Math.round((px-ax.mL)/ax.plotW*M); jsel=Math.max(0,Math.min(M,jsel));
++    vl.setAttribute('x1',tx(jsel)); vl.setAttribute('x2',tx(jsel)); vl.setAttribute('opacity',0.5);
++    showTip('day '+num(a.days*jsel/M,0)+'<br>P95 <b>'+money(p95[jsel])+'</b><br>P50 <b>'+money(p50[jsel])+'</b><br>P5 <b>'+money(p5[jsel])+'</b>',evt); });
++  ov.addEventListener('mouseleave',function(){vl.setAttribute('opacity',0); hideTip();});
++}
++function drawHist(id,data,mark){
++  var svg=g(id); clear(svg); var N=data.length; if(!N)return;
++  var min=Infinity,max=-Infinity,ii; for(ii=0;ii<N;ii++){ if(data[ii]<min)min=data[ii]; if(data[ii]>max)max=data[ii]; }
++  var bins=40, w=(max-min)/bins||1, counts=new Array(bins); for(ii=0;ii<bins;ii++)counts[ii]=0;
++  for(ii=0;ii<N;ii++){ var b=Math.floor((data[ii]-min)/w); if(b>=bins)b=bins-1; if(b<0)b=0; counts[b]++; }
++  var cmax=0; for(ii=0;ii<bins;ii++) if(counts[ii]>cmax)cmax=counts[ii];
++  var ax=axes(svg,660,240,min,max,0,cmax*1.1,function(v){return '$'+num(v,0);},function(v){return ((v/N)*100).toFixed(0)+'%';});
++  var bw=ax.plotW/bins, col=css('--spc-series-1');
++  for(var i=0;i<bins;i++){ if(!counts[i])continue; var x=ax.mL+i*bw, h=ax.plotH*counts[i]/(cmax*1.1);
++    var r=el('rect',{x:x+0.6,y:ax.sy(0)-h,width:Math.max(0.6,bw-1.2),height:h,fill:col,rx:1.5}); svg.appendChild(r);
++    (function(lo,hi,c){ r.addEventListener('mousemove',function(evt){showTip(money(lo)+'–'+money(hi)+'<br><b>'+((c/N)*100).toFixed(1)+'%</b> of outcomes',evt);});
++      r.addEventListener('mouseleave',hideTip); })(min+i*w,min+(i+1)*w,counts[i]); }
++  if(mark>0&&mark>=min&&mark<=max) svg.appendChild(el('line',{x1:ax.sx(mark),y1:ax.mT,x2:ax.sx(mark),y2:ax.sy(0),stroke:css('--spc-series-2'),'stroke-width':1.5,'stroke-dasharray':'4 3'}));
++}
++
++/* ---------- TAB 3: RETURN & RISK ---------- */
++function renderRisk(){
++  var a=getA(), err=g('spc-riskErr'); err.textContent=''; var res=g('spc-riskResults'), tbl=g('spc-riskTable');
++  if(!a.valid){ err.textContent='Check your assumptions.'; res.innerHTML=''; clear(g('spc-riskChart')); return; }
++  var pos=parseFloat(g('spc-posVal').value)||0;
++  var er=expectedPrice(a)/a.S0-1, pLoss=1-pAbove(a,a.S0),
++      v95p=pctile(a,0.05), v99p=pctile(a,0.01),
++      var95=1-v95p/a.S0, var99=1-v99p/a.S0,
++      cvar95=1-cvarPrice(a,0.05)/a.S0, cvar99=1-cvarPrice(a,0.01)/a.S0;
++  res.innerHTML=
++    statHTML('Expected return', pct(er,1), er>=0?'pos':'neg')+
++    statHTML('Chance of a loss', pct(pLoss,1))+
++    statHTML('95% VaR', pct(var95,1)+' · '+money(var95*pos),'neg')+
++    statHTML('99% VaR', pct(var99,1)+' · '+money(var99*pos),'neg')+
++    statHTML('95% CVaR (avg worst 5%)', pct(cvar95,1)+' · '+money(cvar95*pos),'neg')+
++    statHTML('Best case (P95)', pct(pctile(a,0.95)/a.S0-1,1),'pos');
++  var ps=[0.01,0.05,0.25,0.5,0.75,0.95,0.99], rows='<tr><th>Percentile</th><th>Return</th><th>P/L on '+money(pos)+'</th></tr>';
++  for(var i=0;i<ps.length;i++){ var rr=pctile(a,ps[i])/a.S0-1; rows+='<tr><td>'+(ps[i]*100)+'th</td><td>'+pct(rr,1)+'</td><td>'+money(rr*pos)+'</td></tr>'; }
++  tbl.innerHTML=rows;
++  var svg=g('spc-riskChart'); clear(svg);
++  var lo=pctile(a,0.002)/a.S0-1, hi=pctile(a,0.998)/a.S0-1, N=200, pts=[], ymax=0, ii;
++  for(ii=0;ii<=N;ii++){ var r=lo+(hi-lo)*ii/N, S=a.S0*(1+r), y=lnpdf(a,S)*a.S0; pts.push({x:r,y:y}); if(y>ymax)ymax=y; }
++  var ax=axes(svg,660,260,lo,hi,0,ymax*1.12,function(v){return (v*100).toFixed(0)+'%';},function(){return '';});
++  var varR=v95p/a.S0-1;
++  var dRed='',open=false;
++  for(ii=0;ii<pts.length;ii++){ var p=pts[ii];
++    if(p.x<=varR){ if(!open){dRed+='M '+ax.sx(p.x)+' '+ax.sy(0);open=true;} dRed+=' L '+ax.sx(p.x)+' '+ax.sy(p.y); }
++    else if(open){ dRed+=' L '+ax.sx(pts[ii-1].x)+' '+ax.sy(0)+' Z'; open=false; } }
++  if(open) dRed+=' L '+ax.sx(varR)+' '+ax.sy(0)+' Z';
++  if(dRed) svg.appendChild(el('path',{d:dRed,fill:css('--spc-bad'),'fill-opacity':0.28}));
++  var dFill='M '+ax.sx(pts[0].x)+' '+ax.sy(0), dLine='';
++  for(ii=0;ii<pts.length;ii++){ dFill+=' L '+ax.sx(pts[ii].x)+' '+ax.sy(pts[ii].y); dLine+=(ii?' L ':'M ')+ax.sx(pts[ii].x)+' '+ax.sy(pts[ii].y); }
++  dFill+=' L '+ax.sx(pts[pts.length-1].x)+' '+ax.sy(0)+' Z';
++  svg.appendChild(el('path',{d:dFill,fill:css('--spc-series-1'),'fill-opacity':0.08}));
++  svg.appendChild(el('path',{d:dLine,fill:'none',stroke:css('--spc-series-1'),'stroke-width':2}));
++  vline(svg,ax,0,css('--spc-muted'),'0%'); vline(svg,ax,varR,css('--spc-bad'),'VaR');
++  hoverPts(svg,ax,pts,function(v){return 'return '+(v*100).toFixed(1)+'%';},function(v){return num(v,5);},'density');
++}
++
++/* ---------- TAB 4: OPTIONS ---------- */
++var optT='call';
++function renderOpt(){
++  var a=getA(), err=g('spc-optErr'); err.textContent=''; var res=g('spc-optResults');
++  var K=parseFloat(g('spc-strike').value), prem=parseFloat(g('spc-premium').value), con=parseInt(g('spc-contracts').value,10)||0, mult=100*con;
++  if(!a.valid){ err.textContent='Check your assumptions.'; res.innerHTML=''; clear(g('spc-optChart')); return; }
++  if(!(K>0)||!(prem>=0)) err.textContent='Enter a positive strike and premium.';
++  var isCall=optT==='call', be=isCall?K+prem:K-prem,
++      pITM=isCall?pAbove(a,K):1-pAbove(a,K),
++      pProfit=isCall?pAbove(a,be):Math.max(0,1-pAbove(a,be)),
++      expPayoff=isCall?callExp(a,K):putExp(a,K),
++      expPL=(expPayoff-prem)*mult, maxLoss=prem*mult;
++  res.innerHTML=
++    statHTML('Breakeven price', money(be),'hl')+
++    statHTML('P(profit)', pct(pProfit,1),'hl')+
++    statHTML('P(expires in-the-money)', pct(pITM,1))+
++    statHTML('Expected P/L', money(expPL), expPL>=0?'pos':'neg')+
++    statHTML('Max loss', money(-maxLoss),'neg')+
++    statHTML('Expected payoff / share', money(expPayoff));
++  g('spc-optNote').innerHTML='Expected P/L uses <b>your</b> expected annual return ('+g('spc-mu').value+'%), i.e. the real-world probability measure — so it answers "given my view, is this a good bet?" It is <b>not</b> a fair option price (that would use the risk-free rate under the risk-neutral measure). Assumes holding a long option to expiration.';
++  var svg=g('spc-optChart'); clear(svg);
++  var lo=Math.max(0.01,pctile(a,0.01)), hi=pctile(a,0.99), N=160,
++      payoff=function(S){ return (isCall?Math.max(S-K,0):Math.max(K-S,0))-prem; },
++      pts=[], ymin=Infinity, ymax=-Infinity, ii;
++  for(ii=0;ii<=N;ii++){ var S=lo+(hi-lo)*ii/N, pl=payoff(S)*mult; pts.push({x:S,y:pl}); if(pl<ymin)ymin=pl; if(pl>ymax)ymax=pl; }
++  if(ymax<=0)ymax=maxLoss*0.2; if(ymin>=0)ymin=-maxLoss*0.2;
++  var ax=axes(svg,660,260,lo,hi,ymin*1.1,ymax*1.1,function(v){return '$'+num(v,0);},function(v){return money(v);});
++  function areaPath(cond){ var d='',open=false,i2;
++    for(i2=0;i2<pts.length;i2++){ var p=pts[i2], on=cond(p.y);
++      if(on){ if(!open){ d+='M '+ax.sx(p.x)+' '+ax.sy(0); open=true;} d+=' L '+ax.sx(p.x)+' '+ax.sy(p.y);}
++      else if(open){ d+=' L '+ax.sx(pts[i2-1].x)+' '+ax.sy(0)+' Z'; open=false;} }
++    if(open) d+=' L '+ax.sx(pts[pts.length-1].x)+' '+ax.sy(0)+' Z'; return d; }
++  var gp=areaPath(function(y){return y>0;}), rp=areaPath(function(y){return y<=0;});
++  if(rp) svg.appendChild(el('path',{d:rp,fill:css('--spc-bad'),'fill-opacity':0.20}));
++  if(gp) svg.appendChild(el('path',{d:gp,fill:css('--spc-good'),'fill-opacity':0.20}));
++  var dLine=''; for(ii=0;ii<pts.length;ii++) dLine+=(ii?' L ':'M ')+ax.sx(pts[ii].x)+' '+ax.sy(pts[ii].y);
++  svg.appendChild(el('path',{d:dLine,fill:'none',stroke:css('--spc-text-secondary'),'stroke-width':2}));
++  vline(svg,ax,a.S0,css('--spc-series-2'),'now'); vline(svg,ax,be,css('--spc-muted'),'B/E');
++  hoverPts(svg,ax,pts,function(v){return 'price '+money(v);},function(v){return money(v);},'P/L');
++}
++
++/* ---------- TAB 5: ESTIMATE ---------- */
++var estSigma=null, estMu=null;
++function parseLines(str){ return str.split(/\n/).map(function(line){ var m=line.match(/-?\d+(\.\d+)?/g); return m?parseFloat(m[m.length-1]):NaN; }).filter(function(v){return !isNaN(v);}); }
++function renderEst(){
++  var err=g('spc-estErr'); err.textContent=''; var res=g('spc-estResults'), raw=g('spc-hist').value.trim();
++  if(!raw){ res.innerHTML='<div class="spc-note" style="grid-column:1/-1">Paste at least ~10 closing prices to estimate.</div>'; estSigma=estMu=null; return; }
++  var prices; if(/\n/.test(raw)) prices=parseLines(raw); else prices=raw.split(/[\s,;]+/).map(Number).filter(function(v){return !isNaN(v);});
++  if(prices.length<3){ err.textContent='Need at least 3 prices.'; res.innerHTML=''; return; }
++  for(var i=0;i<prices.length;i++) if(prices[i]<=0){ err.textContent='Prices must be positive.'; res.innerHTML=''; return; }
++  var rets=[]; for(i=1;i<prices.length;i++) rets.push(Math.log(prices[i]/prices[i-1]));
++  var n=rets.length, mean=0; for(i=0;i<n;i++) mean+=rets[i]; mean/=n;
++  var vv=0; for(i=0;i<n;i++) vv+=(rets[i]-mean)*(rets[i]-mean); vv/=(n-1);
++  var sdDaily=Math.sqrt(vv); estSigma=sdDaily*Math.sqrt(252);
++  estMu=mean*252+0.5*estSigma*estSigma;
++  res.innerHTML=
++    statHTML('Data points', prices.length+' prices')+
++    statHTML('Daily volatility', pct(sdDaily,2))+
++    statHTML('Annualized volatility', pct(estSigma,1),'hl')+
++    statHTML('Est. expected return', pct(estMu,1),'hl')+
++    statHTML('Latest price', money(prices[prices.length-1]));
++}
++
++/* ---------- FETCH (via configurable backend proxy) ---------- */
++var QUOTE_ENDPOINT=(R.dataset.quoteEndpoint||'').trim();
++function fetchTicker(){
++  var sym=g('spc-ticker').value.trim().toUpperCase().replace(/[^A-Z0-9.\-]/g,''), st=g('spc-fetchStatus'); st.className='spc-status';
++  if(!QUOTE_ENDPOINT){ st.textContent='No data endpoint configured — enter price and volatility manually.'; return; }
++  if(!sym){ st.textContent='Enter a ticker first.'; return; }
++  st.textContent='Fetching '+sym+'…';
++  var url=QUOTE_ENDPOINT+(QUOTE_ENDPOINT.indexOf('?')>=0?'&':'?')+'ticker='+encodeURIComponent(sym);
++  fetch(url).then(function(r){ if(!r.ok) throw new Error('http '+r.status); return r.json(); }).then(function(d){
++    if(d.error) throw new Error(d.error);
++    if(typeof d.price==='number') g('spc-price').value=d.price;
++    if(typeof d.volatility==='number') g('spc-sigma').value=(d.volatility*100).toFixed(1);
++    st.className='spc-status spc-ok';
++    st.textContent='Loaded '+sym+': price '+money(d.price)+(typeof d.volatility==='number'?', volatility '+(d.volatility*100).toFixed(1)+'%':'')+'. Expected return left as-is — set it to your own view.';
++    renderAll();
++  }).catch(function(e){ st.className='spc-status spc-warn';
++    st.textContent="Couldn't fetch "+sym+" ("+e.message+"). Enter price and volatility manually, or use the Estimate inputs tab."; });
++}
++
++/* ---------- wiring ---------- */
++function activeP(){ return R.querySelector('.spc-tab[aria-selected="true"]').dataset.p; }
++function renderActive(){ var on=activeP(); if(on==='prob')renderProb(); else if(on==='mc')renderMC(); else if(on==='risk')renderRisk(); else if(on==='opt')renderOpt(); else if(on==='est')renderEst(); }
++function renderAll(){ renderProb(); renderRisk(); renderOpt(); renderEst(); if(activeP()==='mc') renderMC(); }
++
++['spc-price','spc-mu','spc-sigma','spc-days'].forEach(function(id){ g(id).addEventListener('input',renderAll); });
++g('spc-target').addEventListener('input',renderProb);
++g('spc-mcTarget').addEventListener('input',renderMC);
++g('spc-mcN').addEventListener('change',renderMC);
++g('spc-mcRun').addEventListener('click',renderMC);
++g('spc-posVal').addEventListener('input',renderRisk);
++['spc-strike','spc-premium','spc-contracts'].forEach(function(id){ g(id).addEventListener('input',renderOpt); });
++g('spc-hist').addEventListener('input',renderEst);
++g('spc-fetchBtn').addEventListener('click',fetchTicker);
++g('spc-ticker').addEventListener('keydown',function(e){ if(e.key==='Enter') fetchTicker(); });
++R.querySelectorAll('#spc-optType button').forEach(function(b){ b.addEventListener('click',function(){
++  R.querySelectorAll('#spc-optType button').forEach(function(x){x.setAttribute('aria-pressed','false');}); b.setAttribute('aria-pressed','true'); optT=b.dataset.t; renderOpt(); }); });
++g('spc-useEst').addEventListener('click',function(){ if(estSigma){ g('spc-sigma').value=(estSigma*100).toFixed(1); g('spc-mu').value=(estMu*100).toFixed(1); renderAll();
++  R.querySelector('.spc-tab[data-p="prob"]').click(); } });
++R.querySelectorAll('.spc-tab').forEach(function(t){ t.addEventListener('click',function(){
++  R.querySelectorAll('.spc-tab').forEach(function(x){x.setAttribute('aria-selected','false');}); t.setAttribute('aria-selected','true');
++  R.querySelectorAll('.spc-panel').forEach(function(p){p.classList.remove('spc-active');});
++  g('spc-p-'+t.dataset.p).classList.add('spc-active'); renderActive(); }); });
++g('spc-themeBtn').addEventListener('click',function(){
++  if(R.classList.contains('spc-dark')){ R.classList.remove('spc-dark'); R.classList.add('spc-light'); }
++  else if(R.classList.contains('spc-light')){ R.classList.remove('spc-light'); R.classList.add('spc-dark'); }
++  else { R.classList.add(matchMedia('(prefers-color-scheme: dark)').matches?'spc-light':'spc-dark'); }
++  renderAll(); });
++
++/* ---------- apply config: URL query params override data-* attributes ---------- */
++function applyConfig(){
++  var ds=R.dataset, params=null;
++  try{ params=new URLSearchParams(location.search); }catch(e){ params=null; }
++  function cfg(k){
++    if(params && params.get(k)!=null && params.get(k)!=='') return params.get(k);
++    return (ds[k]!==undefined && ds[k]!=='') ? ds[k] : null;
++  }
++  var vP=cfg('price'), vMu=cfg('mu'), vSig=cfg('sigma'), vDays=cfg('days'), vSym=cfg('symbol');
++  if(vP!=null) g('spc-price').value=vP;
++  if(vMu!=null) g('spc-mu').value=vMu;
++  if(vSig!=null) g('spc-sigma').value=vSig;
++  if(vDays!=null) g('spc-days').value=vDays;
++  if(vSym!=null) g('spc-ticker').value=vSym;
++  if(!QUOTE_ENDPOINT){ g('spc-fetchrow').style.display='none'; }
++  // seed target/strike near a round move from price
++  var S0=parseFloat(g('spc-price').value);
++  if(isFinite(S0)&&S0>0){ var tgt=Math.round(S0*1.15*100)/100; g('spc-target').value=tgt; g('spc-mcTarget').value=tgt; g('spc-strike').value=Math.round(S0*1.10*100)/100; }
++}
++applyConfig();
++
++/* ---------- public hook: update the stock without reloading (for SPA embeds) ---------
++   window.spcSetStock({symbol, price, sigma, mu, days})  — sigma/mu are PERCENT numbers */
++window.spcSetStock=function(o){
++  o=o||{};
++  if(o.price!=null) g('spc-price').value=o.price;
++  if(o.sigma!=null) g('spc-sigma').value=o.sigma;
++  if(o.mu!=null) g('spc-mu').value=o.mu;
++  if(o.days!=null) g('spc-days').value=o.days;
++  if(o.symbol!=null) g('spc-ticker').value=o.symbol;
++  var S0=parseFloat(g('spc-price').value);
++  if(isFinite(S0)&&S0>0){ var tgt=Math.round(S0*1.15*100)/100; g('spc-target').value=tgt; g('spc-mcTarget').value=tgt; g('spc-strike').value=Math.round(S0*1.10*100)/100; }
++  renderAll();
++};
++
++renderAll();
++})();
++</script>
++</div>
++<!-- === END STOCK PROBABILITY CALCULATOR WIDGET === -->
++</body></html>
++"""
++
++
+ # =========================== HTTP ===========================
+ class Handler(BaseHTTPRequestHandler):
+     def log_message(self, *a):
+@@ -2187,6 +2905,8 @@
+             self._send(200, SW_JS.encode("utf-8"), "application/javascript")
+         elif self.path.startswith("/sim.js"):
+             self._send(200, SIM_JS.encode("utf-8"), "application/javascript")
++        elif self.path.startswith("/calc-widget"):
++            self._send(200, CALC_PAGE.encode("utf-8"), "text/html; charset=utf-8")
+         elif self.path.startswith("/icon.png") or self.path.startswith("/apple-touch-icon"):
+             self._send(200, icon_bytes(), "image/png")
+         elif self.path.startswith("/api/hist/alerts"):
