@@ -1787,7 +1787,7 @@ SIM_JS = r"""/* ============================================================
 
     var wrap = document.createElement("div");
     wrap.innerHTML =
-      '<h2>🧪 Backtest — "buy the lowest"</h2>' +
+      '<h2>🧪 SimuWatch — "buy the lowest"</h2>' +
       '<div class="rule">Catching a stock’s exact bottom needs hindsight. This asks the real question: how much does perfect timing pay, and how much can a rule you could actually follow capture? Try it on simulated markets, or on the daily history this app has saved.</div>' +
       '<div class="sim-seg"><button id="sim-tab-mc" class="on">Simulated</button><button id="sim-tab-real">Real history</button></div>' +
       mc + real;
@@ -1902,7 +1902,7 @@ input{font:inherit;font-size:13px;padding:7px 10px;border:1px solid #d1d5db;bord
 <div class="tabs">
   <button id="tab-watch" class="tab active" onclick="showTab('watch')">⭐ Watchlist</button>
   <button id="tab-hist" class="tab" onclick="showTab('history')">🕘 History</button>
-  <button id="tab-sim" class="tab" onclick="showTab('sim')">🧪 Backtest</button>
+  <button id="tab-sim" class="tab" onclick="showTab('sim')">🧪 SimuWatch</button>
 </div>
 
 <div id="view-watch">
