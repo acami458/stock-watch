@@ -654,15 +654,24 @@ def fetch_snapshots(syms):
                 snaps = data.get("snapshots", data) if isinstance(data, dict) else {}
                 if isinstance(snaps, dict):
                     out.update(snaps)
+                print(f"[ALPACA-DEBUG] OK: requested {len(chunk)} symbols, got {len(snaps) if isinstance(snaps, dict) else 0} snapshots", flush=True)
                 break
             except urllib.error.HTTPError as e:
+                try:
+                    body = e.read().decode()[:300]
+                except Exception:
+                    body = "(could not read error body)"
+                print(f"[ALPACA-DEBUG] HTTP {e.code} from Alpaca -> {body}", flush=True)
                 if e.code == 429 and attempt < 2:
                     time.sleep(1.5 * (attempt + 1)); continue
                 break
-            except Exception:
+            except Exception as e:
+                print(f"[ALPACA-DEBUG] error contacting Alpaca: {type(e).__name__}: {str(e)[:200]}", flush=True)
                 if attempt < 2:
                     time.sleep(0.8 * (attempt + 1)); continue
                 break
+    if not out:
+        print(f"[ALPACA-DEBUG] fetch_snapshots got NOTHING back (HAVE_DATA={HAVE_DATA}, feed={ALPACA_FEED})", flush=True)
     return out
 
 
@@ -818,6 +827,7 @@ def evaluate_signal(row):
 
 def refresh_symbols(syms):
     if not HAVE_DATA or not syms:
+        print(f"[ALPACA-DEBUG] refresh skipped: HAVE_DATA={HAVE_DATA} (keys present in env?), n_syms={len(list(syms)) if syms else 0}", flush=True)
         return
     snaps = fetch_snapshots(list(syms))
     with _qlock:
