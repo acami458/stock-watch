@@ -20,7 +20,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from email.message import EmailMessage
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -94,6 +94,15 @@ PUSHOVER_API_TOKEN = os.environ.get("PUSHOVER_API_TOKEN", "").strip()
 PUSHOVER_URL       = "https://api.pushover.net/1/messages.json"
 PUSHOVER_ON = bool(PUSHOVER_USER_KEY and PUSHOVER_API_TOKEN)
 
+# Finnhub (earnings calendar + fundamentals) — free tier. Key from env, not source.
+#   export FINNHUB_KEY=...
+FINNHUB_KEY = os.environ.get("FINNHUB_KEY", "").strip()
+FINNHUB_URL = "https://finnhub.io/api/v1"
+HAVE_EARNINGS = bool(FINNHUB_KEY)
+EARNINGS_REFRESH_SECONDS = int(os.environ.get("EARNINGS_REFRESH_SECONDS", str(6 * 3600)))
+NOTABLE_MIN_REV = float(os.environ.get("NOTABLE_MIN_REV", "750e6"))  # >= $750M rev est = "notable"
+EARN_MAX_ROWS = 90
+
 _FALLBACK_ICON = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==")
 
@@ -149,6 +158,12 @@ def init_db():
         cur.execute("""CREATE TABLE IF NOT EXISTS daily_history(
             symbol TEXT NOT NULL, day TEXT NOT NULL, close REAL, low REAL,
             high REAL, prev_close REAL, PRIMARY KEY(symbol, day))""")
+        # Per-user earnings analysis notes (the judgment columns from the
+        # weekly spreadsheet): Grade, Beat %, What-to-Watch, and a gold flag.
+        cur.execute("""CREATE TABLE IF NOT EXISTS earnings_notes(
+            user_id INTEGER NOT NULL, symbol TEXT NOT NULL, period TEXT NOT NULL,
+            grade TEXT, beat REAL, watch TEXT, gold INTEGER DEFAULT 0,
+            PRIMARY KEY(user_id, symbol, period))""")
         conn.commit()
     finally:
         conn.close()
@@ -1110,6 +1125,274 @@ def record_alarms():
                                 row.get("from_low"), row.get("change"))
 
 
+# =========================== EARNINGS (Finnhub) ===========================
+# Curated "notable" weekly earnings + per-user analysis notes + next-earnings
+# badges for watchlist cards. Every Finnhub call is best-effort and cached; if
+# FINNHUB_KEY is unset the whole feature is simply off and nothing else breaks.
+_EARN_NAME_HINT = {
+    "AAPL": "Apple", "MSFT": "Microsoft", "AMZN": "Amazon", "GOOG": "Alphabet", "GOOGL": "Alphabet",
+    "META": "Meta Platforms", "NVDA": "NVIDIA", "TSLA": "Tesla", "AVGO": "Broadcom", "JPM": "JPMorgan Chase",
+    "V": "Visa", "MA": "Mastercard", "KO": "Coca-Cola", "PEP": "PepsiCo", "JNJ": "Johnson & Johnson",
+    "LLY": "Eli Lilly", "PFE": "Pfizer", "MRK": "Merck", "ABBV": "AbbVie", "UNH": "UnitedHealth",
+    "HUM": "Humana", "WMT": "Walmart", "COST": "Costco", "HD": "Home Depot", "MCD": "McDonald's",
+    "NKE": "Nike", "DIS": "Disney", "NFLX": "Netflix", "INTC": "Intel", "AMD": "AMD", "MU": "Micron",
+    "QCOM": "Qualcomm", "TXN": "Texas Instruments", "IBM": "IBM", "ORCL": "Oracle", "CRM": "Salesforce",
+    "ADBE": "Adobe", "CSCO": "Cisco", "BA": "Boeing", "CAT": "Caterpillar", "GE": "GE Aerospace",
+    "LMT": "Lockheed Martin", "DE": "Deere", "UPS": "UPS", "XOM": "Exxon Mobil", "CVX": "Chevron",
+    "BAC": "Bank of America", "WFC": "Wells Fargo", "GS": "Goldman Sachs", "MS": "Morgan Stanley",
+    "C": "Citigroup", "PYPL": "PayPal", "BKNG": "Booking", "SBUX": "Starbucks", "T": "AT&T",
+    "VZ": "Verizon", "CMCSA": "Comcast", "INTU": "Intuit", "AMAT": "Applied Materials", "ADI": "Analog Devices",
+    "GILD": "Gilead", "AMGN": "Amgen", "BMY": "Bristol-Myers", "ADSK": "Autodesk", "GEV": "GE Vernova",
+    "RIO": "Rio Tinto", "BABA": "Alibaba", "FUTU": "Futu", "MAIN": "Main Street Capital", "CUBE": "CubeSmart",
+    "CL": "Colgate-Palmolive", "CBRL": "Cracker Barrel", "COPX": "Global X Copper ETF", "IEP": "Icahn Enterprises",
+}
+_HOUR_LABEL = {"bmo": "Before open", "amc": "After close", "dmh": "During market"}
+
+_earn_lock = threading.Lock()
+_earn_state = {"raw": [], "fetched": 0.0}         # broad calendar window cache
+_fund = {}                                        # symbol -> {name, pe, consensus, color, t}
+_fund_lock = threading.Lock()
+_enrich_running = {"on": False}
+
+
+def _finnhub_get(path, params):
+    params = dict(params or {})
+    params["token"] = FINNHUB_KEY
+    url = FINNHUB_URL + path + "?" + urllib.parse.urlencode(params)
+    req = urllib.request.Request(url, headers={"User-Agent": "stock-watch"})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        return json.loads(r.read().decode())
+
+
+def fetch_earnings_calendar(dfrom, dto):
+    if not HAVE_EARNINGS:
+        return []
+    try:
+        data = _finnhub_get("/calendar/earnings", {"from": dfrom, "to": dto})
+        return data.get("earningsCalendar") or []
+    except Exception as e:
+        print(f"[EARN] calendar fetch failed: {str(e)[:140]}", flush=True)
+        return []
+
+
+def _refresh_earnings_raw(force=False):
+    """(Re)pull the broad earnings window. Finnhub only — no DB, safe off-hours."""
+    if not HAVE_EARNINGS:
+        return
+    now = time.monotonic()
+    with _earn_lock:
+        fresh = _earn_state["raw"] and (now - _earn_state["fetched"]) < EARNINGS_REFRESH_SECONDS
+    if fresh and not force:
+        return
+    today = datetime.now(ET).date()
+    dfrom = (today - timedelta(days=4)).strftime("%Y-%m-%d")
+    dto = (today + timedelta(days=45)).strftime("%Y-%m-%d")
+    rows = fetch_earnings_calendar(dfrom, dto)
+    if rows:
+        with _earn_lock:
+            _earn_state["raw"] = rows
+            _earn_state["fetched"] = now
+
+
+def _week_bounds(offset):
+    today = datetime.now(ET).date()
+    monday = today - timedelta(days=today.weekday()) + timedelta(days=7 * offset)
+    return monday, monday + timedelta(days=6)
+
+
+def _rev_fmt(v):
+    if not v:
+        return None
+    a = abs(v)
+    if a >= 1e9:
+        return f"${v/1e9:.1f}B"
+    if a >= 1e6:
+        return f"${v/1e6:.0f}M"
+    return f"${v:,.0f}"
+
+
+def _consensus_label(r):
+    sb = r.get("strongBuy") or 0; b = r.get("buy") or 0; h = r.get("hold") or 0
+    s = r.get("sell") or 0; ss = r.get("strongSell") or 0
+    total = sb + b + h + s + ss
+    if not total:
+        return None, None
+    score = (1 * sb + 2 * b + 3 * h + 4 * s + 5 * ss) / total   # 1=Strong Buy .. 5=Strong Sell
+    if score <= 1.5:
+        return "Strong Buy", "green"
+    if score <= 2.4:
+        return "Buy", "green"
+    if score <= 2.9:
+        return "Moderate Buy", "amber"
+    if score <= 3.5:
+        return "Hold", "gray"
+    if score <= 4.5:
+        return "Sell", "red"
+    return "Strong Sell", "red"
+
+
+def _enrich_symbol(sym):
+    name = pe = consensus = color = None
+    try:
+        name = (_finnhub_get("/stock/profile2", {"symbol": sym}) or {}).get("name") or None
+    except Exception:
+        pass
+    time.sleep(0.4)
+    try:
+        m = (_finnhub_get("/stock/metric", {"symbol": sym, "metric": "all"}) or {}).get("metric") or {}
+        raw_pe = m.get("peTTM")
+        if raw_pe is None:
+            raw_pe = m.get("peBasicExclExtraTTM")
+        if raw_pe is not None:
+            pe = round(float(raw_pe), 1)
+    except Exception:
+        pass
+    time.sleep(0.4)
+    try:
+        rec = _finnhub_get("/stock/recommendation", {"symbol": sym})
+        if isinstance(rec, list) and rec:
+            consensus, color = _consensus_label(rec[0])
+    except Exception:
+        pass
+    with _fund_lock:
+        cur = _fund.get(sym) or {}
+        _fund[sym] = {"name": name or cur.get("name"),
+                      "pe": pe if pe is not None else cur.get("pe"),
+                      "consensus": consensus or cur.get("consensus"),
+                      "color": color or cur.get("color"), "t": time.monotonic()}
+
+
+def _start_enrichment(symbols):
+    if not HAVE_EARNINGS or not symbols:
+        return
+    with _fund_lock:
+        if _enrich_running["on"]:
+            return
+        _enrich_running["on"] = True
+    syms = list(symbols)
+
+    def run():
+        try:
+            for sym in syms:
+                with _fund_lock:
+                    f = _fund.get(sym)
+                if f and (time.monotonic() - f.get("t", 0)) < 20 * 3600:
+                    continue
+                _enrich_symbol(sym)
+                time.sleep(0.6)
+        finally:
+            with _fund_lock:
+                _enrich_running["on"] = False
+    threading.Thread(target=run, daemon=True).start()
+
+
+def earnings_week_rows(offset=0):
+    """Curated notable earnings for the week (offset weeks from this one)."""
+    _refresh_earnings_raw()
+    with _earn_lock:
+        raw = list(_earn_state["raw"])
+    monday, sunday = _week_bounds(offset)
+    ms, ss = monday.strftime("%Y-%m-%d"), sunday.strftime("%Y-%m-%d")
+    notable = set(DEFAULT_WATCHLIST)
+    try:
+        notable |= set(all_user_symbols())
+    except Exception:
+        pass
+    for e in raw:
+        rev = e.get("revenueEstimate")
+        if rev and rev >= NOTABLE_MIN_REV and e.get("symbol"):
+            notable.add(e.get("symbol"))
+    best = {}
+    for e in raw:
+        d = e.get("date"); sym = e.get("symbol")
+        if not d or not sym or d < ms or d > ss or sym not in notable:
+            continue
+        if sym in best and (e.get("revenueEstimate") or 0) <= (best[sym].get("revenueEstimate") or 0):
+            continue
+        best[sym] = e
+    rows = []
+    for sym, e in best.items():
+        with _fund_lock:
+            f = dict(_fund.get(sym) or {})
+        yr, q = e.get("year"), e.get("quarter")
+        period = f"{yr}Q{q}" if yr and q else (e.get("date") or sym)
+        rows.append({
+            "symbol": sym,
+            "company": f.get("name") or _EARN_NAME_HINT.get(sym) or sym,
+            "date": e.get("date"),
+            "when": _HOUR_LABEL.get((e.get("hour") or "").lower(), ""),
+            "eps_est": e.get("epsEstimate"),
+            "rev_est": _rev_fmt(e.get("revenueEstimate")),
+            "_rev": e.get("revenueEstimate") or 0,
+            "pe": f.get("pe"),
+            "consensus": f.get("consensus"),
+            "consensus_color": f.get("color"),
+            "period": period,
+        })
+    rows.sort(key=lambda r: (r["date"] or "9999-99-99", -r["_rev"]))
+    rows = rows[:EARN_MAX_ROWS]
+    _start_enrichment([r["symbol"] for r in rows])
+    return rows, (ms, ss)
+
+
+def earnings_badges(symbols):
+    """symbol -> {date, days, when} for its next report. Reads cache only (no fetch)."""
+    if not HAVE_EARNINGS or not symbols:
+        return {}
+    with _earn_lock:
+        raw = list(_earn_state["raw"])
+    if not raw:
+        return {}
+    today = datetime.now(ET).date()
+    tstr = today.strftime("%Y-%m-%d")
+    want = set(symbols)
+    best = {}
+    for e in raw:
+        sym = e.get("symbol"); d = e.get("date")
+        if sym not in want or not d or d < tstr:
+            continue
+        if sym not in best or d < best[sym]["date"]:
+            try:
+                days = (datetime.strptime(d, "%Y-%m-%d").date() - today).days
+            except Exception:
+                days = None
+            best[sym] = {"date": d, "days": days, "when": _HOUR_LABEL.get((e.get("hour") or "").lower(), "")}
+    return best
+
+
+def get_earn_notes(uid):
+    conn, kind = _db()
+    try:
+        cur = conn.cursor()
+        cur.execute(_ph("SELECT symbol, period, grade, beat, watch, gold FROM earnings_notes WHERE user_id=%s", kind), (uid,))
+        out = {}
+        for r in cur.fetchall():
+            out[(r[0], r[1])] = {"grade": r[2], "beat": r[3], "watch": r[4], "gold": bool(r[5])}
+        return out
+    finally:
+        conn.close()
+
+
+def save_earn_note(uid, symbol, period, grade, beat, watch, gold):
+    conn, kind = _db()
+    try:
+        cur = conn.cursor()
+        g = 1 if gold else 0
+        if kind == "pg":
+            cur.execute("""INSERT INTO earnings_notes(user_id, symbol, period, grade, beat, watch, gold)
+                           VALUES(%s,%s,%s,%s,%s,%s,%s)
+                           ON CONFLICT (user_id, symbol, period) DO UPDATE SET
+                             grade=EXCLUDED.grade, beat=EXCLUDED.beat,
+                             watch=EXCLUDED.watch, gold=EXCLUDED.gold""",
+                        (uid, symbol, period, grade, beat, watch, g))
+        else:
+            cur.execute("""INSERT OR REPLACE INTO earnings_notes(user_id, symbol, period, grade, beat, watch, gold)
+                           VALUES(?,?,?,?,?,?,?)""", (uid, symbol, period, grade, beat, watch, g))
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def refresher():
     """Background loop.
 
@@ -1123,6 +1406,12 @@ def refresher():
     last_daily_save = None   # date string of the last persisted daily snapshot
     while True:
         now = datetime.now(ET)
+        # Keep the earnings calendar warm even off-hours (Finnhub only, no DB),
+        # so watchlist cards can show "reports in N days" any time of day.
+        try:
+            _refresh_earnings_raw()
+        except Exception:
+            pass
         # Active only during the sessions we actually alert in. Otherwise stay
         # idle and make NO database calls, letting the DB endpoint suspend.
         if session_label(now) not in ALERT_SESSIONS:
@@ -1903,6 +2192,23 @@ input{font:inherit;font-size:13px;padding:7px 10px;border:1px solid #d1d5db;bord
 .histtbl .stat span{flex:1}
 .histtbl .stat span:nth-child(2),.histtbl .stat span:nth-child(3){text-align:center}
 .histtbl .stat span:nth-child(4),.histtbl .stat span:nth-child(5){text-align:right}
+.etbl{border-collapse:collapse;width:100%;font-size:12px}
+.etbl th,.etbl td{border-bottom:1px solid #eef0f3;padding:6px 8px;text-align:left;vertical-align:top}
+.etbl th{position:sticky;top:0;background:#f6f7f9;font-size:11px;color:#374151;white-space:nowrap}
+.etbl tr.gold{background:#fffbeb}
+.etbl td.num{text-align:right;white-space:nowrap}
+.etbl .cons{display:inline-block;font-weight:700;padding:1px 7px;border-radius:999px;font-size:11px}
+.cons.green{background:#dcfce7;color:#166534}.cons.amber{background:#fef3c7;color:#92400e}
+.cons.gray{background:#eef0f3;color:#374151}.cons.red{background:#fee2e2;color:#991b1b}
+.etbl input.g{width:46px;padding:3px 5px;font-size:12px}
+.etbl input.b{width:56px;padding:3px 5px;font-size:12px}
+.etbl textarea.w{width:100%;min-width:190px;height:34px;font:inherit;font-size:12px;padding:3px 5px;border:1px solid #d1d5db;border-radius:6px;resize:vertical}
+.etbl a.ews{text-decoration:none;font-size:14px}
+.star{cursor:pointer;font-size:15px;border:none;background:none;padding:0;line-height:1}
+.edate{font-weight:700;white-space:nowrap}.ewhen{color:#6b7280;white-space:nowrap}
+.earn-badge{display:inline-block;margin-top:4px;font-size:10px;font-weight:800;padding:1px 6px;border-radius:999px;background:#eef2ff;color:#3730a3;border:1px solid #c7d2fe}
+.earn-badge.soon{background:#fef3c7;color:#92400e;border-color:#fcd34d}
+.earn-badge.imm{background:#fee2e2;color:#991b1b;border-color:#fca5a5}
 </style></head><body>
 <h1>📈 Stock Watch</h1>
 <div class="meta" id="asof">loading…</div>
@@ -1914,6 +2220,7 @@ input{font:inherit;font-size:13px;padding:7px 10px;border:1px solid #d1d5db;bord
   <button id="tab-watch" class="tab active" onclick="showTab('watch')">⭐ Watchlist</button>
   <button id="tab-hist" class="tab" onclick="showTab('history')">🕘 History</button>
   <button id="tab-sim" class="tab" onclick="showTab('sim')">🧪 SimuWatch</button>
+  <button id="tab-earn" class="tab" onclick="showTab('earn')">📅 Earnings</button>
 </div>
 
 <div id="view-watch">
@@ -1948,6 +2255,19 @@ input{font:inherit;font-size:13px;padding:7px 10px;border:1px solid #d1d5db;bord
 
 <div id="view-sim" style="display:none">
   <div id="sim-root"></div>
+</div>
+
+<div id="view-earn" style="display:none">
+  <div class="bar" style="align-items:center">
+    <button onclick="earnWeek(-1)">◀ Prev</button>
+    <span id="earn-range" style="font-weight:700">…</span>
+    <button onclick="earnWeek(1)">Next ▶</button>
+    <button onclick="earnWeek(0)">This week</button>
+    <button onclick="loadEarnings()" style="font-weight:600">Refresh</button>
+  </div>
+  <div id="earn-note" class="muted" style="font-size:12px;margin-bottom:8px"></div>
+  <div id="earn-wrap" style="overflow:auto"><div class="empty">Loading…</div></div>
+  <div class="foot">Objective columns auto-fill from Finnhub and refresh on their own. <b>Grade</b>, <b>Beat %</b> and <b>What to Watch</b> are yours — edits save to your account. Tap ☆ to flag a market-mover; ⧉ opens Earnings Whispers for the whisper number.</div>
 </div>
 
 <div id="overlay" onclick="if(event.target===this)closeDetail()">
@@ -1989,7 +2309,7 @@ function card(t,blink){
   '<div class="row">from day low: '+pctSpan(t.from_low)+'</div>'+
   '<div class="row muted">open: '+(t.open==null?'—':'$'+t.open.toFixed(2))+' · prev: '+(t.prev_close==null?'—':'$'+t.prev_close.toFixed(2))+'</div>'+
   '<div class="row muted">VWAP: '+(t.vwap==null?'—':'$'+t.vwap.toFixed(2))+'</div>'+
-  '<div class="row muted">'+(t.as_of||'')+'</div></div>';
+  '<div class="row muted">'+(t.as_of||'')+'</div>'+earnCardBadge(t)+'</div>';
 }
 function findRow(tk){return (LAST.mine||[]).find(function(r){return r.ticker===tk;});}
 async function openDetail(tk){
@@ -2140,11 +2460,14 @@ function showTab(t){
  document.getElementById('view-watch').style.display=(t==='watch')?'block':'none';
  document.getElementById('view-history').style.display=(t==='history')?'block':'none';
  document.getElementById('view-sim').style.display=(t==='sim')?'block':'none';
+ document.getElementById('view-earn').style.display=(t==='earn')?'block':'none';
  document.getElementById('tab-watch').classList.toggle('active',t==='watch');
  document.getElementById('tab-hist').classList.toggle('active',t==='history');
  document.getElementById('tab-sim').classList.toggle('active',t==='sim');
+ document.getElementById('tab-earn').classList.toggle('active',t==='earn');
  if(t==='history')loadHistory();
  if(t==='sim'&&window.initSim)window.initSim();
+ if(t==='earn')loadEarnings();
 }
 async function loadHistory(){
  const box=document.getElementById('histalerts');
@@ -2184,6 +2507,66 @@ function drawDaily(points,sym){
  const up=data[data.length-1]>=data[0];
  _histChart=new Chart(cv,{type:'line',data:{labels:labels,datasets:[{data:data,borderColor:up?'#16a34a':'#dc2626',borderWidth:2,pointRadius:2,tension:0.2,fill:false}]},
    options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{ticks:{maxTicksLimit:8,font:{size:10}}},y:{ticks:{font:{size:10}}}}}});
+}
+// ---------- Earnings tab ----------
+let _earnOffset=0, _earnReloadT=null;
+function earnWeek(o){ if(o===0)_earnOffset=0; else _earnOffset=Math.max(-2,Math.min(6,_earnOffset+o)); loadEarnings(); }
+function ewsLink(sym){return 'https://www.earningswhispers.com/stocks/'+encodeURIComponent(sym);}
+function esc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
+function consCell(r){ if(!r.consensus) return '<span class="muted">—</span>'; return '<span class="cons '+(r.consensus_color||'gray')+'">'+esc(r.consensus)+'</span>'; }
+function earnCardBadge(t){
+ if(!t.earn||t.earn.days==null) return '';
+ var d=t.earn.days,cls='earn-badge'; if(d<=1)cls+=' imm'; else if(d<=5)cls+=' soon';
+ var lbl=(d<=0?'today':(d===1?'tomorrow':'in '+d+'d'));
+ return '<div class="row"><span class="'+cls+'">📅 Earnings '+lbl+(t.earn.when?(' · '+t.earn.when):'')+'</span></div>';
+}
+async function loadEarnings(){
+ const wrap=document.getElementById('earn-wrap'),note=document.getElementById('earn-note');
+ if(_earnReloadT){clearTimeout(_earnReloadT);_earnReloadT=null;}
+ wrap.innerHTML='<div class="empty">Loading…</div>';
+ try{
+  const d=await (await fetch('/api/earnings?week='+_earnOffset,{cache:'no-store'})).json();
+  document.getElementById('earn-range').textContent=(d.week_start||'')+'  →  '+(d.week_end||'');
+  if(!d.have_earnings){wrap.innerHTML='<div class="warn">📅 The Earnings tab needs a free <b>Finnhub</b> key. Add <b>FINNHUB_KEY</b> in your server settings and it turns on automatically — everything else keeps working without it.</div>';note.textContent='';return;}
+  const rows=d.rows||[];
+  if(!rows.length){wrap.innerHTML='<div class="empty">No notable earnings found for this week.</div>';note.textContent='';return;}
+  note.textContent=rows.length+' notable companies reporting'+(d.logged_in?'':' — sign in to save your Grade / Beat % / notes.');
+  wrap.innerHTML=earnTable(rows,d.logged_in);
+  if(rows.some(function(r){return r.pe==null||!r.consensus;})){ _earnReloadT=setTimeout(function(){ if(_curTab==='earn')loadEarnings(); },9000); }
+ }catch(e){wrap.innerHTML='<div class="empty">Could not load earnings.</div>';note.textContent='';}
+}
+function earnTable(rows,editable){
+ var dis=editable?'':' disabled';
+ var h='<table class="etbl"><thead><tr><th></th><th>Company</th><th>Ticker</th><th>Date</th><th>Time</th><th>P/E</th><th>Est. EPS</th><th>Est. Rev</th><th>Grade</th><th>Beat %</th><th>Consensus</th><th>What to Watch</th><th></th></tr></thead><tbody>';
+ h+=rows.map(function(r){
+   var ro=r.gold?' class="gold"':'';
+   var grade=esc(r.grade||''), watch=esc(r.watch||''), beat=(r.beat!=null?r.beat:'');
+   return '<tr'+ro+' data-sym="'+r.symbol+'" data-period="'+esc(r.period||'')+'">'
+    +'<td><button class="star" title="Flag market-mover" onclick="toggleGold(this)">'+(r.gold?'⭐':'☆')+'</button></td>'
+    +'<td>'+esc(r.company||r.symbol)+'</td>'
+    +'<td class="tk">'+r.symbol+'</td>'
+    +'<td class="edate">'+(r.date||'—')+'</td>'
+    +'<td class="ewhen">'+(r.when||'—')+'</td>'
+    +'<td class="num">'+(r.pe!=null?r.pe:'—')+'</td>'
+    +'<td class="num">'+(r.eps_est!=null?('$'+Number(r.eps_est).toFixed(2)):'—')+'</td>'
+    +'<td class="num">'+(r.rev_est||'—')+'</td>'
+    +'<td><input class="g" value="'+grade+'" placeholder="—" onchange="saveNote(this)"'+dis+'></td>'
+    +'<td><input class="b" type="number" step="1" min="0" max="100" value="'+beat+'" placeholder="—" onchange="saveNote(this)"'+dis+'></td>'
+    +'<td>'+consCell(r)+'</td>'
+    +'<td><textarea class="w" placeholder="your notes…" onchange="saveNote(this)"'+dis+'>'+watch+'</textarea></td>'
+    +'<td><a class="ews" href="'+ewsLink(r.symbol)+'" target="_blank" rel="noopener" title="Earnings Whispers (whisper number)">⧉</a></td>'
+   +'</tr>';
+ }).join('');
+ return h+'</tbody></table>';
+}
+function toggleGold(btn){ var on=(btn.textContent==='☆'); btn.textContent=on?'⭐':'☆'; var tr=btn.closest('tr'); if(tr){tr.classList.toggle('gold',on);} saveNote(btn); }
+async function saveNote(el){
+ var tr=el.closest&&el.closest('tr'); if(!tr) return;
+ var sym=tr.getAttribute('data-sym'), period=tr.getAttribute('data-period');
+ var gi=tr.querySelector('input.g'), bi=tr.querySelector('input.b'), wi=tr.querySelector('textarea.w'), st=tr.querySelector('.star');
+ var beatRaw=bi?bi.value:''; var beat=(beatRaw===''||beatRaw==null)?null:Number(beatRaw);
+ var body={symbol:sym,period:period,grade:gi?gi.value:'',beat:beat,watch:wi?wi.value:'',gold:(st?st.textContent==='⭐':false)};
+ try{ await fetch('/api/earnings/note',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}); }catch(e){}
 }
 if('serviceWorker' in navigator){navigator.serviceWorker.register('/sw.js').catch(function(){});}
 whoami();load();setInterval(load,30000);
@@ -2943,8 +3326,38 @@ class Handler(BaseHTTPRequestHandler):
             uid = self._uid()
             out = {"meta": meta(), "mine": []}
             if uid:
-                out["mine"] = rows_for(get_watchlist(uid))
+                mine = rows_for(get_watchlist(uid))
+                try:
+                    eb = earnings_badges([r["ticker"] for r in mine])
+                    for r in mine:
+                        r["earn"] = eb.get(r["ticker"])
+                except Exception:
+                    pass
+                out["mine"] = mine
             self._json(out)
+        elif self.path.startswith("/api/earnings"):
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            try:
+                offset = int((q.get("week") or ["0"])[0])
+            except Exception:
+                offset = 0
+            offset = max(-2, min(offset, 6))
+            try:
+                rows, bounds = earnings_week_rows(offset)
+            except Exception as e:
+                print(f"[EARN] week build failed: {str(e)[:140]}", flush=True)
+                rows, bounds = [], ("", "")
+            uid = self._uid()
+            if uid:
+                notes = get_earn_notes(uid)
+                for r in rows:
+                    n = notes.get((r["symbol"], r["period"]))
+                    if n:
+                        r["grade"] = n["grade"]; r["beat"] = n["beat"]
+                        r["watch"] = n["watch"]; r["gold"] = n["gold"]
+            self._json({"have_earnings": HAVE_EARNINGS, "week_start": bounds[0],
+                        "week_end": bounds[1], "offset": offset,
+                        "rows": rows, "logged_in": bool(uid)})
         elif self.path.startswith("/healthz"):
             self._send(200, b"ok", "text/plain")
         else:
@@ -2952,6 +3365,24 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         body = self._body()
+        if self.path.startswith("/api/earnings/note"):
+            uid = self._uid()
+            if not uid:
+                return self._json({"error": "Please log in first."})
+            sym = clean_symbol(body.get("symbol"))
+            period = (body.get("period") or "").strip()[:16]
+            if not sym or not period:
+                return self._json({"error": "Missing symbol or period."})
+            grade = (body.get("grade") or "").strip()[:12]
+            watch = (body.get("watch") or "").strip()[:2000]
+            gold = bool(body.get("gold"))
+            beat = body.get("beat")
+            try:
+                beat = None if beat in (None, "") else float(beat)
+            except Exception:
+                beat = None
+            save_earn_note(uid, sym, period, grade, beat, watch, gold)
+            return self._json({"ok": True})
         if self.path.startswith("/api/signup") or self.path.startswith("/api/login"):
             email = (body.get("email") or "").strip().lower()
             pw = body.get("password") or ""
@@ -3054,7 +3485,8 @@ def main():
         print("WARNING: ALPACA_KEY / ALPACA_SECRET not set.")
     print(f"Storage: {'Postgres' if DATABASE_URL else 'local SQLite ('+DB_PATH+')'}")
     print(f"Data: Alpaca feed={ALPACA_FEED} | Email: {'ON' if EMAIL_ON else 'OFF'} | "
-          f"Push: {'ON' if PUSH_ON else 'OFF'} | Pushover: {'ON' if PUSHOVER_ON else 'OFF'}")
+          f"Push: {'ON' if PUSH_ON else 'OFF'} | Pushover: {'ON' if PUSHOVER_ON else 'OFF'} | "
+          f"Earnings(Finnhub): {'ON' if HAVE_EARNINGS else 'OFF'}")
     print(f"Icon: {'icon.png found' if os.path.exists(ICON_PATH) else 'using fallback (add icon.png)'}")
     threading.Thread(target=refresher, daemon=True).start()
     srv = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
