@@ -12,6 +12,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import smtplib
 import ssl
 import threading
@@ -654,36 +655,66 @@ def _chunks(lst, n):
         yield lst[i:i + n]
 
 
+# Symbols Alpaca has rejected as invalid (e.g. an index ticker like NAS100).
+# Remembered so one bad ticker can't blank the whole batch, and so we stop
+# re-requesting it every cycle. Cleared on restart.
+_bad_symbols = set()
+_bad_lock = threading.Lock()
+_INVALID_RE = re.compile(r"invalid symbol[^A-Za-z0-9]*([A-Za-z0-9.\-]+)", re.I)
+
+
 def fetch_snapshots(syms):
-    """Alpaca multi-symbol snapshots -> {symbol: snapshot dict}."""
+    """Alpaca multi-symbol snapshots -> {symbol: snapshot dict}.
+
+    Resilient to bad tickers: Alpaca rejects an ENTIRE batch with HTTP 400 if
+    even one symbol is invalid, so we parse out the offending symbol, drop it,
+    and retry the rest — instead of letting one bad ticker blank everything.
+    """
     out = {}
     headers = {"APCA-API-KEY-ID": ALPACA_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET,
                "User-Agent": "stock-watch"}
-    for chunk in _chunks(sorted(syms), 90):
-        url = DATA_URL + "?symbols=" + urllib.parse.quote(",".join(chunk)) + "&feed=" + urllib.parse.quote(ALPACA_FEED)
-        req = urllib.request.Request(url, headers=headers)
-        for attempt in range(3):
+    with _bad_lock:
+        known_bad = set(_bad_symbols)
+    for chunk in _chunks(sorted(set(syms)), 90):
+        work = [s for s in chunk if s.upper() not in known_bad]
+        tries = 0
+        while work and tries < 10:
+            tries += 1
+            url = DATA_URL + "?symbols=" + urllib.parse.quote(",".join(work)) + "&feed=" + urllib.parse.quote(ALPACA_FEED)
+            req = urllib.request.Request(url, headers=headers)
             try:
                 with urllib.request.urlopen(req, timeout=15) as r:
                     data = json.loads(r.read().decode())
                 snaps = data.get("snapshots", data) if isinstance(data, dict) else {}
                 if isinstance(snaps, dict):
                     out.update(snaps)
-                print(f"[ALPACA-DEBUG] OK: requested {len(chunk)} symbols, got {len(snaps) if isinstance(snaps, dict) else 0} snapshots", flush=True)
+                print(f"[ALPACA-DEBUG] OK: requested {len(work)} symbols, got {len(snaps) if isinstance(snaps, dict) else 0} snapshots", flush=True)
                 break
             except urllib.error.HTTPError as e:
                 try:
                     body = e.read().decode()[:300]
                 except Exception:
                     body = "(could not read error body)"
+                if e.code == 400:
+                    m = _INVALID_RE.search(body)
+                    badsym = m.group(1).upper() if m else None
+                    upper = [w.upper() for w in work]
+                    if badsym and badsym in upper:
+                        work = [w for w in work if w.upper() != badsym]
+                        with _bad_lock:
+                            _bad_symbols.add(badsym)
+                        print(f"[ALPACA-DEBUG] invalid symbol {badsym} dropped; retrying {len(work)} others", flush=True)
+                        continue
+                    print(f"[ALPACA-DEBUG] HTTP 400 (could not identify bad symbol) -> {body}", flush=True)
+                    break
+                if e.code == 429 and tries < 6:
+                    time.sleep(1.5 * tries); continue
                 print(f"[ALPACA-DEBUG] HTTP {e.code} from Alpaca -> {body}", flush=True)
-                if e.code == 429 and attempt < 2:
-                    time.sleep(1.5 * (attempt + 1)); continue
                 break
             except Exception as e:
                 print(f"[ALPACA-DEBUG] error contacting Alpaca: {type(e).__name__}: {str(e)[:200]}", flush=True)
-                if attempt < 2:
-                    time.sleep(0.8 * (attempt + 1)); continue
+                if tries < 3:
+                    time.sleep(0.8 * tries); continue
                 break
     if not out:
         print(f"[ALPACA-DEBUG] fetch_snapshots got NOTHING back (HAVE_DATA={HAVE_DATA}, feed={ALPACA_FEED})", flush=True)
