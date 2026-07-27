@@ -1968,29 +1968,57 @@ SIM_JS = r"""/* ============================================================
     document.getElementById("sim-real-takeaway").innerHTML = txt;
   }
 
-  function runReal() {
-    var sel = document.getElementById("sim-real-sym");
-    var sym = sel.value;
+  function cleanSym(s) { return (s || "").trim().toUpperCase().replace(/[^A-Z0-9.-]/g, "").slice(0, 10); }
+
+  function clearReal() {
+    document.getElementById("sim-real-tiles").innerHTML = "";
+    document.getElementById("sim-real-alarms").innerHTML = "";
+    document.getElementById("sim-real-takeaway").innerHTML = "";
+    if (realChart) { realChart.destroy(); realChart = null; }
+  }
+
+  // Load a stock's saved daily history; if we don't have enough yet, auto-pull
+  // ~1 year of real bars from Alpaca once, then hand the points to the callback.
+  function loadRealHistory(sym, alreadyBackfilled, cb) {
     var note = document.getElementById("sim-real-note");
-    var dip = (+document.getElementById("sim-real-dip").value) / 100;
-    var alarmN = +document.getElementById("sim-real-alarm").value;
-    if (!sym) { note.textContent = "Add stocks to your watchlist (and let some daily history build up) to backtest real data."; return; }
-    note.textContent = "Loading " + sym + " history…";
     fetch("/api/hist/daily?symbol=" + encodeURIComponent(sym), { cache: "no-store" })
       .then(function (r) { return r.json(); })
       .then(function (d) {
         var pts = (d.points || []).filter(function (p) { return p.close != null; });
-        if (pts.length < 5) {
-          note.innerHTML = '<b>Not enough saved history for ' + sym + ' yet.</b> Click <b>⬇ Load full history</b> to pull ~1 year of real daily bars from Alpaca, or let it build up one close per day over time.';
-          document.getElementById("sim-real-tiles").innerHTML = "";
-          document.getElementById("sim-real-alarms").innerHTML = "";
-          document.getElementById("sim-real-takeaway").innerHTML = "";
-          if (realChart) { realChart.destroy(); realChart = null; }
+        if (pts.length < 5 && !alreadyBackfilled) {
+          note.textContent = "Fetching " + sym + "’s past year from the market…";
+          fetch("/api/hist/backfill", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ symbol: sym }) })
+            .then(function (r) { return r.json(); })
+            .then(function (bd) {
+              if (bd.error) { note.innerHTML = "<b>" + bd.error + "</b>"; cb(null); return; }
+              loadRealHistory(sym, true, cb);
+            })
+            .catch(function () { note.textContent = "Couldn’t load " + sym + " right now — try again in a moment."; cb(null); });
           return;
         }
-        renderReal(backtestReal(pts, dip, alarmN), sym);
+        cb(pts);
       })
-      .catch(function () { note.textContent = "Could not load history for " + sym + "."; });
+      .catch(function () { note.textContent = "Couldn’t load " + sym + " right now — try again in a moment."; cb(null); });
+  }
+
+  function runReal() {
+    var inp = document.getElementById("sim-real-sym");
+    var sym = cleanSym(inp.value);
+    var note = document.getElementById("sim-real-note");
+    var dip = (+document.getElementById("sim-real-dip").value) / 100;
+    var alarmN = +document.getElementById("sim-real-alarm").value;
+    if (!sym) { note.innerHTML = 'Type a stock symbol above (for example <b>AAPL</b>), then press “See how it did”.'; return; }
+    inp.value = sym;
+    note.textContent = "Loading " + sym + " prices…";
+    loadRealHistory(sym, false, function (pts) {
+      if (!pts) return;
+      if (pts.length < 5) {
+        note.innerHTML = 'We couldn’t find enough price history for <b>' + sym + '</b>. Double-check the symbol — it needs to be a US-listed stock (for example AAPL, MSFT, KO). Some foreign or over-the-counter tickers aren’t available on the free data feed.';
+        clearReal();
+        return;
+      }
+      renderReal(backtestReal(pts, dip, alarmN), sym);
+    });
   }
 
   // Pull real daily bars from Alpaca into saved history, then backtest.
@@ -2014,14 +2042,10 @@ SIM_JS = r"""/* ============================================================
   }
 
   function refreshRealSymbols() {
-    var sel = document.getElementById("sim-real-sym");
-    if (!sel) return;
+    var dl = document.getElementById("sim-real-list");
+    if (!dl) return;
     var syms = (window.LAST && window.LAST.mine ? window.LAST.mine : []).map(function (t) { return t.ticker; });
-    var prev = sel.value;
-    sel.innerHTML = syms.length
-      ? syms.map(function (s) { return '<option value="' + s + '">' + s + '</option>'; }).join("")
-      : '<option value="">(no stocks in watchlist)</option>';
-    if (prev && syms.indexOf(prev) >= 0) sel.value = prev;
+    dl.innerHTML = syms.map(function (s) { return '<option value="' + s + '">'; }).join("");
   }
 
   // ---------------------------------------------------------
@@ -2093,39 +2117,50 @@ SIM_JS = r"""/* ============================================================
       '</div>';
 
     var real =
-      '<div id="sim-real" style="display:none">' +
-      '<div class="sim-card"><div class="sim-h">Backtest on your saved daily history</div>' +
-      '<div class="bar"><label style="font-size:13px">Stock:&nbsp;</label>' +
-      '<select id="sim-real-sym" style="min-width:120px"></select>' +
-      '<label style="font-size:13px;margin-left:10px">Dip trigger:</label>' +
+      '<div id="sim-real">' +
+      '<div class="sim-card">' +
+      '<div class="sim-h">Try a stock</div>' +
+      '<div class="sim-sub">Type any US stock symbol and press the button — we’ll pull its real prices and show how a few simple “when to buy” ideas would have done.</div>' +
+      '<div class="bar" style="align-items:center">' +
+      '<input id="sim-real-sym" list="sim-real-list" placeholder="e.g. AAPL" maxlength="10" style="min-width:150px;text-transform:uppercase">' +
+      '<datalist id="sim-real-list"></datalist>' +
+      '<button class="primary" id="sim-real-run">See how it did →</button>' +
+      '</div>' +
+      '<div class="bar" style="margin-top:2px">' +
+      '<label style="font-size:12px;color:#374151">Buy after it drops&nbsp;' +
       '<select id="sim-real-dip"><option value="5">5%</option><option value="10" selected>10%</option>' +
-      '<option value="15">15%</option><option value="20">20%</option></select>' +
-      '<label style="font-size:13px;margin-left:10px">Buy on alarm #:</label>' +
-      '<select id="sim-real-alarm"><option value="1" selected>1</option><option value="2">2</option>' +
-      '<option value="3">3</option><option value="4">4</option><option value="5">5</option></select>' +
-      '<button id="sim-real-load" title="Pull ~1 year of real daily bars from Alpaca into your saved history">⬇ Load full history</button>' +
-      '<button class="primary" id="sim-real-run">Backtest</button></div>' +
+      '<option value="15">15%</option><option value="20">20%</option></select></label>' +
+      '<label style="font-size:12px;color:#374151;margin-left:8px">Use alarm&nbsp;' +
+      '<select id="sim-real-alarm"><option value="1" selected>#1</option><option value="2">#2</option>' +
+      '<option value="3">#3</option><option value="4">#4</option><option value="5">#5</option></select></label>' +
+      '</div>' +
       '<div class="muted" id="sim-real-note" style="font-size:12px;margin-top:8px"></div></div>' +
-      '<div class="sim-card"><div class="sim-h">Return per strategy</div><div class="sim-tiles" id="sim-real-tiles"></div></div>' +
-      '<div class="sim-card"><div class="sim-sub">Saved daily closes &amp; where each strategy buys · faint dots = every app alarm firing</div>' +
+      '<div class="sim-card"><div class="sim-h">How each way of buying did</div><div class="sim-tiles" id="sim-real-tiles"></div></div>' +
+      '<div class="sim-card"><div class="sim-sub">The stock’s price, and where each idea would have bought · faint dots = every alarm the app fired</div>' +
       '<div class="sim-chartbox"><canvas id="sim-real-chart"></canvas></div></div>' +
-      '<div class="sim-card"><div class="sim-h">App alarm signal · per-alarm returns</div>' +
-      '<div class="sim-sub">Each numbered alarm your rule fired, and what buying it would have returned to the latest close. The highlighted row is the alarm # selected above.</div>' +
+      '<div class="sim-card"><div class="sim-h">Each alarm the app fired</div>' +
+      '<div class="sim-sub">Every numbered alarm on this stock, and what buying it would have returned by today. The highlighted row is the alarm number you picked above.</div>' +
       '<div id="sim-real-alarms"></div></div>' +
-      '<div class="sim-card"><div class="sim-h">The takeaway</div><div class="sim-take" id="sim-real-takeaway"></div></div>' +
+      '<div class="sim-card"><div class="sim-h">In plain English</div><div class="sim-take" id="sim-real-takeaway"></div></div>' +
       '</div>';
+
+    var advanced =
+      '<details id="sim-adv" style="margin-top:6px">' +
+      '<summary style="cursor:pointer;font-weight:600;color:#374151;font-size:13px;padding:6px 0">⚙️ Advanced: experiment with pretend markets</summary>' +
+      '<div class="sim-sub" style="margin-top:6px">This part isn’t a real stock — it invents thousands of random markets to show, on average, how much perfect timing pays versus a simple rule. Just for tinkering.</div>' +
+      mc +
+      '</details>';
 
     var wrap = document.createElement("div");
     wrap.innerHTML =
-      '<h2>🧪 SimuWatch — "buy the lowest"</h2>' +
-      '<div class="rule">Catching a stock’s exact bottom needs hindsight. This asks the real question: how much does perfect timing pay, and how much can a rule you could actually follow capture? Try it on simulated markets, or on the daily history this app has saved.</div>' +
-      '<div class="sim-seg"><button id="sim-tab-mc" class="on">Simulated</button><button id="sim-tab-real">Real history</button></div>' +
-      mc + real;
+      '<h2>🧪 SimuWatch — would buying the dips have paid off?</h2>' +
+      '<div class="rule">Type any stock and see how a few simple “when to buy” ideas would have worked on its real prices over the past year — from perfect hindsight to a rule you could actually follow.</div>' +
+      real + advanced;
     root.appendChild(wrap);
 
     document.getElementById("sim-run").addEventListener("click", runMC);
     document.getElementById("sim-real-run").addEventListener("click", runReal);
-    document.getElementById("sim-real-load").addEventListener("click", runBackfill);
+    document.getElementById("sim-real-sym").addEventListener("keydown", function (e) { if (e.key === "Enter") runReal(); });
     ["sim-runs", "sim-days", "sim-mu", "sim-sigma", "sim-dip", "sim-seed"].forEach(function (id) {
       var inp = document.getElementById(id), lab = document.getElementById(id + "-v");
       var fmt = (id === "sim-runs") ? function (v) { return (+v).toLocaleString(); }
@@ -2133,8 +2168,8 @@ SIM_JS = r"""/* ============================================================
         : function (v) { return v; };
       inp.addEventListener("input", function () { lab.textContent = fmt(inp.value); });
     });
-    document.getElementById("sim-tab-mc").addEventListener("click", function () { showSub("mc"); });
-    document.getElementById("sim-tab-real").addEventListener("click", function () { showSub("real"); });
+    var adv = document.getElementById("sim-adv");
+    if (adv) adv.addEventListener("toggle", function () { if (adv.open && !mcRan) { mcRan = true; runMC(); } });
   }
 
   function showSub(which) {
@@ -2150,12 +2185,19 @@ SIM_JS = r"""/* ============================================================
     }
   }
 
-  var booted = false;
+  var booted = false, mcRan = false;
   window.initSim = function () {
     var root = document.getElementById("sim-root");
     if (!root) return;
-    if (!booted) { buildUI(root); booted = true; runMC(); }
+    if (!booted) { buildUI(root); booted = true; }
     refreshRealSymbols();
+    // Friendly first impression: show an example using the first watchlist stock.
+    var inp = document.getElementById("sim-real-sym");
+    if (inp && !inp.value) {
+      var syms = (window.LAST && window.LAST.mine ? window.LAST.mine : []).map(function (t) { return t.ticker; });
+      if (syms.length) { inp.value = syms[0]; runReal(); }
+      else { document.getElementById("sim-real-note").innerHTML = 'Type a stock symbol above (for example <b>AAPL</b>) and press “See how it did”.'; }
+    }
   };
 
   // expose engines for testing / reuse
