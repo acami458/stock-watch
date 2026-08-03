@@ -104,6 +104,17 @@ EARNINGS_REFRESH_SECONDS = int(os.environ.get("EARNINGS_REFRESH_SECONDS", str(6 
 NOTABLE_MIN_REV = float(os.environ.get("NOTABLE_MIN_REV", "750e6"))  # >= $750M rev est = "notable"
 EARN_MAX_ROWS = 90
 
+# Anthropic API — powers the SimuCal earnings-beat calculator tab. Claude
+# researches any ticker on demand via server-side web_search. Never exposed
+# to the browser.
+#   export ANTHROPIC_API_KEY=sk-ant-...
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+ANTHROPIC_URL     = "https://api.anthropic.com/v1/messages"
+ANTHROPIC_MODEL   = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-5").strip()
+ANTHROPIC_VERSION = "2023-06-01"
+HAVE_SIMUCAL      = bool(ANTHROPIC_API_KEY)
+SIMUCAL_TIMEOUT   = int(os.environ.get("SIMUCAL_TIMEOUT", "90"))  # seconds
+
 _FALLBACK_ICON = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==")
 
@@ -159,6 +170,16 @@ def init_db():
         cur.execute("""CREATE TABLE IF NOT EXISTS daily_history(
             symbol TEXT NOT NULL, day TEXT NOT NULL, close REAL, low REAL,
             high REAL, prev_close REAL, PRIMARY KEY(symbol, day))""")
+        # SimuCal same-day cache — one row per (symbol, day), refreshed
+        # whenever a research call completes. Keeps repeat lookups free.
+        cur.execute("""CREATE TABLE IF NOT EXISTS simucal_cache(
+            symbol TEXT NOT NULL, day TEXT NOT NULL,
+            data_json TEXT NOT NULL, updated_at TEXT,
+            PRIMARY KEY(symbol, day))""")
+        cur.execute("""CREATE TABLE IF NOT EXISTS simucal_usage(
+            day TEXT NOT NULL, user_id INTEGER NOT NULL,
+            symbol TEXT NOT NULL, ts TEXT NOT NULL,
+            PRIMARY KEY(day, user_id, symbol, ts))""")
         # Per-user earnings analysis notes (the judgment columns from the
         # weekly spreadsheet): Grade, Beat %, What-to-Watch, and a gold flag.
         cur.execute("""CREATE TABLE IF NOT EXISTS earnings_notes(
@@ -1424,6 +1445,235 @@ def save_earn_note(uid, symbol, period, grade, beat, watch, gold):
         conn.close()
 
 
+# ============================ SIMUCAL ==============================
+# v5.0 anchored-rubric earnings-beat probability calculator. Finnhub
+# pre-fills the objective columns (date, consensus, beat history) so
+# Claude focuses its web_search budget on the judgment factors.
+
+SIMUCAL_RUBRIC_SPEC = """
+The v5.0 anchored rubric scores 6 categories from 0-10:
+1. Recent beat streak (last 4 quarters of EPS beats/misses)
+2. Estimate revisions (90d) (are analysts raising or cutting into the print?)
+3. Demand backdrop (top-line demand trends, comps, category dynamics)
+4. Margin/cost setup (input costs, mix, opex, one-timers)
+5. Guide cushion (is management guide below/above/at Street?)
+6. Sector-specific factor (FX, tariffs, spring season, capex cycle, or
+   whatever is the swing variable for THIS name)
+
+Translate to a beat probability (0-100):
+- Sum the 6 scores (max 60). 30 = ~50%, every +2 pts = ~+5%.
+- Cap at 90%, floor at 10%.
+- Verdict labels: 65+ = "Beat likely", 55-64 = "Slight beat lean",
+  45-54 = "Toss-up", 35-44 = "Slight miss lean", <35 = "Miss tilt".
+"""
+
+
+def _extract_json(text):
+    """Pull the first {...} JSON object out of a text blob."""
+    if not text:
+        raise ValueError("empty response")
+    text = re.sub(r"```json\s*|\s*```", "", text)
+    m = re.search(r"\{[\s\S]*\}", text)
+    if not m:
+        raise ValueError("no JSON object found")
+    return json.loads(m.group(0))
+
+
+def simucal_prefill(sym):
+    """Pull the objective columns from Finnhub so Claude doesn't have to search
+    for what we already know. Returns dict with next-earnings metadata + a
+    normalised period key ({year}Q{quarter}) that matches earnings_notes."""
+    out = {"symbol": sym, "period": "", "date": "", "hour": "", "eps": None,
+           "rev": None, "beat_history": "", "prev_actual": None,
+           "prev_estimate": None}
+    if not HAVE_EARNINGS:
+        return out
+
+    today = datetime.now(ET).date()
+    try:
+        rows = fetch_earnings_calendar(today.isoformat(),
+                                        (today + timedelta(days=120)).isoformat())
+    except Exception:
+        rows = []
+    upcoming = [r for r in rows if (r.get("symbol") or "").upper() == sym]
+    upcoming.sort(key=lambda r: r.get("date") or "")
+    if upcoming:
+        e = upcoming[0]
+        yr, q = e.get("year"), e.get("quarter")
+        out["period"] = f"{yr}Q{q}" if yr and q else (e.get("date") or sym)
+        out["date"] = e.get("date") or ""
+        out["hour"] = e.get("hour") or ""  # 'bmo', 'amc', 'dmh'
+        out["eps"] = e.get("epsEstimate")
+        out["rev"] = e.get("revenueEstimate")
+
+    try:
+        hist = _finnhub_get("/stock/earnings", {"symbol": sym, "limit": 4}) or []
+    except Exception:
+        hist = []
+    beats = 0
+    total = 0
+    for h in hist[:4]:
+        act, est = h.get("actual"), h.get("estimate")
+        if act is None or est is None:
+            continue
+        total += 1
+        if act > est:
+            beats += 1
+    out["beat_history"] = f"{beats} / {total}" if total else ""
+    if hist:
+        out["prev_actual"] = hist[0].get("actual")
+        out["prev_estimate"] = hist[0].get("estimate")
+    return out
+
+
+def simucal_research(symbol):
+    """Call the Anthropic API with web_search enabled and parse the rubric JSON."""
+    if not HAVE_SIMUCAL:
+        raise RuntimeError("ANTHROPIC_API_KEY not set on the server.")
+    sym = (symbol or "").strip().upper()
+    if not sym or not re.match(r"^[A-Z][A-Z0-9\.\-]{0,9}$", sym):
+        raise ValueError("Invalid ticker.")
+
+    pre = simucal_prefill(sym)
+    hour_label = {"bmo": "pre-market", "amc": "after-close",
+                  "dmh": "during-hours"}.get((pre.get("hour") or "").lower(), "")
+
+    context_block = ""
+    if pre.get("date"):
+        context_block = (
+            "\nObjective metrics already retrieved from Finnhub — use these "
+            "verbatim in the JSON, do NOT re-search for them:\n"
+            + f"- Next report date: {pre['date']}"
+            + (f" ({hour_label})" if hour_label else "") + "\n"
+            + (f"- Consensus EPS: ${pre['eps']}\n" if pre.get('eps') is not None else "")
+            + (f"- Consensus revenue: ${pre['rev']:,.0f}\n" if pre.get('rev') else "")
+            + (f"- Beat rate (last 4Q): {pre['beat_history']}\n" if pre.get('beat_history') else "")
+            + (f"- Most recent quarter: actual ${pre['prev_actual']} vs est ${pre['prev_estimate']}\n"
+               if pre.get('prev_actual') is not None else "")
+            + "\nFocus your web search on: 90-day estimate revisions, "
+            "demand backdrop, margin/cost setup, guide cushion, and the "
+            "sector-specific swing factor for THIS name.\n"
+        )
+
+    prompt = (
+        "You are the v5.0 Earnings-Beat Probability Calculator. Research ticker "
+        + sym + " for its NEXT upcoming earnings report and return ONLY a JSON "
+        "object with no preamble, no markdown fences.\n"
+        + context_block +
+        SIMUCAL_RUBRIC_SPEC +
+        "\n\nReturn this exact JSON structure:\n\n"
+        "{\n"
+        '  "name": "Company Name",\n'
+        '  "date": "Month DD, YYYY (pre-market or after-close)",\n'
+        '  "eps": "$X.XX",\n'
+        '  "rev": "$XX.XB",\n'
+        '  "beat": "X / 4",\n'
+        '  "prob": <integer 10-90>,\n'
+        '  "verdict": "Beat likely" | "Slight beat lean" | "Toss-up" | "Slight miss lean" | "Miss tilt",\n'
+        '  "rubric": [\n'
+        '    ["Recent beat streak", <0-10>, "one-line evidence"],\n'
+        '    ["Estimate revisions (90d)", <0-10>, "one-line evidence"],\n'
+        '    ["Demand backdrop", <0-10>, "one-line evidence"],\n'
+        '    ["Margin/cost setup", <0-10>, "one-line evidence"],\n'
+        '    ["Guide cushion", <0-10>, "one-line evidence"],\n'
+        '    ["<sector-specific factor>", <0-10>, "one-line evidence"]\n'
+        '  ],\n'
+        '  "foot": "Sources: <2-3 real sources you found>."\n'
+        "}\n\n"
+        "Ticker: " + sym
+    )
+
+    payload = {
+        "model": ANTHROPIC_MODEL,
+        "max_tokens": 2000,
+        "messages": [{"role": "user", "content": prompt}],
+        "tools": [{"type": "web_search_20250305", "name": "web_search"}],
+    }
+    req = urllib.request.Request(
+        ANTHROPIC_URL,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "x-api-key": ANTHROPIC_API_KEY,
+            "anthropic-version": ANTHROPIC_VERSION,
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=SIMUCAL_TIMEOUT) as resp:
+            raw = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", "ignore")[:200]
+        raise RuntimeError(f"Anthropic API {e.code}: {body}")
+
+    text = "\n".join(
+        b.get("text", "") for b in (raw.get("content") or [])
+        if isinstance(b, dict) and b.get("type") == "text"
+    )
+    data = _extract_json(text)
+
+    for k in ("name", "date", "eps", "rev", "beat", "prob", "verdict", "rubric", "foot"):
+        if k not in data:
+            raise ValueError(f"missing field: {k}")
+    try:
+        data["prob"] = max(10, min(90, int(round(float(data["prob"])))))
+    except Exception:
+        raise ValueError("bad prob value")
+    if not isinstance(data["rubric"], list) or len(data["rubric"]) != 6:
+        raise ValueError("rubric must be 6 rows")
+
+    data["symbol"] = sym
+    data["period"] = pre.get("period") or ""
+    return data
+
+
+def simucal_cache_get(sym, day):
+    conn, kind = _db()
+    try:
+        cur = conn.cursor()
+        cur.execute(_ph("SELECT data_json FROM simucal_cache WHERE symbol=%s AND day=%s", kind),
+                    (sym, day))
+        row = cur.fetchone()
+        return json.loads(row[0]) if row else None
+    finally:
+        conn.close()
+
+
+def simucal_cache_put(sym, day, data):
+    conn, kind = _db()
+    try:
+        cur = conn.cursor()
+        now = datetime.now(timezone.utc).isoformat()
+        payload = json.dumps(data)
+        if kind == "pg":
+            cur.execute("""INSERT INTO simucal_cache(symbol, day, data_json, updated_at)
+                           VALUES(%s,%s,%s,%s)
+                           ON CONFLICT (symbol, day) DO UPDATE SET
+                             data_json=EXCLUDED.data_json, updated_at=EXCLUDED.updated_at""",
+                        (sym, day, payload, now))
+        else:
+            cur.execute("""INSERT OR REPLACE INTO simucal_cache(symbol, day, data_json, updated_at)
+                           VALUES(?,?,?,?)""", (sym, day, payload, now))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def simucal_usage_log(uid, sym):
+    conn, kind = _db()
+    try:
+        cur = conn.cursor()
+        now = datetime.now(ET)
+        cur.execute(_ph("""INSERT INTO simucal_usage(day, user_id, symbol, ts)
+                           VALUES(%s,%s,%s,%s)""", kind),
+                    (now.date().isoformat(), uid, sym, now.strftime("%H:%M:%S")))
+        conn.commit()
+    except Exception:
+        pass
+    finally:
+        conn.close()
+
+
 def refresher():
     """Background loop.
 
@@ -1516,6 +1766,206 @@ self.addEventListener('notificationclick', function(e){
     if(clients.openWindow) return clients.openWindow(e.notification.data||'/');
   }));
 });"""
+
+
+SIMUCAL_JS = r"""/* ============================================================
+   SimuCal — v5.0 Earnings-Beat Probability Calculator
+   Renders inside #view-simucal. Talks to POST /api/simucal/research,
+   which proxies to Claude with server-side web_search.
+   ============================================================ */
+(function(){
+  function $(id){ return document.getElementById(id); }
+  function esc(s){ return String(s==null?'':s).replace(/[&<>"']/g,function(c){
+    return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];
+  }); }
+
+  function probClass(p){ return p>=65?'sc-green':p>=45?'sc-amber':'sc-red'; }
+  function verdictClass(p){ return p>=65?'sc-vbeat':p>=45?'sc-vtoss':'sc-vmiss'; }
+
+  // Map v5.0 probability -> letter grade for earnings_notes.
+  // Adjust to your grading convention if you use a different scale.
+  function probToGrade(p){
+    if (p >= 70) return 'A';
+    if (p >= 55) return 'B';
+    if (p >= 40) return 'C';
+    return 'D';
+  }
+
+  // The current rendered payload, kept in closure so the Save button can read it.
+  var _current = null;
+
+  function render(d){
+    _current = d;
+    var dateShort = String(d.date||'').split(' (')[0];
+    var rubricRows = (d.rubric||[]).map(function(r){
+      return '<div class="sc-rline">'
+        + '<span class="sc-rname">'+esc(r[0])+'</span>'
+        + '<span class="sc-rscore">'+esc(r[1])+'/10</span>'
+        + '<span class="sc-rnote">'+esc(r[2])+'</span>'
+        + '</div>';
+    }).join('');
+
+    $('sc-result').innerHTML =
+      '<div class="sc-card">'
+      +   '<div class="sc-prob-row">'
+      +     '<div>'
+      +       '<div class="sc-plabel">'+esc(d.name)+' \u00b7 Probability of beating consensus EPS</div>'
+      +       '<div class="sc-pvalue '+probClass(d.prob)+'">'+esc(d.prob)+'%</div>'
+      +     '</div>'
+      +     '<span class="sc-verdict '+verdictClass(d.prob)+'">'+esc(d.verdict)+'</span>'
+      +   '</div>'
+      +   '<div class="sc-bar"><div class="sc-bfill '+probClass(d.prob)+'" style="width:'+esc(d.prob)+'%"></div></div>'
+      +   '<div class="sc-metrics">'
+      +     '<div class="sc-m"><div class="sc-mlbl">Consensus EPS</div><div class="sc-mval">'+esc(d.eps)+'</div></div>'
+      +     '<div class="sc-m"><div class="sc-mlbl">Consensus revenue</div><div class="sc-mval">'+esc(d.rev)+'</div></div>'
+      +     '<div class="sc-m"><div class="sc-mlbl">Report date</div><div class="sc-mval">'+esc(dateShort)+'</div></div>'
+      +     '<div class="sc-m"><div class="sc-mlbl">Beat rate (4Q)</div><div class="sc-mval">'+esc(d.beat)+'</div></div>'
+      +   '</div>'
+      +   '<h3 class="sc-rhead">v5.0 anchored rubric</h3>'
+      +   '<div class="sc-rubric">'+rubricRows+'</div>'
+      +   '<div class="sc-foot">'+esc(d.foot)+(d._cached?' \u00b7 <span class="sc-cached">cached \u00b7 <a href="#" onclick="simucalRefresh();return false">refresh</a></span>':'')+'</div>'
+      +   (d.period ? '<div class="sc-save-row"><button class="sc-save" onclick="simucalSave()">\ud83d\udcbe Save to Earnings notes</button><span id="sc-save-msg"></span></div>' : '<div class="sc-save-row"><span class="muted" style="font-size:12px">No period matched from Finnhub \u2014 can\'t save to notes.</span></div>')
+      + '</div>';
+  }
+
+  window.simucalRun = async function(){
+    var t = ($('sc-ticker').value||'').trim().toUpperCase();
+    if(!t){ return; }
+    $('sc-ticker').value = t;
+    $('sc-status').innerHTML = '<div class="sc-load"><span class="sc-spin"></span>Researching '+esc(t)+' \u2014 this takes 30\u201360 seconds\u2026</div>';
+    $('sc-result').innerHTML = '';
+    try {
+      var r = await fetch('/api/simucal/research', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({symbol: t})
+      });
+      var d = await r.json();
+      $('sc-status').innerHTML = '';
+      if (d.error) {
+        $('sc-status').innerHTML = '<div class="warn">'+esc(d.error)+'</div>';
+        return;
+      }
+      render(d);
+    } catch(e) {
+      $('sc-status').innerHTML = '<div class="warn">Network error \u2014 try again.</div>';
+    }
+  };
+
+  window.simucalSave = async function(){
+    if (!_current || !_current.period) return;
+    var d = _current;
+    var watch = '';
+    if (d.rubric && d.rubric[5]) {
+      watch = d.rubric[5][0] + ': ' + d.rubric[5][2];
+    }
+    watch = 'SimuCal v5.0 \u00b7 ' + d.verdict + ' (' + d.prob + '%). ' + watch;
+    var body = {
+      symbol: d.symbol || ($('sc-ticker').value||'').trim().toUpperCase(),
+      period: d.period,
+      grade:  probToGrade(d.prob),
+      beat:   d.prob,
+      watch:  watch,
+      gold:   d.prob >= 70
+    };
+    var msg = $('sc-save-msg');
+    msg.textContent = 'Saving\u2026';
+    try {
+      var r = await fetch('/api/earnings/note', {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify(body)
+      });
+      var res = await r.json();
+      if (res.ok) {
+        msg.innerHTML = '<span style="color:#166534">\u2713 Saved to Earnings tab \u00b7 '+esc(body.period)+'</span>';
+      } else {
+        msg.innerHTML = '<span style="color:#991b1b">'+esc(res.error||'Save failed')+'</span>';
+      }
+    } catch(e) {
+      msg.innerHTML = '<span style="color:#991b1b">Network error.</span>';
+    }
+  };
+
+  window.simucalRefresh = async function(){
+    var t = ($('sc-ticker').value||'').trim().toUpperCase();
+    if (!t) return;
+    $('sc-status').innerHTML = '<div class="sc-load"><span class="sc-spin"></span>Re-researching '+esc(t)+' (bypassing cache)\u2026</div>';
+    $('sc-result').innerHTML = '';
+    try {
+      var r = await fetch('/api/simucal/research', {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({symbol: t, force: true})
+      });
+      var d = await r.json();
+      $('sc-status').innerHTML = '';
+      if (d.error) { $('sc-status').innerHTML = '<div class="warn">'+esc(d.error)+'</div>'; return; }
+      render(d);
+    } catch(e) {
+      $('sc-status').innerHTML = '<div class="warn">Network error \u2014 try again.</div>';
+    }
+  };
+
+  window.initSimuCal = function(){
+    var status = $('sc-status');
+    if (window.ME && !ME.logged_in) {
+      status.innerHTML = '<div class="warn">Sign in above to use SimuCal \u2014 research calls hit Claude and cost API credits, so this tab is gated to your account.</div>';
+      return;
+    }
+    var el = $('sc-ticker');
+    if (el) el.focus();
+    if (status) status.innerHTML = '';
+  };
+
+  // Inject SimuCal styles once.
+  if (!document.getElementById('sc-css')) {
+    var s = document.createElement('style');
+    s.id = 'sc-css';
+    s.textContent =
+      '#view-simucal input#sc-ticker{font-weight:600;font-size:15px;letter-spacing:0.02em}'
+      + '.sc-card{background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:20px;margin-top:4px}'
+      + '.sc-prob-row{display:flex;align-items:baseline;justify-content:space-between;gap:16px;flex-wrap:wrap;margin-bottom:12px}'
+      + '.sc-plabel{font-size:12px;color:#6b7280;margin-bottom:4px}'
+      + '.sc-pvalue{font-size:44px;font-weight:600;line-height:1;letter-spacing:-0.02em}'
+      + '.sc-pvalue.sc-green{color:#0ca30c}.sc-pvalue.sc-amber{color:#c2830a}.sc-pvalue.sc-red{color:#d03b3b}'
+      + '.sc-verdict{display:inline-block;padding:5px 12px;border-radius:999px;font-size:12px;font-weight:600}'
+      + '.sc-verdict.sc-vbeat{background:#dcfce7;color:#166534}'
+      + '.sc-verdict.sc-vtoss{background:#f3f4f6;color:#374151}'
+      + '.sc-verdict.sc-vmiss{background:#fee2e2;color:#991b1b}'
+      + '.sc-bar{height:5px;background:#f3f4f6;border-radius:3px;overflow:hidden;margin:8px 0 20px}'
+      + '.sc-bfill{height:100%;transition:width 0.4s ease}'
+      + '.sc-bfill.sc-green{background:#0ca30c}.sc-bfill.sc-amber{background:#c2830a}.sc-bfill.sc-red{background:#d03b3b}'
+      + '.sc-metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;margin-bottom:18px}'
+      + '.sc-m{background:#f9fafb;border-radius:8px;padding:12px 14px}'
+      + '.sc-mlbl{font-size:11px;color:#6b7280;margin-bottom:3px;text-transform:uppercase;letter-spacing:0.03em}'
+      + '.sc-mval{font-size:17px;font-weight:600;color:#111827}'
+      + '.sc-rhead{font-size:14px;font-weight:700;margin:16px 0 8px;color:#374151}'
+      + '.sc-rubric{border-top:1px solid #e5e7eb}'
+      + '.sc-rline{display:grid;grid-template-columns:1.4fr 60px 2fr;gap:14px;padding:10px 0;border-bottom:1px solid #f3f4f6;font-size:13px;align-items:center}'
+      + '.sc-rline:last-child{border-bottom:none}'
+      + '.sc-rname{color:#111827;font-weight:500}'
+      + '.sc-rscore{font-weight:600;color:#111827;text-align:right;font-variant-numeric:tabular-nums}'
+      + '.sc-rnote{color:#6b7280;font-size:12px}'
+      + '.sc-foot{font-size:11px;color:#9ca3af;font-style:italic;margin-top:14px;padding-top:12px;border-top:1px solid #f3f4f6}'
+      + '.sc-cached{color:#6b7280;font-style:normal}.sc-cached a{color:#1d4ed8;text-decoration:none}.sc-cached a:hover{text-decoration:underline}'
+      + '.sc-save-row{margin-top:14px;display:flex;align-items:center;gap:12px;flex-wrap:wrap}'
+      + '.sc-save{background:#1d4ed8;color:#fff;border:none;border-radius:8px;padding:9px 16px;font-size:13px;font-weight:600;cursor:pointer}'
+      + '.sc-save:hover{background:#1e40af}'
+      + '.sc-load{display:flex;align-items:center;gap:10px;color:#6b7280;font-size:14px;padding:12px 0}'
+      + '.sc-spin{width:14px;height:14px;border:2px solid #e5e7eb;border-top-color:#374151;border-radius:50%;animation:sc-spin 0.8s linear infinite;display:inline-block}'
+      + '@keyframes sc-spin{to{transform:rotate(360deg)}}'
+      + '@media (max-width:600px){.sc-pvalue{font-size:34px}.sc-rline{grid-template-columns:1fr 50px}.sc-rnote{grid-column:1/-1}}';
+    document.head.appendChild(s);
+  }
+
+  document.addEventListener('input', function(e){
+    if (e.target && e.target.id === 'sc-ticker') {
+      e.target.value = e.target.value.toUpperCase();
+    }
+  });
+})();
+"""
 
 
 SIM_JS = r"""/* ============================================================
@@ -2294,6 +2744,7 @@ input{font:inherit;font-size:13px;padding:7px 10px;border:1px solid #d1d5db;bord
   <button id="tab-hist" class="tab" onclick="showTab('history')">🕘 History</button>
   <button id="tab-sim" class="tab" onclick="showTab('sim')">🧪 SimuWatch</button>
   <button id="tab-earn" class="tab" onclick="showTab('earn')">📅 Earnings</button>
+  <button id="tab-simucal" class="tab" onclick="showTab('simucal')">🎯 SimuCal</button>
 </div>
 
 <div id="view-watch">
@@ -2343,6 +2794,18 @@ input{font:inherit;font-size:13px;padding:7px 10px;border:1px solid #d1d5db;bord
   <div class="foot">Objective columns auto-fill from Finnhub and refresh on their own. <b>Grade</b>, <b>Beat %</b> and <b>What to Watch</b> are yours — edits save to your account. Tap ☆ to flag a market-mover; ⧉ opens Earnings Whispers for the whisper number.</div>
 </div>
 
+<div id="view-simucal" style="display:none">
+  <h2>🎯 SimuCal <span class="muted" style="font-weight:400;font-size:13px">· v5.0 anchored rubric</span></h2>
+  <div class="bar" style="align-items:center;margin-top:8px">
+    <input id="sc-ticker" placeholder="Enter any ticker (e.g. NVDA)" maxlength="10" style="flex:1;min-width:180px;text-transform:uppercase" onkeydown="if(event.key==='Enter')simucalRun()">
+    <button class="primary" onclick="simucalRun()">Research</button>
+  </div>
+  <div class="muted" style="font-size:12px;margin-top:6px">Claude searches the web for the next earnings date, consensus, revisions, and guide — then scores the 6-factor rubric. Takes 30–60 seconds.</div>
+  <div id="sc-status" style="margin-top:14px"></div>
+  <div id="sc-result" style="margin-top:14px"></div>
+  <div class="foot">Probability is a rubric-derived subjective score, not options-implied. Model returns fresh sources with each query.</div>
+</div>
+
 <div id="overlay" onclick="if(event.target===this)closeDetail()">
   <div id="modal">
     <button class="x" style="font-size:18px" onclick="closeDetail()">✕</button>
@@ -2358,6 +2821,7 @@ input{font:inherit;font-size:13px;padding:7px 10px;border:1px solid #d1d5db;bord
   </div>
 </div>
 <script src="/sim.js"></script>
+<script src="/simucal.js"></script>
 <script>
 let LAST={mine:[]}, ME={logged_in:false}, _chart=null, prevAlarmNum={}, firstLoad=true, _curTab='watch', _histChart=null;
 function pctSpan(v){if(v===null||v===undefined)return '<span class="muted">—</span>';var s=(v>=0?"+":"")+v.toFixed(2)+"%";return '<span class="'+(v>=0?'up':'dn')+'">'+s+'</span>';}
@@ -2534,13 +2998,16 @@ function showTab(t){
  document.getElementById('view-history').style.display=(t==='history')?'block':'none';
  document.getElementById('view-sim').style.display=(t==='sim')?'block':'none';
  document.getElementById('view-earn').style.display=(t==='earn')?'block':'none';
+ document.getElementById('view-simucal').style.display=(t==='simucal')?'block':'none';
  document.getElementById('tab-watch').classList.toggle('active',t==='watch');
  document.getElementById('tab-hist').classList.toggle('active',t==='history');
  document.getElementById('tab-sim').classList.toggle('active',t==='sim');
  document.getElementById('tab-earn').classList.toggle('active',t==='earn');
+ document.getElementById('tab-simucal').classList.toggle('active',t==='simucal');
  if(t==='history')loadHistory();
  if(t==='sim'&&window.initSim)window.initSim();
  if(t==='earn')loadEarnings();
+ if(t==='simucal'&&window.initSimuCal)window.initSimuCal();
 }
 async function loadHistory(){
  const box=document.getElementById('histalerts');
@@ -3371,6 +3838,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, SW_JS.encode("utf-8"), "application/javascript")
         elif self.path.startswith("/sim.js"):
             self._send(200, SIM_JS.encode("utf-8"), "application/javascript")
+        elif self.path.startswith("/simucal.js"):
+            self._send(200, SIMUCAL_JS.encode("utf-8"), "application/javascript")
         elif self.path.startswith("/calc-widget"):
             self._send(200, CALC_PAGE.encode("utf-8"), "text/html; charset=utf-8")
         elif self.path.startswith("/icon.png") or self.path.startswith("/apple-touch-icon"):
@@ -3438,6 +3907,30 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         body = self._body()
+        if self.path.startswith("/api/simucal/research"):
+            uid = self._uid()
+            if not uid:
+                return self._json({"error": "Please log in first."})
+            if not HAVE_SIMUCAL:
+                return self._json({"error": "SimuCal needs ANTHROPIC_API_KEY set on the server."})
+            sym = clean_symbol(body.get("symbol"))
+            if not sym:
+                return self._json({"error": "Enter a ticker to research."})
+            today = datetime.now(ET).date().isoformat()
+            force = bool(body.get("force"))
+            if not force:
+                cached = simucal_cache_get(sym, today)
+                if cached:
+                    cached["_cached"] = True
+                    return self._json(cached)
+            try:
+                data = simucal_research(sym)
+                simucal_cache_put(sym, today, data)
+                simucal_usage_log(uid, sym)
+                data["_cached"] = False
+                return self._json(data)
+            except Exception as e:
+                return self._json({"error": f"Research failed: {str(e)[:180]}"})
         if self.path.startswith("/api/earnings/note"):
             uid = self._uid()
             if not uid:
@@ -3559,7 +4052,8 @@ def main():
     print(f"Storage: {'Postgres' if DATABASE_URL else 'local SQLite ('+DB_PATH+')'}")
     print(f"Data: Alpaca feed={ALPACA_FEED} | Email: {'ON' if EMAIL_ON else 'OFF'} | "
           f"Push: {'ON' if PUSH_ON else 'OFF'} | Pushover: {'ON' if PUSHOVER_ON else 'OFF'} | "
-          f"Earnings(Finnhub): {'ON' if HAVE_EARNINGS else 'OFF'}")
+          f"Earnings(Finnhub): {'ON' if HAVE_EARNINGS else 'OFF'} | "
+          f"SimuCal(Anthropic): {'ON' if HAVE_SIMUCAL else 'OFF'}")
     print(f"Icon: {'icon.png found' if os.path.exists(ICON_PATH) else 'using fallback (add icon.png)'}")
     threading.Thread(target=refresher, daemon=True).start()
     srv = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
