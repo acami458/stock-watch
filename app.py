@@ -1238,7 +1238,7 @@ def _refresh_earnings_raw(force=False):
         return
     today = datetime.now(ET).date()
     dfrom = (today - timedelta(days=4)).strftime("%Y-%m-%d")
-    dto = (today + timedelta(days=45)).strftime("%Y-%m-%d")
+    dto = (today + timedelta(days=14)).strftime("%Y-%m-%d")
     rows = fetch_earnings_calendar(dfrom, dto)
     if rows:
         with _earn_lock:
