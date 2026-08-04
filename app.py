@@ -3259,8 +3259,8 @@ function copyEarningsToExcel(){
  // Beat % is exported as a decimal fraction (0.65) to match the spreadsheet format —
  // paste into a column formatted as "0.00" or Percentage and it will display correctly.
  var headers = ['Company','Ticker','Date','Time','P/E','Est. EPS','Est. Revenue','Grade','Beat %','Consensus','What to Watch'];
- var lines = [headers.join('\t')];
- var clean = function(s){ return String(s==null?'':s).replace(/\t/g,' ').replace(/\r?\n/g,' ').trim(); };
+ var lines = [headers.join('\\t')];
+ var clean = function(s){ return String(s==null?'':s).replace(/\\t/g,' ').replace(/\\r?\\n/g,' ').trim(); };
  rows.forEach(function(tr){
    var tds = tr.querySelectorAll('td');
    // tds indices: 0=star 1=Company 2=Ticker 3=Date 4=Time 5=P/E 6=EPS 7=Rev
@@ -3285,9 +3285,9 @@ function copyEarningsToExcel(){
      clean(tds[10] ? tds[10].textContent : ''),
      clean(watchIn ? watchIn.value       : '')
    ];
-   lines.push(cells.join('\t'));
+   lines.push(cells.join('\\t'));
  });
- var tsv = lines.join('\n');
+ var tsv = lines.join('\\n');
  var done = function(ok){
    if(!btn) return;
    btn.textContent = ok ? ('✓ Copied '+rows.length+' rows') : 'Copy failed — try Chrome';
