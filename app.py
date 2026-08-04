@@ -102,7 +102,7 @@ FINNHUB_URL = "https://finnhub.io/api/v1"
 HAVE_EARNINGS = bool(FINNHUB_KEY)
 EARNINGS_REFRESH_SECONDS = int(os.environ.get("EARNINGS_REFRESH_SECONDS", str(6 * 3600)))
 NOTABLE_MIN_REV = float(os.environ.get("NOTABLE_MIN_REV", "750e6"))  # >= $750M rev est = "notable"
-EARN_MAX_ROWS = 90
+EARN_MAX_ROWS = int(os.environ.get("EARN_MAX_ROWS", "500"))
 
 # Anthropic API — powers the SimuCal earnings-beat calculator tab. Claude
 # researches any ticker on demand via server-side web_search. Never exposed
