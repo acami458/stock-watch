@@ -1201,7 +1201,7 @@ _EARN_NAME_HINT = {
 _HOUR_LABEL = {"bmo": "Before open", "amc": "After close", "dmh": "During market"}
 
 _earn_lock = threading.Lock()
-_earn_state = {"raw": [], "fetched": 0.0}         # broad calendar window cache
+_earn_state = {"raw": [], "fetched": 0.0, "week_supp": {}}  # broad calendar cache + per-week supplement timestamps
 _fund = {}                                        # symbol -> {name, pe, consensus, color, t}
 _fund_lock = threading.Lock()
 _enrich_running = {"on": False}
@@ -1244,6 +1244,40 @@ def _refresh_earnings_raw(force=False):
         with _earn_lock:
             _earn_state["raw"] = rows
             _earn_state["fetched"] = now
+
+
+def _refresh_earnings_week(offset, force=False):
+    """Targeted Finnhub fetch for one specific week — supplements the broad
+    cache. Finnhub's free tier caps total rows and orders results by latest
+    date first, so a wide-range request truncates the earliest days off the
+    response entirely. Fetching each week directly gets complete data."""
+    if not HAVE_EARNINGS:
+        return
+    now = time.monotonic()
+    with _earn_lock:
+        last = _earn_state["week_supp"].get(offset, 0.0)
+    if not force and (now - last) < EARNINGS_REFRESH_SECONDS:
+        return
+    monday, sunday = _week_bounds(offset)
+    supp = fetch_earnings_calendar(monday.strftime("%Y-%m-%d"),
+                                    sunday.strftime("%Y-%m-%d"))
+    if not supp:
+        return
+    added = 0
+    with _earn_lock:
+        raw = list(_earn_state["raw"] or [])
+        seen = set((r.get("symbol"), r.get("date")) for r in raw)
+        for r in supp:
+            key = (r.get("symbol"), r.get("date"))
+            if key and key not in seen:
+                raw.append(r)
+                seen.add(key)
+                added += 1
+        _earn_state["raw"] = raw
+        _earn_state["week_supp"][offset] = now
+    if added:
+        print(f"[EARN] week {offset} supplement added {added} rows "
+              f"({monday.isoformat()} → {sunday.isoformat()})", flush=True)
 
 
 def _week_bounds(offset):
@@ -1467,6 +1501,7 @@ def _start_enrichment(symbols):
 def earnings_week_rows(offset=0):
     """Curated notable earnings for the week (offset weeks from this one)."""
     _refresh_earnings_raw()
+    _refresh_earnings_week(offset)  # ensure this week's data is complete (works around free-tier truncation)
     with _earn_lock:
         raw = list(_earn_state["raw"])
     monday, sunday = _week_bounds(offset)
@@ -4100,6 +4135,7 @@ class Handler(BaseHTTPRequestHandler):
             if (q.get("force") or ["0"])[0] == "1":
                 try:
                     _refresh_earnings_raw(force=True)
+                    _refresh_earnings_week(offset, force=True)
                 except Exception as e:
                     print(f"[EARN] force refresh failed: {str(e)[:140]}", flush=True)
             try:
