@@ -1352,7 +1352,7 @@ def earnings_week_rows(offset=0):
         pass
     for e in raw:
         rev = e.get("revenueEstimate")
-        if rev and rev >= NOTABLE_MIN_REV and e.get("symbol"):
+        if e.get("symbol") and (NOTABLE_MIN_REV <= 0 or (rev and rev >= NOTABLE_MIN_REV)):
             notable.add(e.get("symbol"))
     best = {}
     for e in raw:
