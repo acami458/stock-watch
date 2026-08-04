@@ -1505,7 +1505,11 @@ def earnings_week_rows(offset=0):
     with _earn_lock:
         raw = list(_earn_state["raw"])
     monday, sunday = _week_bounds(offset)
-    ms, ss = monday.strftime("%Y-%m-%d"), sunday.strftime("%Y-%m-%d")
+    # For the current week only, hide days that have already passed — earnings
+    # are graded upcoming, not past. Prev-week views stay complete for review.
+    today = datetime.now(ET).date()
+    effective_start = max(monday, today) if offset == 0 else monday
+    ms, ss = effective_start.strftime("%Y-%m-%d"), sunday.strftime("%Y-%m-%d")
     notable = set(DEFAULT_WATCHLIST)
     try:
         notable |= set(all_user_symbols())
