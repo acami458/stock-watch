@@ -73,6 +73,69 @@ DEFAULT_WATCHLIST = [
     "MAIN", "META", "MSFT", "MU", "NVDA", "PFE", "RIO", "SLV",
     "TSLA", "VZ", "WMT", "ADSK", "AVGO", "SPCX",
 ]
+
+# Curated "big names" for the Earnings tab — approximates S&P 500 plus a
+# handful of major non-S&P names (Chinese ADRs, prominent recent IPOs, etc).
+# Only tickers in this set (plus DEFAULT_WATCHLIST and each user's own
+# watchlist) show up on the Earnings tab. Trim or extend as needed.
+BIG_NAME_TICKERS = frozenset([
+    # Communication Services
+    "CHTR","CMCSA","DASH","DIS","EA","FOX","FOXA","GOOG","GOOGL","IPG","LYV",
+    "META","MTCH","NFLX","NWS","NWSA","OMC","PARA","T","TKO","TMUS","TTWO","VZ","WBD",
+    # Consumer Discretionary
+    "ABNB","AMZN","APTV","AZO","BBWI","BBY","BKNG","BWA","CCL","CMG","DECK","DHI","DPZ",
+    "DRI","EBAY","EXPE","F","GM","GPC","GRMN","HAS","HD","HLT","KMX","LEN","LKQ","LOW",
+    "LULU","LVS","MAR","MCD","MGM","MHK","NCLH","NKE","NVR","ORLY","PHM","POOL","RCL",
+    "RL","ROST","SBUX","TJX","TPR","TSCO","TSLA","ULTA","WHR","WYNN","YUM",
+    # Consumer Staples
+    "ADM","BF.B","BG","CAG","CHD","CL","CLX","COST","CPB","EL","GIS","HRL","HSY","K",
+    "KDP","KHC","KMB","KO","KR","KVUE","LW","MDLZ","MKC","MNST","MO","PEP","PG","PM",
+    "SJM","STZ","SYY","TAP","TSN","WMT",
+    # Energy
+    "BKR","COP","CTRA","CVX","DVN","EOG","EQT","FANG","HAL","HES","KMI","MPC","MRO",
+    "OKE","OXY","PSX","SLB","TRGP","VLO","WMB","XOM",
+    # Financials
+    "ACGL","AFL","AIG","AJG","ALL","AON","AXP","BAC","BEN","BLK","BRK.B","BRO","BX",
+    "C","CB","CBOE","CFG","CINF","CME","COF","DFS","EG","FDS","FI","FIS","FITB","GL",
+    "GPN","GS","HBAN","HIG","ICE","IVZ","JPM","KEY","KKR","MA","MCO","MET","MKTX",
+    "MMC","MS","MSCI","MTB","NDAQ","NTRS","PAYX","PGR","PNC","PRU","PYPL","RF","RJF",
+    "SCHW","SPGI","STT","SYF","TFC","TROW","TRV","USB","V","WFC","WRB","WTW","ZION",
+    # Health Care
+    "A","ABBV","ABT","ALGN","AMGN","BAX","BDX","BIIB","BIO","BMY","BSX","CAH","CI",
+    "CNC","COR","CRL","CTLT","CVS","DGX","DHR","DVA","DXCM","ELV","EW","GEHC","GILD",
+    "HCA","HOLX","HSIC","HUM","IDXX","ILMN","INCY","IQV","ISRG","JNJ","LH","LLY",
+    "MCK","MDT","MOH","MRK","MRNA","MTD","PFE","PODD","REGN","RMD","RVTY","STE","SYK",
+    "TECH","TFX","TMO","UHS","UNH","VRTX","VTRS","WAT","WST","ZBH","ZTS",
+    # Industrials
+    "ALLE","AME","AOS","AXON","BA","BR","CARR","CAT","CHRW","CMI","CPRT","CSX","CTAS",
+    "DAL","DAY","DE","DOV","EFX","EMR","ETN","EXPD","FAST","FDX","GD","GE","GEV",
+    "GNRC","GWW","HII","HON","HUBB","HWM","IEX","IR","ITW","J","JBHT","JBL","JCI",
+    "LDOS","LHX","LMT","LUV","MAS","MMM","NOC","NSC","ODFL","OTIS","PAYC","PCAR",
+    "PH","PNR","PWR","ROK","ROL","ROP","RSG","RTX","SNA","SWK","TDG","TDY","TT",
+    "TXT","UAL","UBER","UNP","UPS","URI","VRSK","WAB","WM","XYL",
+    # Information Technology
+    "AAPL","ACN","ADBE","ADI","ADP","ADSK","AKAM","AMAT","AMD","ANET","ANSS","APH",
+    "AVGO","CDNS","CDW","CRM","CRWD","CSCO","CTSH","DDOG","EPAM","FICO","FSLR","FTNT",
+    "GDDY","GEN","GLW","HPE","HPQ","IBM","INTC","INTU","IT","JBL","JKHY","KEYS","KLAC",
+    "LRCX","MCHP","MPWR","MRVL","MSFT","MSI","MU","NET","NOW","NVDA","NXPI","ON",
+    "ORCL","PANW","PLTR","PTC","QCOM","QRVO","SMCI","SNOW","SNPS","STX","SWKS","TDY",
+    "TEL","TER","TRMB","TXN","VRSN","WDAY","WDC","ZBRA","ZS",
+    # Materials
+    "ALB","AMCR","APD","AVY","BALL","CE","CF","CTVA","DD","DOW","ECL","EMN","FCX",
+    "FMC","IFF","IP","LIN","LYB","MLM","MOS","NEM","NUE","PKG","PPG","SHW","STLD","VMC",
+    # Real Estate
+    "AMT","ARE","AVB","BXP","CBRE","CCI","CPT","CSGP","DLR","DOC","EQIX","EQR","ESS",
+    "EXR","FRT","HST","INVH","IRM","KIM","MAA","O","PLD","PSA","REG","SBAC","SPG",
+    "UDR","VICI","VTR","WELL","WY",
+    # Utilities
+    "AEE","AEP","AES","ATO","AWK","CEG","CMS","CNP","D","DTE","DUK","ED","EIX","ES",
+    "ETR","EVRG","EXC","FE","LNT","NEE","NI","NRG","PCG","PEG","PNW","PPL","SO","SRE",
+    "WEC","XEL",
+    # Extras: prominent non-S&P names Camila tracks (Chinese ADRs, recent IPOs, BDCs)
+    "MAIN","PDD","BABA","JD","BIDU","NIO","LI","SE","SPOT","SHOP","MELI","MSTR","COIN",
+    "RIVN","ROKU","U","IBKR","HOOD","APP","RDDT","NET","FUTU","RIO","IEP","CUBE","GLD",
+    "SLV","COPX","CBRL","ADMA","SPCX",
+])
 HAVE_DATA       = bool(ALPACA_KEY and ALPACA_SECRET)
 
 SMTP_HOST = os.environ.get("SMTP_HOST", "").strip()
@@ -1250,7 +1313,7 @@ def _refresh_earnings_week(offset, force=False):
     """Targeted Finnhub fetch for one specific week — supplements the broad
     cache. Finnhub's free tier caps total rows and orders results by latest
     date first, so a wide-range request truncates the earliest days off the
-    response entirely. Fetching each week directly gets complete data."""
+    response entirely. Fetching each DAY individually gets complete data."""
     if not HAVE_EARNINGS:
         return
     now = time.monotonic()
@@ -1259,24 +1322,31 @@ def _refresh_earnings_week(offset, force=False):
     if not force and (now - last) < EARNINGS_REFRESH_SECONDS:
         return
     monday, sunday = _week_bounds(offset)
-    supp = fetch_earnings_calendar(monday.strftime("%Y-%m-%d"),
-                                    sunday.strftime("%Y-%m-%d"))
-    if not supp:
-        return
-    added = 0
+    total_added = 0
+    day = monday
+    while day <= sunday:
+        d = day.strftime("%Y-%m-%d")
+        try:
+            supp = fetch_earnings_calendar(d, d)
+        except Exception as e:
+            print(f"[EARN] day {d} fetch failed: {str(e)[:120]}", flush=True)
+            supp = []
+        if supp:
+            with _earn_lock:
+                raw = list(_earn_state["raw"] or [])
+                seen = set((r.get("symbol"), r.get("date")) for r in raw)
+                for r in supp:
+                    key = (r.get("symbol"), r.get("date"))
+                    if key and key not in seen:
+                        raw.append(r)
+                        seen.add(key)
+                        total_added += 1
+                _earn_state["raw"] = raw
+        day += timedelta(days=1)
     with _earn_lock:
-        raw = list(_earn_state["raw"] or [])
-        seen = set((r.get("symbol"), r.get("date")) for r in raw)
-        for r in supp:
-            key = (r.get("symbol"), r.get("date"))
-            if key and key not in seen:
-                raw.append(r)
-                seen.add(key)
-                added += 1
-        _earn_state["raw"] = raw
         _earn_state["week_supp"][offset] = now
-    if added:
-        print(f"[EARN] week {offset} supplement added {added} rows "
+    if total_added:
+        print(f"[EARN] week {offset} per-day fetch added {total_added} rows "
               f"({monday.isoformat()} → {sunday.isoformat()})", flush=True)
 
 
@@ -1510,15 +1580,18 @@ def earnings_week_rows(offset=0):
     today = datetime.now(ET).date()
     effective_start = max(monday, today) if offset == 0 else monday
     ms, ss = effective_start.strftime("%Y-%m-%d"), sunday.strftime("%Y-%m-%d")
-    notable = set(DEFAULT_WATCHLIST)
+    notable = set(BIG_NAME_TICKERS)
+    notable |= set(DEFAULT_WATCHLIST)
     try:
         notable |= set(all_user_symbols())
     except Exception:
         pass
-    for e in raw:
-        rev = e.get("revenueEstimate")
-        if e.get("symbol") and (NOTABLE_MIN_REV <= 0 or (rev and rev >= NOTABLE_MIN_REV)):
-            notable.add(e.get("symbol"))
+    # Escape hatch: EARN_SHOW_ALL=1 shows everything Finnhub returned (bypasses
+    # the whitelist). Off by default — the curated list keeps the tab focused.
+    if os.environ.get("EARN_SHOW_ALL", "").lower() in ("1", "true", "yes"):
+        for e in raw:
+            if e.get("symbol"):
+                notable.add(e["symbol"])
     best = {}
     for e in raw:
         d = e.get("date"); sym = e.get("symbol")
@@ -3235,7 +3308,7 @@ function drawDaily(points,sym){
    options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{ticks:{maxTicksLimit:8,font:{size:10}}},y:{ticks:{font:{size:10}}}}}});
 }
 // ---------- Earnings tab ----------
-let _earnOffset=0, _earnReloadT=null;
+let _earnOffset=0, _earnReloadT=null, _earnReloadN=0;
 function earnWeek(o){ if(o===0)_earnOffset=0; else _earnOffset=Math.max(-2,Math.min(6,_earnOffset+o)); loadEarnings(); }
 function ewsLink(sym){return 'https://www.earningswhispers.com/stocks/'+encodeURIComponent(sym);}
 function esc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
@@ -3249,6 +3322,7 @@ function earnCardBadge(t){
 async function loadEarnings(force){
  const wrap=document.getElementById('earn-wrap'),note=document.getElementById('earn-note');
  if(_earnReloadT){clearTimeout(_earnReloadT);_earnReloadT=null;}
+ if(force){_earnReloadN=0;}
  wrap.innerHTML='<div class="empty">'+(force?'Refetching from Finnhub…':'Loading…')+'</div>';
  try{
   var url='/api/earnings?week='+_earnOffset+(force?'&force=1':'');
@@ -3259,7 +3333,24 @@ async function loadEarnings(force){
   if(!rows.length){wrap.innerHTML='<div class="empty">No notable earnings found for this week.</div>';note.textContent='';return;}
   note.textContent=rows.length+' notable companies reporting'+(d.logged_in?'':' — sign in to save your Grade / Beat % / notes.');
   wrap.innerHTML=earnTable(rows,d.logged_in);
-  if(rows.some(function(r){return r.pe==null||!r.consensus;})){ _earnReloadT=setTimeout(function(){ if(_curTab==='earn')loadEarnings(); },9000); }
+  // Only re-poll if enrichment is still filling in AND we haven't tried too many times.
+  // Skip entirely if the user is typing — otherwise we'd nuke their in-progress edit.
+  var stillEnriching = rows.some(function(r){return r.pe==null||!r.consensus;});
+  if(stillEnriching && _earnReloadN < 8){
+    _earnReloadN++;
+    var attemptReload = function(){
+      if(_curTab!=='earn') return;
+      var ae=document.activeElement;
+      if(ae && ae.closest && ae.closest('#view-earn') && (ae.matches('input')||ae.matches('textarea'))){
+        // User is editing — postpone without counting against the cap
+        _earnReloadN--;
+        _earnReloadT=setTimeout(attemptReload, 15000);
+        return;
+      }
+      loadEarnings();
+    };
+    _earnReloadT=setTimeout(attemptReload, 25000);
+  }
  }catch(e){wrap.innerHTML='<div class="empty">Could not load earnings.</div>';note.textContent='';}
 }
 function earnTable(rows,editable){
