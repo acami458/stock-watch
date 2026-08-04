@@ -2933,7 +2933,7 @@ input{font:inherit;font-size:13px;padding:7px 10px;border:1px solid #d1d5db;bord
     <span id="earn-range" style="font-weight:700">…</span>
     <button onclick="earnWeek(1)">Next ▶</button>
     <button onclick="earnWeek(0)">This week</button>
-    <button onclick="loadEarnings()" style="font-weight:600">Refresh</button>
+    <button onclick="loadEarnings(true)" style="font-weight:600">Refresh</button>
     <button id="earn-copy-btn" onclick="copyEarningsToExcel()" title="Copy visible rows as TSV — paste directly into Excel">📋 Copy to Excel</button>
   </div>
   <div id="earn-note" class="muted" style="font-size:12px;margin-bottom:8px"></div>
@@ -3207,12 +3207,13 @@ function earnCardBadge(t){
  var lbl=(d<=0?'today':(d===1?'tomorrow':'in '+d+'d'));
  return '<div class="row"><span class="'+cls+'">📅 Earnings '+lbl+(t.earn.when?(' · '+t.earn.when):'')+'</span></div>';
 }
-async function loadEarnings(){
+async function loadEarnings(force){
  const wrap=document.getElementById('earn-wrap'),note=document.getElementById('earn-note');
  if(_earnReloadT){clearTimeout(_earnReloadT);_earnReloadT=null;}
- wrap.innerHTML='<div class="empty">Loading…</div>';
+ wrap.innerHTML='<div class="empty">'+(force?'Refetching from Finnhub…':'Loading…')+'</div>';
  try{
-  const d=await (await fetch('/api/earnings?week='+_earnOffset,{cache:'no-store'})).json();
+  var url='/api/earnings?week='+_earnOffset+(force?'&force=1':'');
+  const d=await (await fetch(url,{cache:'no-store'})).json();
   document.getElementById('earn-range').textContent=(d.week_start||'')+'  →  '+(d.week_end||'');
   if(!d.have_earnings){wrap.innerHTML='<div class="warn">📅 The Earnings tab needs a free <b>Finnhub</b> key. Add <b>FINNHUB_KEY</b> in your server settings and it turns on automatically — everything else keeps working without it.</div>';note.textContent='';return;}
   const rows=d.rows||[];
@@ -4094,6 +4095,13 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 offset = 0
             offset = max(-2, min(offset, 6))
+            # Force a fresh Finnhub fetch when the user hits Refresh (?force=1).
+            # Cheap re-loads (auto-poll while enrichment fills in) don't set it.
+            if (q.get("force") or ["0"])[0] == "1":
+                try:
+                    _refresh_earnings_raw(force=True)
+                except Exception as e:
+                    print(f"[EARN] force refresh failed: {str(e)[:140]}", flush=True)
             try:
                 rows, bounds = earnings_week_rows(offset)
             except Exception as e:
