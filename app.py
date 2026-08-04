@@ -1283,6 +1283,126 @@ def _consensus_label(r):
     return "Strong Sell", "red"
 
 
+def _beat_history_score(sym):
+    """Cheap Grade + Beat% from Finnhub beat/miss history alone.
+    Matches Camila's conservative grading scale: no A's, B- caps big-cap
+    consistent-beat names, C+ for solid, C for mixed, C-/D for weak."""
+    try:
+        hist = _finnhub_get("/stock/earnings", {"symbol": sym, "limit": 4}) or []
+    except Exception:
+        return None
+    beats = 0
+    total = 0
+    for h in hist[:4]:
+        act, est = h.get("actual"), h.get("estimate")
+        if act is None or est is None:
+            continue
+        total += 1
+        if act > est:
+            beats += 1
+    if total == 0:
+        return None
+    ratio = beats / total
+    if ratio >= 0.95:
+        return {"grade": "B-", "beat": 70}
+    if ratio >= 0.70:
+        return {"grade": "C+", "beat": 65}
+    if ratio >= 0.45:
+        return {"grade": "C",  "beat": 55}
+    if ratio >= 0.20:
+        return {"grade": "C-", "beat": 50}
+    return {"grade": "D",  "beat": 35}
+
+
+def _prob_to_grade(p):
+    """Convert a SimuCal probability (10-90) to Camila's letter-grade scale."""
+    try:
+        p = float(p)
+    except Exception:
+        return "C"
+    if p >= 80: return "A"
+    if p >= 72: return "A-"
+    if p >= 66: return "B+"
+    if p >= 60: return "B"
+    if p >= 54: return "B-"
+    if p >= 48: return "C+"
+    if p >= 42: return "C"
+    if p >= 35: return "C-"
+    return "D"
+
+
+_simucal_running = {"on": False}
+
+
+def _start_simucal_for_watchlist(symbols):
+    """Run full SimuCal (Claude + web_search) on any of these symbols that are
+    in DEFAULT_WATCHLIST or any user's watchlist. Fills sc_grade / sc_beat /
+    sc_watch on _fund[sym] so the Earnings tab shows them."""
+    if not HAVE_SIMUCAL or not HAVE_EARNINGS or not symbols:
+        return
+    watchlist = set(DEFAULT_WATCHLIST)
+    try:
+        watchlist |= set(all_user_symbols())
+    except Exception:
+        pass
+    targets = [s for s in symbols if s in watchlist]
+    if not targets:
+        return
+    with _fund_lock:
+        if _simucal_running["on"]:
+            return
+        _simucal_running["on"] = True
+
+    def run():
+        try:
+            today = datetime.now(ET).date().isoformat()
+            for sym in targets:
+                with _fund_lock:
+                    f = _fund.get(sym) or {}
+                if f.get("sc_t") and (time.monotonic() - f["sc_t"]) < 20 * 3600:
+                    continue
+                data = None
+                try:
+                    data = simucal_cache_get(sym, today)
+                except Exception:
+                    pass
+                if not data:
+                    try:
+                        cap = int(os.environ.get("SIMUCAL_MAX_PER_DAY", "20"))
+                    except Exception:
+                        cap = 20
+                    if simucal_usage_count_today() >= cap:
+                        print(f"[SIMUCAL-AUTO] daily cap of {cap} reached, skipping {sym}", flush=True)
+                        break
+                    try:
+                        data = simucal_research(sym)
+                        simucal_cache_put(sym, today, data)
+                        simucal_usage_log(1, sym)
+                    except Exception as e:
+                        print(f"[SIMUCAL-AUTO] {sym} failed: {str(e)[:120]}", flush=True)
+                        continue
+                prob = int(data.get("prob") or 50)
+                verdict = data.get("verdict") or ""
+                watch = ""
+                if isinstance(data.get("rubric"), list) and len(data["rubric"]) >= 6:
+                    r = data["rubric"][5]
+                    watch = f"{r[0]}: {r[2]}"
+                watch = f"SimuCal v5.0 \u00b7 {verdict} ({prob}%). {watch}".strip()
+                with _fund_lock:
+                    cur = _fund.get(sym) or {}
+                    cur["sc_grade"] = _prob_to_grade(prob)
+                    cur["sc_beat"]  = prob
+                    cur["sc_watch"] = watch
+                    cur["sc_t"]     = time.monotonic()
+                    _fund[sym] = cur
+                time.sleep(1.0)
+        finally:
+            with _fund_lock:
+                _simucal_running["on"] = False
+
+    threading.Thread(target=run, daemon=True).start()
+
+
 def _enrich_symbol(sym):
     name = pe = consensus = color = None
     try:
@@ -1306,12 +1426,18 @@ def _enrich_symbol(sym):
             consensus, color = _consensus_label(rec[0])
     except Exception:
         pass
+    time.sleep(0.4)
+    auto = _beat_history_score(sym)
     with _fund_lock:
         cur = _fund.get(sym) or {}
-        _fund[sym] = {"name": name or cur.get("name"),
-                      "pe": pe if pe is not None else cur.get("pe"),
-                      "consensus": consensus or cur.get("consensus"),
-                      "color": color or cur.get("color"), "t": time.monotonic()}
+        cur["name"]       = name or cur.get("name")
+        cur["pe"]         = pe if pe is not None else cur.get("pe")
+        cur["consensus"]  = consensus or cur.get("consensus")
+        cur["color"]      = color or cur.get("color")
+        cur["auto_grade"] = (auto or {}).get("grade") or cur.get("auto_grade")
+        cur["auto_beat"]  = (auto or {}).get("beat")  or cur.get("auto_beat")
+        cur["t"]          = time.monotonic()
+        _fund[sym] = cur
 
 
 def _start_enrichment(symbols):
@@ -1379,11 +1505,18 @@ def earnings_week_rows(offset=0):
             "pe": f.get("pe"),
             "consensus": f.get("consensus"),
             "consensus_color": f.get("color"),
+            "auto_grade": f.get("auto_grade"),
+            "auto_beat":  f.get("auto_beat"),
+            "sc_grade":   f.get("sc_grade"),
+            "sc_beat":    f.get("sc_beat"),
+            "sc_watch":   f.get("sc_watch"),
             "period": period,
         })
     rows.sort(key=lambda r: (r["date"] or "9999-99-99", -r["_rev"]))
     rows = rows[:EARN_MAX_ROWS]
-    _start_enrichment([r["symbol"] for r in rows])
+    syms_out = [r["symbol"] for r in rows]
+    _start_enrichment(syms_out)
+    _start_simucal_for_watchlist(syms_out)
     return rows, (ms, ss)
 
 
@@ -1635,6 +1768,19 @@ def simucal_cache_get(sym, day):
                     (sym, day))
         row = cur.fetchone()
         return json.loads(row[0]) if row else None
+    finally:
+        conn.close()
+
+
+def simucal_usage_count_today():
+    """How many uncached SimuCal calls have been made today. Cheap guard."""
+    conn, kind = _db()
+    try:
+        cur = conn.cursor()
+        today = datetime.now(ET).date().isoformat()
+        cur.execute(_ph("SELECT COUNT(*) FROM simucal_usage WHERE day=%s", kind), (today,))
+        row = cur.fetchone()
+        return int(row[0]) if row else 0
     finally:
         conn.close()
 
@@ -2788,6 +2934,7 @@ input{font:inherit;font-size:13px;padding:7px 10px;border:1px solid #d1d5db;bord
     <button onclick="earnWeek(1)">Next ▶</button>
     <button onclick="earnWeek(0)">This week</button>
     <button onclick="loadEarnings()" style="font-weight:600">Refresh</button>
+    <button id="earn-copy-btn" onclick="copyEarningsToExcel()" title="Copy visible rows as TSV — paste directly into Excel">📋 Copy to Excel</button>
   </div>
   <div id="earn-note" class="muted" style="font-size:12px;margin-bottom:8px"></div>
   <div id="earn-wrap" style="overflow:auto"><div class="empty">Loading…</div></div>
@@ -3100,6 +3247,69 @@ function earnTable(rows,editable){
  return h+'</tbody></table>';
 }
 function toggleGold(btn){ var on=(btn.textContent==='☆'); btn.textContent=on?'⭐':'☆'; var tr=btn.closest('tr'); if(tr){tr.classList.toggle('gold',on);} saveNote(btn); }
+function copyEarningsToExcel(){
+ var rows = document.querySelectorAll('#earn-wrap table.etbl tbody tr');
+ var btn = document.getElementById('earn-copy-btn');
+ var reset = function(){ if(btn) btn.textContent='📋 Copy to Excel'; };
+ if(!rows.length){
+   if(btn){ btn.textContent='(nothing to copy)'; setTimeout(reset,2000); }
+   return;
+ }
+ // Column order matches Camila's earnings spreadsheet (July_2026_Earnings_Week5.xlsx).
+ // Beat % is exported as a decimal fraction (0.65) to match the spreadsheet format —
+ // paste into a column formatted as "0.00" or Percentage and it will display correctly.
+ var headers = ['Company','Ticker','Date','Time','P/E','Est. EPS','Est. Revenue','Grade','Beat %','Consensus','What to Watch'];
+ var lines = [headers.join('\t')];
+ var clean = function(s){ return String(s==null?'':s).replace(/\t/g,' ').replace(/\r?\n/g,' ').trim(); };
+ rows.forEach(function(tr){
+   var tds = tr.querySelectorAll('td');
+   // tds indices: 0=star 1=Company 2=Ticker 3=Date 4=Time 5=P/E 6=EPS 7=Rev
+   //              8=Grade(input) 9=Beat(input) 10=Consensus 11=Watch(textarea) 12=EWS
+   var gradeIn = tds[8]  ? tds[8].querySelector('input')    : null;
+   var beatIn  = tds[9]  ? tds[9].querySelector('input')    : null;
+   var watchIn = tds[11] ? tds[11].querySelector('textarea'): null;
+   var beatRaw = beatIn ? beatIn.value.trim() : '';
+   var beat    = beatRaw ? (Number(beatRaw)/100).toFixed(2) : '';
+   var isGold  = tr.classList.contains('gold');
+   var company = (isGold ? '⭐ ' : '') + clean(tds[1] ? tds[1].textContent : '');
+   var cells = [
+     company,
+     clean(tds[2]  ? tds[2].textContent  : ''),
+     clean(tds[3]  ? tds[3].textContent  : ''),
+     clean(tds[4]  ? tds[4].textContent  : ''),
+     clean(tds[5]  ? tds[5].textContent  : ''),
+     clean(tds[6]  ? tds[6].textContent  : ''),
+     clean(tds[7]  ? tds[7].textContent  : ''),
+     clean(gradeIn ? gradeIn.value       : ''),
+     beat,
+     clean(tds[10] ? tds[10].textContent : ''),
+     clean(watchIn ? watchIn.value       : '')
+   ];
+   lines.push(cells.join('\t'));
+ });
+ var tsv = lines.join('\n');
+ var done = function(ok){
+   if(!btn) return;
+   btn.textContent = ok ? ('✓ Copied '+rows.length+' rows') : 'Copy failed — try Chrome';
+   setTimeout(reset, 2500);
+ };
+ // Modern browsers first; fall back to a hidden textarea if clipboard API is blocked.
+ if(navigator.clipboard && navigator.clipboard.writeText){
+   navigator.clipboard.writeText(tsv).then(function(){done(true);}).catch(function(){
+     try {
+       var ta=document.createElement('textarea'); ta.value=tsv; ta.style.position='fixed';
+       ta.style.left='-9999px'; document.body.appendChild(ta); ta.select();
+       var ok=document.execCommand('copy'); document.body.removeChild(ta); done(ok);
+     } catch(e){ done(false); }
+   });
+ } else {
+   try {
+     var ta2=document.createElement('textarea'); ta2.value=tsv; ta2.style.position='fixed';
+     ta2.style.left='-9999px'; document.body.appendChild(ta2); ta2.select();
+     var ok2=document.execCommand('copy'); document.body.removeChild(ta2); done(ok2);
+   } catch(e){ done(false); }
+ }
+}
 async function saveNote(el){
  var tr=el.closest&&el.closest('tr'); if(!tr) return;
  var sym=tr.getAttribute('data-sym'), period=tr.getAttribute('data-period');
@@ -3890,13 +4100,26 @@ class Handler(BaseHTTPRequestHandler):
                 print(f"[EARN] week build failed: {str(e)[:140]}", flush=True)
                 rows, bounds = [], ("", "")
             uid = self._uid()
-            if uid:
-                notes = get_earn_notes(uid)
-                for r in rows:
-                    n = notes.get((r["symbol"], r["period"]))
-                    if n:
-                        r["grade"] = n["grade"]; r["beat"] = n["beat"]
-                        r["watch"] = n["watch"]; r["gold"] = n["gold"]
+            notes = get_earn_notes(uid) if uid else {}
+            for r in rows:
+                n = notes.get((r["symbol"], r["period"])) if uid else None
+                if n:
+                    # Tier 1: user's manual grade always wins.
+                    r["grade"] = n["grade"]; r["beat"] = n["beat"]
+                    r["watch"] = n["watch"]; r["gold"] = n["gold"]
+                else:
+                    # Tier 2: SimuCal-derived (Watchlist tickers only).
+                    if r.get("sc_grade"):
+                        r["grade"] = r["sc_grade"]
+                    if r.get("sc_beat"):
+                        r["beat"]  = r["sc_beat"]
+                    if r.get("sc_watch"):
+                        r["watch"] = r["sc_watch"]
+                    # Tier 3: cheap beat-history auto (fills what SimuCal hasn't).
+                    if not r.get("grade") and r.get("auto_grade"):
+                        r["grade"] = r["auto_grade"]
+                    if not r.get("beat")  and r.get("auto_beat"):
+                        r["beat"]  = r["auto_beat"]
             self._json({"have_earnings": HAVE_EARNINGS, "week_start": bounds[0],
                         "week_end": bounds[1], "offset": offset,
                         "rows": rows, "logged_in": bool(uid)})
