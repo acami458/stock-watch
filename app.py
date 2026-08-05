@@ -1390,7 +1390,8 @@ def _consensus_label(r):
 def _beat_history_score(sym):
     """Cheap Grade + Beat% from Finnhub beat/miss history alone.
     Matches Camila's conservative grading scale: no A's, B- caps big-cap
-    consistent-beat names, C+ for solid, C for mixed, C-/D for weak."""
+    consistent-beat names, C+ for solid, C for mixed, C-/D for weak.
+    Also captures the most-recent report (for actuals swap after print)."""
     try:
         hist = _finnhub_get("/stock/earnings", {"symbol": sym, "limit": 4}) or []
     except Exception:
@@ -1404,18 +1405,65 @@ def _beat_history_score(sym):
         total += 1
         if act > est:
             beats += 1
+    # Capture the latest report — used to detect "already reported" rows.
+    # Finnhub populates .actual within hours of a print.
+    latest = None
+    if hist:
+        h0 = hist[0]  # most-recent quarter
+        if h0.get("actual") is not None and h0.get("date"):
+            act = h0["actual"]
+            est = h0.get("estimate")
+            surprise_pct = None
+            if est is not None and est != 0:
+                surprise_pct = ((act - est) / abs(est)) * 100.0
+            latest = {
+                "date": h0["date"],
+                "actual": act,
+                "estimate": est,
+                "surprise_pct": surprise_pct,
+            }
+    out = {"latest_report": latest}
     if total == 0:
-        return None
+        out["grade"] = None
+        out["beat"]  = None
+        return out
     ratio = beats / total
-    if ratio >= 0.95:
-        return {"grade": "B-", "beat": 70}
-    if ratio >= 0.70:
-        return {"grade": "C+", "beat": 65}
-    if ratio >= 0.45:
-        return {"grade": "C",  "beat": 55}
-    if ratio >= 0.20:
-        return {"grade": "C-", "beat": 50}
-    return {"grade": "D",  "beat": 35}
+    if ratio >= 0.95:   out["grade"], out["beat"] = "B-", 70
+    elif ratio >= 0.70: out["grade"], out["beat"] = "C+", 65
+    elif ratio >= 0.45: out["grade"], out["beat"] = "C",  55
+    elif ratio >= 0.20: out["grade"], out["beat"] = "C-", 50
+    else:               out["grade"], out["beat"] = "D",  35
+    return out
+
+
+def _actual_grade(surprise_pct):
+    """Grade a REPORTED print based on EPS surprise vs consensus.
+    Unlike the predicted scale (which caps at B-), actuals can earn A
+    since the outcome is factual, not probabilistic."""
+    if surprise_pct is None:
+        return "B"  # reported but surprise unmeasurable — treat as neutral
+    if surprise_pct >= 10:  return "A"
+    if surprise_pct >= 5:   return "A-"
+    if surprise_pct >= 2:   return "B+"
+    if surprise_pct >= 0:   return "B"
+    if surprise_pct >= -2:  return "C+"
+    if surprise_pct >= -5:  return "C"
+    if surprise_pct >= -10: return "C-"
+    return "D"
+
+
+def _reported_watch(rep):
+    """Short 'REPORTED' narrative for the What to Watch cell."""
+    act = rep.get("actual")
+    est = rep.get("estimate")
+    pct = rep.get("surprise_pct")
+    if act is None:
+        return "REPORTED"
+    if est is not None:
+        verdict = "Beat" if act > est else ("Miss" if act < est else "In line")
+        tail = f" ({pct:+.1f}%)" if pct is not None else ""
+        return f"REPORTED · {verdict} — EPS ${act:.2f} vs ${est:.2f} est{tail}"
+    return f"REPORTED · EPS ${act:.2f}"
 
 
 def _prob_to_grade(p):
@@ -1441,7 +1489,11 @@ _simucal_running = {"on": False}
 def _start_simucal_for_watchlist(symbols):
     """Run full SimuCal (Claude + web_search) on any of these symbols that are
     in DEFAULT_WATCHLIST or any user's watchlist. Fills sc_grade / sc_beat /
-    sc_watch on _fund[sym] so the Earnings tab shows them."""
+    sc_watch on _fund[sym] so the Earnings tab shows them.
+    Set env var SIMUCAL_AUTO=0 to disable this background auto-firing while
+    keeping the manual SimuCal tab fully functional."""
+    if os.environ.get("SIMUCAL_AUTO", "1").lower() in ("0", "false", "no", "off"):
+        return
     if not HAVE_SIMUCAL or not HAVE_EARNINGS or not symbols:
         return
     watchlist = set(DEFAULT_WATCHLIST)
@@ -1538,8 +1590,9 @@ def _enrich_symbol(sym):
         cur["pe"]         = pe if pe is not None else cur.get("pe")
         cur["consensus"]  = consensus or cur.get("consensus")
         cur["color"]      = color or cur.get("color")
-        cur["auto_grade"] = (auto or {}).get("grade") or cur.get("auto_grade")
-        cur["auto_beat"]  = (auto or {}).get("beat")  or cur.get("auto_beat")
+        cur["auto_grade"]    = (auto or {}).get("grade") or cur.get("auto_grade")
+        cur["auto_beat"]     = (auto or {}).get("beat")  or cur.get("auto_beat")
+        cur["latest_report"] = (auto or {}).get("latest_report") or cur.get("latest_report")
         cur["t"]          = time.monotonic()
         _fund[sym] = cur
 
@@ -1622,6 +1675,11 @@ def earnings_week_rows(offset=0):
             "sc_grade":   f.get("sc_grade"),
             "sc_beat":    f.get("sc_beat"),
             "sc_watch":   f.get("sc_watch"),
+            # If Finnhub's most-recent report matches this earnings date and has
+            # .actual populated, the company already reported → actuals swap.
+            "reported":   ((f.get("latest_report") or {}) if
+                           (f.get("latest_report") or {}).get("date") == e.get("date")
+                           else None),
             "period": period,
         })
     rows.sort(key=lambda r: (r["date"] or "9999-99-99", -r["_rev"]))
@@ -2977,6 +3035,11 @@ input{font:inherit;font-size:13px;padding:7px 10px;border:1px solid #d1d5db;bord
 .etbl th,.etbl td{border-bottom:1px solid #eef0f3;padding:6px 8px;text-align:left;vertical-align:top}
 .etbl th{position:sticky;top:0;background:#f6f7f9;font-size:11px;color:#374151;white-space:nowrap}
 .etbl tr.gold{background:#fffbeb}
+.etbl tr.reported{background:#f0f9ff}
+.etbl tr.reported.gold{background:#fef6d9}
+.etbl .rpt{display:inline-block;color:#0891b2;font-weight:800;margin-right:4px;font-size:13px}
+.etbl input.b.beat{color:#166534;font-weight:700;background:#f0fdf4}
+.etbl input.b.miss{color:#991b1b;font-weight:700;background:#fef2f2}
 .etbl td.num{text-align:right;white-space:nowrap}
 .etbl .cons{display:inline-block;font-weight:700;padding:1px 7px;border-radius:999px;font-size:11px}
 .cons.green{background:#dcfce7;color:#166534}.cons.amber{background:#fef3c7;color:#92400e}
@@ -3357,19 +3420,26 @@ function earnTable(rows,editable){
  var dis=editable?'':' disabled';
  var h='<table class="etbl"><thead><tr><th></th><th>Company</th><th>Ticker</th><th>Date</th><th>Time</th><th>P/E</th><th>Est. EPS</th><th>Est. Rev</th><th>Grade</th><th>Beat %</th><th>Consensus</th><th>What to Watch</th><th></th></tr></thead><tbody>';
  h+=rows.map(function(r){
-   var ro=r.gold?' class="gold"':'';
+   var cls=[]; if(r.gold)cls.push('gold'); if(r.is_reported)cls.push('reported');
+   var ro=cls.length?' class="'+cls.join(' ')+'"':'';
    var grade=esc(r.grade||''), watch=esc(r.watch||''), beat=(r.beat!=null?r.beat:'');
+   var rptBadge=r.is_reported?'<span class="rpt" title="Already reported">✓</span> ':'';
+   // For reported rows, beat may be negative (miss). Drop the min=0 constraint
+   // and colorize green (beat) / red (miss).
+   var beatCls='b';
+   if(r.is_reported){ beatCls += (Number(beat)>=0?' beat':' miss'); }
+   var beatAttrs=r.is_reported?'type="number" step="1"':'type="number" step="1" min="0" max="100"';
    return '<tr'+ro+' data-sym="'+r.symbol+'" data-period="'+esc(r.period||'')+'">'
     +'<td><button class="star" title="Flag market-mover" onclick="toggleGold(this)">'+(r.gold?'⭐':'☆')+'</button></td>'
     +'<td>'+esc(r.company||r.symbol)+'</td>'
-    +'<td class="tk">'+r.symbol+'</td>'
+    +'<td class="tk">'+rptBadge+r.symbol+'</td>'
     +'<td class="edate">'+(r.date||'—')+'</td>'
     +'<td class="ewhen">'+(r.when||'—')+'</td>'
     +'<td class="num">'+(r.pe!=null?r.pe:'—')+'</td>'
     +'<td class="num">'+(r.eps_est!=null?('$'+Number(r.eps_est).toFixed(2)):'—')+'</td>'
     +'<td class="num">'+(r.rev_est||'—')+'</td>'
     +'<td><input class="g" value="'+grade+'" placeholder="—" onchange="saveNote(this)"'+dis+'></td>'
-    +'<td><input class="b" type="number" step="1" min="0" max="100" value="'+beat+'" placeholder="—" onchange="saveNote(this)"'+dis+'></td>'
+    +'<td><input class="'+beatCls+'" '+beatAttrs+' value="'+beat+'" placeholder="—" onchange="saveNote(this)"'+dis+'></td>'
     +'<td>'+consCell(r)+'</td>'
     +'<td><textarea class="w" placeholder="your notes…" onchange="saveNote(this)"'+dis+'>'+watch+'</textarea></td>'
     +'<td><a class="ews" href="'+ewsLink(r.symbol)+'" target="_blank" rel="noopener" title="Earnings Whispers (whisper number)">⧉</a></td>'
@@ -4246,15 +4316,30 @@ class Handler(BaseHTTPRequestHandler):
                     # Tier 1: user's manual grade always wins.
                     r["grade"] = n["grade"]; r["beat"] = n["beat"]
                     r["watch"] = n["watch"]; r["gold"] = n["gold"]
+                    r["is_reported"] = False
+                elif r.get("reported"):
+                    # Tier 2 (new): actual result overrides all predictions.
+                    # Grade jumps to actuals scale (A allowed since it's fact,
+                    # not probability). Beat cell shows the surprise % (signed).
+                    rep = r["reported"]
+                    pct = rep.get("surprise_pct")
+                    r["grade"] = _actual_grade(pct)
+                    if pct is not None:
+                        # Round to nearest whole percent so the tab reads cleanly
+                        r["beat"] = int(round(pct))
+                    r["watch"] = _reported_watch(rep)
+                    r["is_reported"] = True
+                    r["actual_eps"] = rep.get("actual")
                 else:
-                    # Tier 2: SimuCal-derived (Watchlist tickers only).
+                    r["is_reported"] = False
+                    # Tier 3: SimuCal-derived (Watchlist tickers only).
                     if r.get("sc_grade"):
                         r["grade"] = r["sc_grade"]
                     if r.get("sc_beat"):
                         r["beat"]  = r["sc_beat"]
                     if r.get("sc_watch"):
                         r["watch"] = r["sc_watch"]
-                    # Tier 3: cheap beat-history auto (fills what SimuCal hasn't).
+                    # Tier 4: cheap beat-history auto (fills what SimuCal hasn't).
                     if not r.get("grade") and r.get("auto_grade"):
                         r["grade"] = r["auto_grade"]
                     if not r.get("beat")  and r.get("auto_beat"):
