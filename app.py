@@ -135,6 +135,11 @@ BIG_NAME_TICKERS = frozenset([
     "MAIN","PDD","BABA","JD","BIDU","NIO","LI","SE","SPOT","SHOP","MELI","MSTR","COIN",
     "RIVN","ROKU","U","IBKR","HOOD","APP","RDDT","NET","FUTU","RIO","IEP","CUBE","GLD",
     "SLV","COPX","CBRL","ADMA","SPCX",
+     # August 2026 additions — confirmed reporters not in the S&P but worth tracking
+    "HIMS","CRWV","LITE","NBIS","BIRK","YETI","ONON","RKLB","ASTS","ACHR",
+    "JBS","ALC","ACM","PLUG","GPRO","IONQ","RGTI","CLSK","DKNG","SOFI",
+    "NTES","BEKE","OTLK","RMIX","PAVM","RLX","INO","STEM","KURA","LENZ",
+    "SES","GEMI","HTFL",
 ])
 HAVE_DATA       = bool(ALPACA_KEY and ALPACA_SECRET)
 
