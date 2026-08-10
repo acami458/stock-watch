@@ -1927,7 +1927,221 @@ def simucal_research(symbol):
 
     data["symbol"] = sym
     data["period"] = pre.get("period") or ""
+    # 8-quarter earnings history (used by SimuCal basket export → Quarterly History sheet)
+    history = []
+    if HAVE_EARNINGS:
+        try:
+            hist_raw = _finnhub_get("/stock/earnings", {"symbol": sym, "limit": 8}) or []
+        except Exception:
+            hist_raw = []
+        for h in hist_raw:
+            act = h.get("actual"); est = h.get("estimate")
+            yr = h.get("year"); q = h.get("quarter")
+            if act is None or est is None or not yr or not q:
+                continue
+            history.append({
+                "quarter": f"Q{q} {yr}",
+                "estimate": est,
+                "actual": act,
+                "result": "Beat" if act > est else ("Miss" if act < est else "In line"),
+            })
+    data["earnings_history"] = history
     return data
+
+
+def _simucal_build_xlsx(basket):
+    """Build a 2-sheet workbook matching Camila's Earnings_Beat_Probability.xlsx
+    template. Sheet 1 = summary table + notes. Sheet 2 = per-ticker quarterly
+    history in horizontal 4-column blocks with a blank spacer between each.
+    Returns raw bytes."""
+    try:
+        import openpyxl
+        from openpyxl.styles import Font, PatternFill, Alignment
+    except ImportError:
+        raise RuntimeError("openpyxl not installed on server. Add 'openpyxl' to requirements.txt and redeploy.")
+
+    HDR_FILL = PatternFill("solid", fgColor="FF1F4E78")
+    HDR_FONT = Font(name="Arial", size=10, bold=True, color="FFFFFFFF")
+    TITLE_FONT = Font(name="Arial", size=13, bold=True, color="FF1F4E78")
+    NOTE_FONT  = Font(name="Arial", size=9, italic=True, color="FF595959")
+    SIG_HIGH_FILL = PatternFill("solid", fgColor="FFDCFCE7")
+    SIG_MOD_FILL  = PatternFill("solid", fgColor="FFFFF3C4")
+    SIG_LOW_FILL  = PatternFill("solid", fgColor="FFFCE7E7")
+    BEAT_FONT     = Font(name="Arial", size=10, color="FF166534", bold=True)
+    MISS_FONT     = Font(name="Arial", size=10, color="FF991B1B", bold=True)
+    SEC_FILL      = PatternFill("solid", fgColor="FFF3F4F6")
+
+    CENTER = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    LEFT   = Alignment(horizontal="left",   vertical="center", wrap_text=True)
+
+    def signal(prob):
+        try:
+            p = float(prob)
+        except Exception:
+            return "Low"
+        if p >= 70: return "High"
+        if p >= 55: return "Moderate"
+        return "Low"
+
+    def beat_decimal(beat_str):
+        m = re.match(r"^\s*(\d+)\s*/\s*(\d+)\s*$", str(beat_str or ""))
+        if not m: return None
+        n, d = int(m.group(1)), int(m.group(2))
+        return (n / d) if d else None
+
+    def eps_num(eps_str):
+        m = re.search(r"-?\d+(\.\d+)?", str(eps_str or ""))
+        return float(m.group(0)) if m else None
+
+    def short_date(d):
+        return str(d or "").split(" (")[0]
+
+    tickers_str = ", ".join((b.get("symbol") or "") for b in basket)
+    today_str = datetime.now(ET).strftime("%b %d, %Y")
+
+    wb = openpyxl.Workbook()
+
+    # ---------- Sheet 1: Beat Probability ----------
+    ws = wb.active
+    ws.title = "Beat Probability"
+    ws["A1"] = f"Earnings Beat Probability — {tickers_str}"
+    ws["A1"].font = TITLE_FONT
+    ws.merge_cells("A1:J1")
+    ws["A2"] = "Estimated likelihood of beating consensus EPS at the next earnings report"
+    ws["A2"].font = NOTE_FONT
+    ws.merge_cells("A2:J2")
+    ws["A3"] = f"Prepared: {today_str}"
+    ws["A3"].font = NOTE_FONT
+    ws.merge_cells("A3:J3")
+
+    headers = ["Ticker","Company","Next Earnings\nDate","Consensus EPS\nEstimate",
+               "Beats (last\n8 qtrs)","Historical\nBeat Rate","Zacks\nEarnings ESP",
+               "Zacks\nRank","Estimated Beat\nProbability","Signal"]
+    for i, h in enumerate(headers, start=1):
+        c = ws.cell(row=5, column=i, value=h)
+        c.font = HDR_FONT; c.fill = HDR_FILL; c.alignment = CENTER
+    ws.row_dimensions[5].height = 30
+
+    widths = {"A":9,"B":22,"C":15,"D":13,"E":11,"F":11,"G":11,"H":11,"I":13,"J":11}
+    for col, w in widths.items():
+        ws.column_dimensions[col].width = w
+
+    row = 6
+    for b in basket:
+        prob = int(b.get("prob") or 0)
+        sig = signal(prob)
+        hist = b.get("earnings_history") or []
+        beats_n = sum(1 for h in hist if h.get("result") == "Beat")
+        beats_txt = f"{beats_n} of {len(hist)}" if hist else str(b.get("beat","")).replace("/", "of")
+        hist_rate = (beats_n / len(hist)) if hist else beat_decimal(b.get("beat"))
+        cells = [
+            b.get("symbol",""),
+            b.get("name",""),
+            short_date(b.get("date","")),
+            eps_num(b.get("eps","")),
+            beats_txt,
+            hist_rate,
+            "",  # Zacks ESP — SimuCal doesn't produce
+            "",  # Zacks Rank — SimuCal doesn't produce
+            prob / 100.0,
+            sig,
+        ]
+        for i, v in enumerate(cells, start=1):
+            c = ws.cell(row=row, column=i, value=v)
+            c.alignment = CENTER if i != 2 else LEFT
+        # Signal cell fill
+        sig_cell = ws.cell(row=row, column=10)
+        sig_cell.fill = {"High": SIG_HIGH_FILL, "Moderate": SIG_MOD_FILL, "Low": SIG_LOW_FILL}[sig]
+        sig_cell.font = Font(name="Arial", size=10, bold=True)
+        # Rate and probability formatted as decimals
+        if hist_rate is not None:
+            ws.cell(row=row, column=6).number_format = "0.00"
+        ws.cell(row=row, column=9).number_format = "0.00"
+        if cells[3] is not None:
+            ws.cell(row=row, column=4).number_format = "0.00"
+        row += 1
+    row += 1
+
+    # Explanatory footer
+    ws.cell(row=row, column=1, value="How the probability is estimated").font = Font(name="Arial", size=10, bold=True)
+    ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=10)
+    row += 1
+    for note in [
+        "• SimuCal v5.0 anchored rubric: 6 factors scored 0-10 each — beat streak, 90d estimate revisions, demand backdrop, margin/cost setup, guide cushion, sector-specific factor.",
+        "• Historical Beat Rate = share of the last N reported quarters that beat consensus EPS.",
+        "• Signal maps directly from probability: ≥70% = High, 55–69% = Moderate, <55% = Low.",
+        "• Zacks Earnings ESP and Zacks Rank columns are blank — SimuCal doesn't compute those proprietary metrics. Fill in manually if you use them.",
+        "• Directional estimates from Claude research + web search — NOT guarantees. Actual results depend on guidance, macro conditions, and one-off items. Not investment advice.",
+    ]:
+        c = ws.cell(row=row, column=1, value=note)
+        c.font = NOTE_FONT
+        c.alignment = LEFT
+        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=10)
+        row += 1
+
+    ws.freeze_panes = "A6"
+
+    # ---------- Sheet 2: Quarterly History ----------
+    ws2 = wb.create_sheet("Quarterly History")
+    ws2["A1"] = "EPS: Actual vs. Estimate — last several quarters"
+    ws2["A1"].font = TITLE_FONT
+    ws2.merge_cells("A1:R1")
+
+    # Horizontal blocks: 4 cols per ticker + 1 spacer between
+    for idx, b in enumerate(basket):
+        block_start = 1 + idx * 5  # col 1, 6, 11, 16, ...
+        # Ticker header on row 3
+        header_txt = f"{b.get('symbol','')} ({b.get('name','')})"
+        hc = ws2.cell(row=3, column=block_start, value=header_txt)
+        hc.font = Font(name="Arial", size=11, bold=True, color="FF1F4E78")
+        hc.fill = SEC_FILL
+        ws2.merge_cells(start_row=3, start_column=block_start, end_row=3, end_column=block_start+3)
+        # Column subheaders on row 4
+        for j, sub in enumerate(["Quarter","Est.","Actual","Result"]):
+            c = ws2.cell(row=4, column=block_start+j, value=sub)
+            c.font = HDR_FONT; c.fill = HDR_FILL; c.alignment = CENTER
+        # Data rows starting row 5
+        hist = b.get("earnings_history") or []
+        beat_ct = 0
+        for i, h in enumerate(hist):
+            r = 5 + i
+            ws2.cell(row=r, column=block_start,   value=h.get("quarter",""))
+            ws2.cell(row=r, column=block_start+1, value=h.get("estimate"))
+            ws2.cell(row=r, column=block_start+2, value=h.get("actual"))
+            res_cell = ws2.cell(row=r, column=block_start+3, value=h.get("result",""))
+            if h.get("result") == "Beat":
+                res_cell.font = BEAT_FONT
+                beat_ct += 1
+            elif h.get("result") == "Miss":
+                res_cell.font = MISS_FONT
+            for j in range(4):
+                cell = ws2.cell(row=r, column=block_start+j)
+                cell.alignment = CENTER
+                if j in (1, 2):
+                    cell.number_format = "0.00"
+        # Summary row
+        summary_row = 5 + len(hist) + 1
+        sc = ws2.cell(row=summary_row, column=block_start, value="Beats:")
+        sc.font = Font(name="Arial", size=10, bold=True)
+        val = ws2.cell(row=summary_row, column=block_start+1,
+                       value=f"{beat_ct} of {len(hist)}" if hist else "no data")
+        val.font = Font(name="Arial", size=10, bold=True)
+        ws2.merge_cells(start_row=summary_row, start_column=block_start+1,
+                        end_row=summary_row, end_column=block_start+3)
+        # Column widths for this block
+        for j, w in enumerate([13, 8, 8, 9]):
+            ws2.column_dimensions[openpyxl.utils.get_column_letter(block_start+j)].width = w
+        if idx < len(basket) - 1:
+            ws2.column_dimensions[openpyxl.utils.get_column_letter(block_start+4)].width = 3
+
+    ws2.freeze_panes = "A5"
+    ws2.row_dimensions[3].height = 22
+
+    # Serialize to bytes
+    import io
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
 
 
 def simucal_cache_get(sym, day):
@@ -2110,6 +2324,164 @@ SIMUCAL_JS = r"""/* ============================================================
   // The current rendered payload, kept in closure so the Save button can read it.
   var _current = null;
 
+  // Session basket — every successful research pushes here; Copy to Excel
+  // dumps the whole basket as TSV in Camila's Earnings_Beat_Probability format.
+  var _basket = [];
+  var BASKET_KEY = 'simucal_basket_v1';
+
+  function saveBasket(){
+    try { localStorage.setItem(BASKET_KEY, JSON.stringify(_basket)); } catch(e){}
+  }
+  function loadBasket(){
+    try {
+      var s = localStorage.getItem(BASKET_KEY);
+      if (s) { var parsed = JSON.parse(s); if (Array.isArray(parsed)) _basket = parsed; }
+    } catch(e){ _basket = []; }
+  }
+
+  function beatToDecimal(beatStr){
+    // "3 / 4" -> 0.75
+    if(!beatStr) return null;
+    var m = String(beatStr).match(/(\d+)\s*\/\s*(\d+)/);
+    if(!m) return null;
+    var n = Number(m[1]), d = Number(m[2]);
+    return d > 0 ? (n/d) : null;
+  }
+
+  function probSignal(p){
+    if (p >= 70) return 'High';
+    if (p >= 55) return 'Moderate';
+    return 'Low';
+  }
+
+  function shortDate(d){
+    // Trim "(pre-market)" tail
+    return String(d||'').split(' (')[0];
+  }
+
+  function todayLabel(){
+    var m = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+    var t = new Date();
+    return m[t.getMonth()]+' '+t.getDate()+', '+t.getFullYear();
+  }
+
+  function renderBasket(){
+    var el = $('sc-basket');
+    if(!el) return;
+    if(!_basket.length){ el.innerHTML=''; return; }
+    var pills = _basket.map(function(b, i){
+      return '<span class="sc-pill">'+esc(b.symbol)
+        + ' <a href="#" class="sc-x" onclick="simucalBasketRemove('+i+');return false" title="Remove">\u00d7</a></span>';
+    }).join('');
+    el.innerHTML =
+      '<div class="sc-basket-card">'
+      +  '<div class="sc-basket-head">'
+      +    '<span class="sc-basket-title">Session basket \u00b7 '+_basket.length+' ticker'+(_basket.length===1?'':'s')+'</span>'
+      +    '<span class="sc-basket-actions">'
+      +      '<button class="sc-basket-btn primary" onclick="simucalCopyBasket()">\ud83d\udccb Copy TSV</button>'
+      +      '<button class="sc-basket-btn primary" onclick="simucalDownloadXlsx()">\ud83d\udcc5 Download .xlsx</button>'
+      +      '<button class="sc-basket-btn" onclick="simucalClearBasket()">Clear</button>'
+      +    '</span>'
+      +  '</div>'
+      +  '<div class="sc-pills">'+pills+'</div>'
+      +  '<div class="sc-basket-hint">Each research adds to the basket. Paste into Excel and it drops into columns like <i>Earnings_Beat_Probability.xlsx</i>.</div>'
+      + '</div>';
+  }
+
+  function basketAdd(d){
+    // Dedupe on symbol — re-researching the same ticker updates the existing row
+    var sym = d.symbol || '';
+    if(!sym) return;
+    for(var i=0; i<_basket.length; i++){
+      if(_basket[i].symbol === sym){ _basket[i] = d; saveBasket(); renderBasket(); return; }
+    }
+    _basket.push(d);
+    saveBasket();
+    renderBasket();
+  }
+
+  window.simucalBasketRemove = function(i){
+    _basket.splice(i, 1);
+    saveBasket();
+    renderBasket();
+  };
+
+  window.simucalClearBasket = function(){
+    if(!_basket.length) return;
+    if(!confirm('Clear all '+_basket.length+' tickers from the basket?')) return;
+    _basket = [];
+    saveBasket();
+    renderBasket();
+  };
+
+  window.simucalCopyBasket = function(){
+    if(!_basket.length) return;
+    var tickers = _basket.map(function(b){ return b.symbol; }).join(', ');
+    var lines = [];
+    // Title / subtitle / prep-date (each on its own row so they land in col A when pasted)
+    lines.push('Earnings Beat Probability \u2014 ' + tickers);
+    lines.push('Estimated likelihood of beating consensus EPS at the next earnings report');
+    lines.push('Prepared: ' + todayLabel());
+    lines.push('');
+    // Column headers
+    lines.push([
+      'Ticker','Company','Next Earnings Date','Consensus EPS Estimate',
+      'Beats (last 4 qtrs)','Historical Beat Rate','Zacks Earnings ESP',
+      'Zacks Rank','Estimated Beat Probability','Signal'
+    ].join('\t'));
+    // Data rows
+    _basket.forEach(function(b){
+      var eps = String(b.eps||'').replace(/[^0-9.\-]/g,'');
+      var beatsTxt = String(b.beat||'').replace('/', 'of');  // "3 / 4" -> "3 of 4"
+      var rate = beatToDecimal(b.beat);
+      var probDec = (Number(b.prob)||0) / 100;
+      lines.push([
+        b.symbol||'', b.name||'', shortDate(b.date), eps,
+        beatsTxt, (rate!=null ? rate.toFixed(2) : ''),
+        '',  // Zacks Earnings ESP — SimuCal doesn't produce this
+        '',  // Zacks Rank — SimuCal doesn't produce this
+        probDec.toFixed(2),
+        probSignal(Number(b.prob)||0)
+      ].map(function(c){ return String(c==null?'':c).replace(/\t/g,' ').replace(/\r?\n/g,' '); }).join('\t'));
+    });
+    // Explanation footer (matches Camila's template phrasing)
+    lines.push('');
+    lines.push('How the probability is estimated');
+    lines.push('\u2022 SimuCal v5.0 anchored rubric: 6 factors scored 0-10 each (beat streak, 90d estimate revisions, demand backdrop, margin/cost setup, guide cushion, sector-specific factor).');
+    lines.push('\u2022 Directional estimates from Claude research + web search \u2014 NOT guarantees. Actual results depend on guidance, macro, and one-off items. Not investment advice.');
+
+    var tsv = lines.join('\n');
+    var done = function(ok){
+      var el = $('sc-basket');
+      if(!el) return;
+      var msg = el.querySelector('.sc-basket-msg');
+      if(!msg){
+        msg = document.createElement('div');
+        msg.className = 'sc-basket-msg';
+        el.querySelector('.sc-basket-card').appendChild(msg);
+      }
+      msg.innerHTML = ok
+        ? '<span style="color:#166534;font-weight:600">\u2713 Copied '+_basket.length+' ticker'+(_basket.length===1?'':'s')+' to clipboard. Paste into Excel.</span>'
+        : '<span style="color:#991b1b">Copy failed \u2014 clipboard access blocked. Try Chrome.</span>';
+      setTimeout(function(){ if(msg && msg.parentNode) msg.parentNode.removeChild(msg); }, 4000);
+    };
+    if(navigator.clipboard && navigator.clipboard.writeText){
+      navigator.clipboard.writeText(tsv).then(function(){done(true);}).catch(function(){
+        try{
+          var ta=document.createElement('textarea'); ta.value=tsv; ta.style.position='fixed';
+          ta.style.left='-9999px'; document.body.appendChild(ta); ta.select();
+          var ok=document.execCommand('copy'); document.body.removeChild(ta); done(ok);
+        } catch(e){ done(false); }
+      });
+    } else {
+      try{
+        var ta2=document.createElement('textarea'); ta2.value=tsv; ta2.style.position='fixed';
+        ta2.style.left='-9999px'; document.body.appendChild(ta2); ta2.select();
+        var ok2=document.execCommand('copy'); document.body.removeChild(ta2); done(ok2);
+      } catch(e){ done(false); }
+    }
+  };
+
   function render(d){
     _current = d;
     var dateShort = String(d.date||'').split(' (')[0];
@@ -2144,6 +2516,60 @@ SIMUCAL_JS = r"""/* ============================================================
       + '</div>';
   }
 
+  window.simucalDownloadXlsx = async function(){
+    if(!_basket.length) return;
+    var el = $('sc-basket');
+    var setMsg = function(html){
+      if(!el) return;
+      var msg = el.querySelector('.sc-basket-msg');
+      if(!msg){
+        msg = document.createElement('div');
+        msg.className = 'sc-basket-msg';
+        var card = el.querySelector('.sc-basket-card');
+        if(card) card.appendChild(msg);
+      }
+      msg.innerHTML = html;
+    };
+    setMsg('<span style="color:#374151">Building workbook…</span>');
+    try {
+      var r = await fetch('/api/simucal/export_xlsx', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({basket: _basket})
+      });
+      if(!r.ok){
+        // Try to parse json error
+        var errTxt = 'Export failed ('+r.status+')';
+        try { var e = await r.json(); if(e && e.error) errTxt = e.error; } catch(_){}
+        setMsg('<span style="color:#991b1b">'+esc(errTxt)+'</span>');
+        return;
+      }
+      var contentType = r.headers.get('Content-Type') || '';
+      if(contentType.indexOf('json') !== -1){
+        // Server returned an error as JSON
+        var j = await r.json();
+        setMsg('<span style="color:#991b1b">'+esc(j.error || 'Export failed')+'</span>');
+        return;
+      }
+      var blob = await r.blob();
+      var url = URL.createObjectURL(blob);
+      var a = document.createElement('a');
+      a.href = url;
+      a.download = 'Earnings_Beat_Probability.xlsx';
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setTimeout(function(){ URL.revokeObjectURL(url); }, 1500);
+      setMsg('<span style="color:#166534;font-weight:600">\u2713 Downloaded '+_basket.length+' ticker'+(_basket.length===1?'':'s')+'.</span>');
+      setTimeout(function(){
+        var msg = el && el.querySelector('.sc-basket-msg');
+        if(msg && msg.parentNode) msg.parentNode.removeChild(msg);
+      }, 4000);
+    } catch(e){
+      setMsg('<span style="color:#991b1b">Network error — try again.</span>');
+    }
+  };
+
   window.simucalRun = async function(){
     var t = ($('sc-ticker').value||'').trim().toUpperCase();
     if(!t){ return; }
@@ -2163,6 +2589,7 @@ SIMUCAL_JS = r"""/* ============================================================
         return;
       }
       render(d);
+      basketAdd(d);
     } catch(e) {
       $('sc-status').innerHTML = '<div class="warn">Network error \u2014 try again.</div>';
     }
@@ -2218,6 +2645,7 @@ SIMUCAL_JS = r"""/* ============================================================
       $('sc-status').innerHTML = '';
       if (d.error) { $('sc-status').innerHTML = '<div class="warn">'+esc(d.error)+'</div>'; return; }
       render(d);
+      basketAdd(d);
     } catch(e) {
       $('sc-status').innerHTML = '<div class="warn">Network error \u2014 try again.</div>';
     }
@@ -2229,6 +2657,9 @@ SIMUCAL_JS = r"""/* ============================================================
       status.innerHTML = '<div class="warn">Sign in above to use SimuCal \u2014 research calls hit Claude and cost API credits, so this tab is gated to your account.</div>';
       return;
     }
+    // Restore basket across page refreshes / browser restarts
+    loadBasket();
+    renderBasket();
     var el = $('sc-ticker');
     if (el) el.focus();
     if (status) status.innerHTML = '';
@@ -2268,6 +2699,20 @@ SIMUCAL_JS = r"""/* ============================================================
       + '.sc-save-row{margin-top:14px;display:flex;align-items:center;gap:12px;flex-wrap:wrap}'
       + '.sc-save{background:#1d4ed8;color:#fff;border:none;border-radius:8px;padding:9px 16px;font-size:13px;font-weight:600;cursor:pointer}'
       + '.sc-save:hover{background:#1e40af}'
+      + '.sc-basket-card{background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:14px 16px}'
+      + '.sc-basket-head{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;margin-bottom:10px}'
+      + '.sc-basket-title{font-size:13px;font-weight:700;color:#374151}'
+      + '.sc-basket-actions{display:flex;gap:8px}'
+      + '.sc-basket-btn{background:#f3f4f6;color:#111827;border:1px solid #d1d5db;border-radius:8px;padding:6px 12px;font-size:12px;font-weight:600;cursor:pointer}'
+      + '.sc-basket-btn.primary{background:#1d4ed8;color:#fff;border-color:#1d4ed8}'
+      + '.sc-basket-btn.primary:hover{background:#1e40af}'
+      + '.sc-basket-btn:hover:not(.primary){background:#e5e7eb}'
+      + '.sc-pills{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px}'
+      + '.sc-pill{display:inline-flex;align-items:center;gap:6px;background:#eef2ff;color:#312e81;font-size:12px;font-weight:700;padding:4px 10px;border-radius:999px;letter-spacing:0.02em}'
+      + '.sc-pill .sc-x{color:#6b7280;text-decoration:none;font-weight:400;line-height:1}'
+      + '.sc-pill .sc-x:hover{color:#991b1b}'
+      + '.sc-basket-hint{font-size:11px;color:#9ca3af;font-style:italic}'
+      + '.sc-basket-msg{margin-top:8px;font-size:12px}'
       + '.sc-load{display:flex;align-items:center;gap:10px;color:#6b7280;font-size:14px;padding:12px 0}'
       + '.sc-spin{width:14px;height:14px;border:2px solid #e5e7eb;border-top-color:#374151;border-radius:50%;animation:sc-spin 0.8s linear infinite;display:inline-block}'
       + '@keyframes sc-spin{to{transform:rotate(360deg)}}'
@@ -3125,6 +3570,7 @@ input{font:inherit;font-size:13px;padding:7px 10px;border:1px solid #d1d5db;bord
   <div class="muted" style="font-size:12px;margin-top:6px">Claude searches the web for the next earnings date, consensus, revisions, and guide — then scores the 6-factor rubric. Takes 30–60 seconds.</div>
   <div id="sc-status" style="margin-top:14px"></div>
   <div id="sc-result" style="margin-top:14px"></div>
+  <div id="sc-basket" style="margin-top:14px"></div>
   <div class="foot">Probability is a rubric-derived subjective score, not options-implied. Model returns fresh sources with each query.</div>
 </div>
 
@@ -4354,6 +4800,22 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         body = self._body()
+        if self.path.startswith("/api/simucal/export_xlsx"):
+            uid = self._uid()
+            if not uid:
+                return self._json({"error": "Please log in first."})
+            basket = body.get("basket") or []
+            if not basket:
+                return self._json({"error": "Basket is empty."})
+            try:
+                xlsx_bytes = _simucal_build_xlsx(basket)
+            except Exception as e:
+                return self._json({"error": f"Export failed: {str(e)[:180]}"})
+            return self._send(
+                200, xlsx_bytes,
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                extra=[("Content-Disposition", 'attachment; filename="Earnings_Beat_Probability.xlsx"')]
+            )
         if self.path.startswith("/api/simucal/research"):
             uid = self._uid()
             if not uid:
