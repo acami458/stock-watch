@@ -1,3 +1,4 @@
 # Production dependencies (local preview without DATABASE_URL/VAPID ignores these).
 psycopg[binary]>=3.1
 pywebpush>=1.14
+openpyxl
