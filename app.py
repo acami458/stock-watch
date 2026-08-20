@@ -135,11 +135,6 @@ BIG_NAME_TICKERS = frozenset([
     "MAIN","PDD","BABA","JD","BIDU","NIO","LI","SE","SPOT","SHOP","MELI","MSTR","COIN",
     "RIVN","ROKU","U","IBKR","HOOD","APP","RDDT","NET","FUTU","RIO","IEP","CUBE","GLD",
     "SLV","COPX","CBRL","ADMA","SPCX",
-     # August 2026 additions — confirmed reporters not in the S&P but worth tracking
-    "HIMS","CRWV","LITE","NBIS","BIRK","YETI","ONON","RKLB","ASTS","ACHR",
-    "JBS","ALC","ACM","PLUG","GPRO","IONQ","RGTI","CLSK","DKNG","SOFI",
-    "NTES","BEKE","OTLK","RMIX","PAVM","RLX","INO","STEM","KURA","LENZ",
-    "SES","GEMI","HTFL",
 ])
 HAVE_DATA       = bool(ALPACA_KEY and ALPACA_SECRET)
 
@@ -215,6 +210,12 @@ def init_db():
             user_id INTEGER NOT NULL, symbol TEXT NOT NULL, PRIMARY KEY(user_id, symbol))""")
         cur.execute("""CREATE TABLE IF NOT EXISTS user_settings(
             user_id INTEGER PRIMARY KEY, alerts_on INTEGER DEFAULT 1)""")
+        # Per-user watchlist display preference: 'cards' (default) or 'table'.
+        # ALTER TABLE IF NOT EXISTS handles the migration for existing rows.
+        try:
+            cur.execute("ALTER TABLE user_settings ADD COLUMN watchlist_view TEXT DEFAULT 'cards'")
+        except Exception:
+            pass  # column already exists — subsequent starts
         cur.execute("""CREATE TABLE IF NOT EXISTS alerts_sent(
             user_id INTEGER NOT NULL, symbol TEXT NOT NULL, day TEXT NOT NULL,
             PRIMARY KEY(user_id, symbol, day))""")
@@ -367,6 +368,39 @@ def set_alerts_on(uid, on):
                            ON CONFLICT (user_id) DO UPDATE SET alerts_on=EXCLUDED.alerts_on""", (uid, val))
         else:
             cur.execute("INSERT OR REPLACE INTO user_settings(user_id, alerts_on) VALUES(?,?)", (uid, val))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_watchlist_view(uid):
+    """Return the user's watchlist display preference: 'cards' or 'table'."""
+    conn, kind = _db()
+    try:
+        cur = conn.cursor()
+        cur.execute(_ph("SELECT watchlist_view FROM user_settings WHERE user_id=%s", kind), (uid,))
+        r = cur.fetchone()
+        v = (r[0] if r else None) or "cards"
+        return v if v in ("cards", "table") else "cards"
+    finally:
+        conn.close()
+
+
+def set_watchlist_view(uid, view):
+    """Save watchlist display preference. Accepts 'cards' or 'table'."""
+    if view not in ("cards", "table"):
+        view = "cards"
+    conn, kind = _db()
+    try:
+        cur = conn.cursor()
+        if kind == "pg":
+            cur.execute("""INSERT INTO user_settings(user_id, watchlist_view) VALUES(%s,%s)
+                           ON CONFLICT (user_id) DO UPDATE SET watchlist_view=EXCLUDED.watchlist_view""",
+                        (uid, view))
+        else:
+            # SQLite: use UPSERT via INSERT OR IGNORE + UPDATE
+            cur.execute("INSERT OR IGNORE INTO user_settings(user_id, watchlist_view) VALUES(?,?)", (uid, view))
+            cur.execute("UPDATE user_settings SET watchlist_view=? WHERE user_id=?", (view, uid))
         conn.commit()
     finally:
         conn.close()
@@ -3473,6 +3507,29 @@ input{font:inherit;font-size:13px;padding:7px 10px;border:1px solid #d1d5db;bord
 .stat{display:flex;justify-content:space-between;font-size:13px;padding:5px 0;border-bottom:1px solid #f1f1f1}
 @keyframes blinkamber{0%,100%{background:#fff7ed;border-color:#f59e0b}50%{background:#fde68a;border-color:#b45309}}
 .card.alerting{animation:blinkamber 1s ease-in-out 30}
+/* Watchlist table view (Format 2 — grandpa's alphabetized spreadsheet layout) */
+.wtbl{border-collapse:collapse;width:100%;font-size:13px;background:#fff;border:1px solid #e7e9ee;border-radius:8px;overflow:hidden}
+.wtbl thead th{background:#f6f7f9;color:#374151;font-size:12px;font-weight:700;padding:9px 10px;text-align:right;border-bottom:2px solid #e7e9ee;white-space:nowrap}
+.wtbl thead th:first-child{text-align:left}
+.wtbl thead th:nth-last-child(-n+4){text-align:center}
+.wtbl thead th:last-child{width:32px}
+.wtbl tbody td{padding:8px 10px;border-bottom:1px solid #f1f2f4;text-align:right;white-space:nowrap;vertical-align:middle}
+.wtbl tbody td:first-child{text-align:left}
+.wtbl tbody td:nth-last-child(-n+4){text-align:center}
+.wtbl tbody tr{cursor:pointer;transition:background 0.1s}
+.wtbl tbody tr:nth-child(even){background:#fafbfc}
+.wtbl tbody tr:hover{background:#eff6ff}
+.wtbl .wt-tk{font-weight:800;font-size:14px;color:#111827;letter-spacing:0.02em}
+.wtbl .wt-up{color:#047857;font-weight:600}
+.wtbl .wt-dn{color:#b91c1c;font-weight:600}
+.wtbl .wt-mut{color:#9ca3af}
+.wtbl .wt-sig{display:inline-block;background:#e0f2fe;color:#075985;padding:2px 8px;border-radius:999px;font-size:11px;font-weight:700}
+.wtbl .wt-alarm{display:inline-block;background:#fef3c7;color:#92400e;padding:2px 8px;border-radius:999px;font-size:11px;font-weight:800}
+.wtbl .wt-earn{display:inline-block;background:#ede9fe;color:#5b21b6;padding:2px 8px;border-radius:999px;font-size:11px;font-weight:700}
+.wtbl .wt-x{background:none;border:none;color:#9ca3af;font-size:13px;cursor:pointer;padding:2px 6px}
+.wtbl .wt-x:hover{color:#b91c1c;background:#fef2f2;border-radius:4px}
+@keyframes wtblink{0%,100%{background:#fef3c7}50%{background:#fde68a}}
+.wtbl tbody tr.wt-blink{animation:wtblink 1s ease-in-out 6}
 .empty{font-size:14px;color:#16181d;font-weight:600;margin-top:8px}
 .tabs{display:flex;gap:4px;margin:10px 0 14px;border-bottom:1px solid #e7e9ee}
 .tab{border:none;background:none;border-radius:0;border-bottom:2px solid transparent;padding:8px 14px;color:#374151;font-weight:600}
@@ -3527,6 +3584,7 @@ input{font:inherit;font-size:13px;padding:7px 10px;border:1px solid #d1d5db;bord
   <span id="status"></span>
   <button onclick="load()">Refresh</button>
   <button onclick="copyList('pre')">Copy pre-market</button>
+  <button id="viewtog" onclick="toggleWatchView()" title="Switch between card and table layouts">📊 Table view</button>
   <label style="font-size:13px"><input type="checkbox" id="sndtog" checked> 🔊 Sound</label>
   <button id="pushbtn" style="display:none" onclick="enablePush()">🔔 Enable phone alerts</button>
   <span id="msg"></span>
@@ -3621,6 +3679,77 @@ function card(t,blink){
   '<div class="row muted">VWAP: '+(t.vwap==null?'—':'$'+t.vwap.toFixed(2))+'</div>'+
   '<div class="row muted">'+(t.as_of||'')+'</div>'+earnCardBadge(t)+'</div>';
 }
+
+// Spreadsheet-style table view — same data as cards, laid out for scanning.
+// Alphabetized by ticker so grandpa can find a specific stock quickly.
+function renderWatchTable(mine, newOnes){
+ var fmt = function(v, dp){ return (v==null) ? '<span class="wt-mut">—</span>' : '$'+Number(v).toFixed(dp==null?2:dp); };
+ var pct = function(v){
+   if(v==null) return '<span class="wt-mut">—</span>';
+   var s=(v>=0?'+':'')+Number(v).toFixed(2)+'%';
+   return '<span class="'+(v>=0?'wt-up':'wt-dn')+'">'+s+'</span>';
+ };
+ var sorted = mine.slice().sort(function(a,b){ return (a.ticker||'').localeCompare(b.ticker||''); });
+ var head = '<thead><tr>'
+   + '<th class="wt-tk">Ticker</th>'
+   + '<th>Price</th>'
+   + '<th>Change</th>'
+   + '<th>From Low</th>'
+   + '<th>VWAP</th>'
+   + '<th>Open</th>'
+   + '<th>Prev</th>'
+   + '<th>Signal</th>'
+   + '<th>Alarms</th>'
+   + '<th>Earnings</th>'
+   + '<th></th>'
+   + '</tr></thead>';
+ var body = sorted.map(function(t){
+   var trCls = 'wt-row';
+   if(newOnes && newOnes.has(t.ticker)) trCls += ' wt-blink';
+   var alarms = (t.alarm_num && t.alarm_num > 0)
+     ? '<span class="wt-alarm">#'+t.alarm_num+'</span>'
+     : '<span class="wt-mut">—</span>';
+   // Earnings badge: show short date if we have one
+   var earn = '<span class="wt-mut">—</span>';
+   if(t.earn && t.earn.date){
+     earn = '<span class="wt-earn">'+t.earn.date+'</span>';
+   }
+   var sig = (t.signal ? '<span class="wt-sig">'+t.signal+'</span>' : '<span class="wt-mut">—</span>');
+   return '<tr class="'+trCls+'" onclick="openDetail(\\''+t.ticker+'\\')">'
+     + '<td class="wt-tk">'+t.ticker+'</td>'
+     + '<td>'+fmt(t.price)+'</td>'
+     + '<td>'+pct(t.change)+'</td>'
+     + '<td>'+pct(t.from_low)+'</td>'
+     + '<td>'+fmt(t.vwap)+'</td>'
+     + '<td>'+fmt(t.open)+'</td>'
+     + '<td>'+fmt(t.prev_close)+'</td>'
+     + '<td>'+sig+'</td>'
+     + '<td>'+alarms+'</td>'
+     + '<td>'+earn+'</td>'
+     + '<td><button class="wt-x" title="Remove" onclick="event.stopPropagation();delSym(\\''+t.ticker+'\\')">✕</button></td>'
+     + '</tr>';
+ }).join('');
+ return '<table class="wtbl">'+head+'<tbody>'+body+'</tbody></table>';
+}
+
+async function toggleWatchView(){
+ var next = (ME.watchlist_view === 'table') ? 'cards' : 'table';
+ ME.watchlist_view = next;
+ // Update button label immediately for responsiveness
+ var btn = document.getElementById('viewtog');
+ if(btn) btn.textContent = (next === 'table') ? '🃏 Card view' : '📊 Table view';
+ // Re-render right away with the data we already have
+ load();
+ // Persist the preference server-side (fire-and-forget)
+ try{
+   await fetch('/api/prefs/watchlist_view', {
+     method:'POST',
+     headers:{'Content-Type':'application/json'},
+     body: JSON.stringify({view: next})
+   });
+ } catch(e){ /* preference will just not persist across sessions */ }
+}
+
 function findRow(tk){return (LAST.mine||[]).find(function(r){return r.ticker===tk;});}
 async function openDetail(tk){
  const t=findRow(tk)||{ticker:tk};
@@ -3685,6 +3814,12 @@ function renderAuth(){
  const b=document.getElementById('authbox');
  document.getElementById('addbar').style.display=ME.logged_in?'flex':'none';
  document.getElementById('pushbtn').style.display=(ME.logged_in&&ME.push_on)?'inline-block':'none';
+ // Sync the cards/table toggle button label to the user's saved preference.
+ var vt = document.getElementById('viewtog');
+ if(vt){
+   vt.style.display = ME.logged_in ? 'inline-block' : 'none';
+   vt.textContent = (ME.watchlist_view === 'table') ? '🃏 Card view' : '📊 Table view';
+ }
  if(ME.logged_in){
    const al=ME.alerts_on?'checked':'';
    const note=(ME.email_on||ME.push_on)?'':' <span class="muted">(alerts not set up by site owner)</span>';
@@ -3748,7 +3883,13 @@ async function load(){
       const n=t.alarm_num||0; curNum[t.ticker]=n;
       if(t.price!=null && n>(prevAlarmNum[t.ticker]||0)) newOnes.add(t.ticker);
     });
-    grid.innerHTML=mine.length?mine.map(t=>card(t,newOnes.has(t.ticker))).join(''):'<div class="empty">No stocks yet — add one in the box at the top.</div>';
+    if(!mine.length){
+      grid.innerHTML='<div class="empty">No stocks yet — add one in the box at the top.</div>';
+    } else if(ME.watchlist_view === 'table'){
+      grid.innerHTML = renderWatchTable(mine, newOnes);
+    } else {
+      grid.innerHTML = mine.map(t=>card(t, newOnes.has(t.ticker))).join('');
+    }
     const sndOn=document.getElementById('sndtog')&&document.getElementById('sndtog').checked;
     if(newOnes.size && sndOn && !firstLoad) beep();
     prevAlarmNum=curNum;
@@ -4723,7 +4864,8 @@ class Handler(BaseHTTPRequestHandler):
             uid = self._uid()
             if uid:
                 self._json({"logged_in": True, "email": get_email(uid),
-                            "alerts_on": get_alerts_on(uid), "email_on": EMAIL_ON, "push_on": PUSH_ON})
+                            "alerts_on": get_alerts_on(uid), "email_on": EMAIL_ON, "push_on": PUSH_ON,
+                            "watchlist_view": get_watchlist_view(uid)})
             else:
                 self._json({"logged_in": False, "email_on": EMAIL_ON, "push_on": PUSH_ON})
         elif self.path.startswith("/api/quotes"):
@@ -4887,6 +5029,15 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"error": "Please log in first."})
             set_alerts_on(uid, bool(body.get("on")))
             return self._json({"ok": True})
+        elif self.path.startswith("/api/prefs/watchlist_view"):
+            uid = self._uid()
+            if not uid:
+                return self._json({"error": "Please log in first."})
+            view = str(body.get("view") or "cards").lower()
+            if view not in ("cards", "table"):
+                return self._json({"error": "view must be 'cards' or 'table'"})
+            set_watchlist_view(uid, view)
+            return self._json({"ok": True, "view": view})
         elif self.path.startswith("/api/push/subscribe"):
             uid = self._uid()
             if not uid:
