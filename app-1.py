@@ -1,0 +1,6029 @@
+#!/usr/bin/env python3
+"""
+Stock Watch — single watchlist, REAL-TIME data via Alpaca (IEX feed, free).
+Add box at top, amber 30s flash + sound on new alerts, tap for chart, email/push.
+ENV: ALPACA_KEY, ALPACA_SECRET, DATABASE_URL, SECRET_KEY,
+     SMTP_* (email, optional), VAPID_* (push, optional), APP_URL
+RUN: export ALPACA_KEY=... ALPACA_SECRET=... ; python3 app.py  -> http://localhost:8765
+"""
+
+import base64
+import hashlib
+import hmac
+import json
+import os
+import re
+import smtplib
+import ssl
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone, timedelta
+from email.message import EmailMessage
+from http.cookies import SimpleCookie
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    raise SystemExit("Python 3.9+ required.")
+
+# ----------------------------- CONFIG -----------------------------
+HERE            = os.path.dirname(os.path.abspath(__file__))
+ALPACA_KEY      = os.environ.get("ALPACA_KEY", "").strip()
+ALPACA_SECRET   = os.environ.get("ALPACA_SECRET", "").strip()
+ALPACA_FEED     = os.environ.get("ALPACA_FEED", "iex").strip()   # free tier = iex
+DATA_URL        = "https://data.alpaca.markets/v2/stocks/snapshots"
+DATABASE_URL    = os.environ.get("DATABASE_URL", "").strip()
+SECRET_KEY      = os.environ.get("SECRET_KEY", "").strip() or base64.b64encode(os.urandom(24)).decode()
+DB_PATH         = os.path.join(HERE, "stockwatch.db")
+ICON_PATH       = os.path.join(HERE, "icon.png")
+ET              = ZoneInfo("America/New_York")
+PORT            = int(os.environ.get("PORT", "8765"))
+REFRESH_SECONDS = 60
+IDLE_SLEEP_SECONDS   = 300   # market closed: re-check every 5 min and touch NOTHING in the DB,
+                             # so Neon's free-tier compute can auto-suspend overnight/weekends
+SYMS_REFRESH_SECONDS = 600   # re-read the watchlist from the DB at most every 10 min while active
+DAILY_SAVE_HOUR      = 15    # persist the daily snapshot once near the close...
+DAILY_SAVE_MINUTE    = 55    # ...at 15:55 ET, instead of rewriting it every minute
+RISE_PCT        = 0.005          # condition 1: price must rise >= 0.5% off the intraday low
+VOL_SPIKE_MULT  = 1.5           # condition 4: last-3-min volume > 150% of the average
+ABOVE_OPEN_STOP = 1.01          # condition 6: stop watching once price >= 1.01 x open
+# Grandpa's numbered-alarm model (see the INTRADAY sketch): a *new* alarm fires
+# each time the stock carves a fresh lower intraday low and then bounces
+# RISE_PCT off it. Alarm #1 may be a "false alarm"; if the stock keeps making
+# lower lows you get #2, #3 ... and the bounce off the deepest low is the real
+# signal. NEW_LOW_MIN_DROP keeps trivial new lows from each firing an alarm:
+# the new low must be at least this fraction below the low that fired the
+# previous alarm.
+NEW_LOW_MIN_DROP = float(os.environ.get("NEW_LOW_MIN_DROP", "0.003"))  # 0.3%
+MAX_PER_USER    = 80
+ALERT_SESSIONS  = {"Pre-market", "Open"}
+APP_URL         = os.environ.get("APP_URL", "").strip()
+
+# JT WatchList (06-15-2026). New accounts start empty; this list is loaded into a
+# specific account on request via the seed_watchlist.py helper script.
+DEFAULT_WATCHLIST = [
+    "AAPL", "ADI", "ADMA", "AMZN", "BABA", "CBRL", "CL", "COPX",
+    "CUBE", "CVX", "DE", "FUTU", "GE", "GEV", "GLD", "GOOG",
+    "IEP", "INTU", "JNJ", "JPM", "KO", "LLY", "LMT", "MA",
+    "MAIN", "META", "MSFT", "MU", "NVDA", "PFE", "RIO", "SLV",
+    "TSLA", "VZ", "WMT", "ADSK", "AVGO", "SPCX",
+]
+
+# Curated "big names" for the Earnings tab — approximates S&P 500 plus a
+# handful of major non-S&P names (Chinese ADRs, prominent recent IPOs, etc).
+# Only tickers in this set (plus DEFAULT_WATCHLIST and each user's own
+# watchlist) show up on the Earnings tab. Trim or extend as needed.
+BIG_NAME_TICKERS = frozenset([
+    # Communication Services
+    "CHTR","CMCSA","DASH","DIS","EA","FOX","FOXA","GOOG","GOOGL","IPG","LYV",
+    "META","MTCH","NFLX","NWS","NWSA","OMC","PARA","T","TKO","TMUS","TTWO","VZ","WBD",
+    # Consumer Discretionary
+    "ABNB","AMZN","APTV","AZO","BBWI","BBY","BKNG","BWA","CCL","CMG","DECK","DHI","DPZ",
+    "DRI","EBAY","EXPE","F","GM","GPC","GRMN","HAS","HD","HLT","KMX","LEN","LKQ","LOW",
+    "LULU","LVS","MAR","MCD","MGM","MHK","NCLH","NKE","NVR","ORLY","PHM","POOL","RCL",
+    "RL","ROST","SBUX","TJX","TPR","TSCO","TSLA","ULTA","WHR","WYNN","YUM",
+    # Consumer Staples
+    "ADM","BF.B","BG","CAG","CHD","CL","CLX","COST","CPB","EL","GIS","HRL","HSY","K",
+    "KDP","KHC","KMB","KO","KR","KVUE","LW","MDLZ","MKC","MNST","MO","PEP","PG","PM",
+    "SJM","STZ","SYY","TAP","TSN","WMT",
+    # Energy
+    "BKR","COP","CTRA","CVX","DVN","EOG","EQT","FANG","HAL","HES","KMI","MPC","MRO",
+    "OKE","OXY","PSX","SLB","TRGP","VLO","WMB","XOM",
+    # Financials
+    "ACGL","AFL","AIG","AJG","ALL","AON","AXP","BAC","BEN","BLK","BRK.B","BRO","BX",
+    "C","CB","CBOE","CFG","CINF","CME","COF","DFS","EG","FDS","FI","FIS","FITB","GL",
+    "GPN","GS","HBAN","HIG","ICE","IVZ","JPM","KEY","KKR","MA","MCO","MET","MKTX",
+    "MMC","MS","MSCI","MTB","NDAQ","NTRS","PAYX","PGR","PNC","PRU","PYPL","RF","RJF",
+    "SCHW","SPGI","STT","SYF","TFC","TROW","TRV","USB","V","WFC","WRB","WTW","ZION",
+    # Health Care
+    "A","ABBV","ABT","ALGN","AMGN","BAX","BDX","BIIB","BIO","BMY","BSX","CAH","CI",
+    "CNC","COR","CRL","CTLT","CVS","DGX","DHR","DVA","DXCM","ELV","EW","GEHC","GILD",
+    "HCA","HOLX","HSIC","HUM","IDXX","ILMN","INCY","IQV","ISRG","JNJ","LH","LLY",
+    "MCK","MDT","MOH","MRK","MRNA","MTD","PFE","PODD","REGN","RMD","RVTY","STE","SYK",
+    "TECH","TFX","TMO","UHS","UNH","VRTX","VTRS","WAT","WST","ZBH","ZTS",
+    # Industrials
+    "ALLE","AME","AOS","AXON","BA","BR","CARR","CAT","CHRW","CMI","CPRT","CSX","CTAS",
+    "DAL","DAY","DE","DOV","EFX","EMR","ETN","EXPD","FAST","FDX","GD","GE","GEV",
+    "GNRC","GWW","HII","HON","HUBB","HWM","IEX","IR","ITW","J","JBHT","JBL","JCI",
+    "LDOS","LHX","LMT","LUV","MAS","MMM","NOC","NSC","ODFL","OTIS","PAYC","PCAR",
+    "PH","PNR","PWR","ROK","ROL","ROP","RSG","RTX","SNA","SWK","TDG","TDY","TT",
+    "TXT","UAL","UBER","UNP","UPS","URI","VRSK","WAB","WM","XYL",
+    # Information Technology
+    "AAPL","ACN","ADBE","ADI","ADP","ADSK","AKAM","AMAT","AMD","ANET","ANSS","APH",
+    "AVGO","CDNS","CDW","CRM","CRWD","CSCO","CTSH","DDOG","EPAM","FICO","FSLR","FTNT",
+    "GDDY","GEN","GLW","HPE","HPQ","IBM","INTC","INTU","IT","JBL","JKHY","KEYS","KLAC",
+    "LRCX","MCHP","MPWR","MRVL","MSFT","MSI","MU","NET","NOW","NVDA","NXPI","ON",
+    "ORCL","PANW","PLTR","PTC","QCOM","QRVO","SMCI","SNOW","SNPS","STX","SWKS","TDY",
+    "TEL","TER","TRMB","TXN","VRSN","WDAY","WDC","ZBRA","ZS",
+    # Materials
+    "ALB","AMCR","APD","AVY","BALL","CE","CF","CTVA","DD","DOW","ECL","EMN","FCX",
+    "FMC","IFF","IP","LIN","LYB","MLM","MOS","NEM","NUE","PKG","PPG","SHW","STLD","VMC",
+    # Real Estate
+    "AMT","ARE","AVB","BXP","CBRE","CCI","CPT","CSGP","DLR","DOC","EQIX","EQR","ESS",
+    "EXR","FRT","HST","INVH","IRM","KIM","MAA","O","PLD","PSA","REG","SBAC","SPG",
+    "UDR","VICI","VTR","WELL","WY",
+    # Utilities
+    "AEE","AEP","AES","ATO","AWK","CEG","CMS","CNP","D","DTE","DUK","ED","EIX","ES",
+    "ETR","EVRG","EXC","FE","LNT","NEE","NI","NRG","PCG","PEG","PNW","PPL","SO","SRE",
+    "WEC","XEL",
+    # Extras: prominent non-S&P names Camila tracks (Chinese ADRs, recent IPOs, BDCs)
+    "MAIN","PDD","BABA","JD","BIDU","NIO","LI","SE","SPOT","SHOP","MELI","MSTR","COIN",
+    "RIVN","ROKU","U","IBKR","HOOD","APP","RDDT","NET","FUTU","RIO","IEP","CUBE","GLD",
+    "SLV","COPX","CBRL","ADMA","SPCX",
+])
+HAVE_DATA       = bool(ALPACA_KEY and ALPACA_SECRET)
+
+SMTP_HOST = os.environ.get("SMTP_HOST", "").strip()
+SMTP_PORT = int(os.environ.get("SMTP_PORT", "587") or 587)
+SMTP_USER = os.environ.get("SMTP_USER", "").strip()
+SMTP_PASS = os.environ.get("SMTP_PASS", "").strip()
+SMTP_SSL  = os.environ.get("SMTP_SSL", "false").lower() in ("1", "true", "yes")
+EMAIL_FROM = os.environ.get("EMAIL_FROM", "").strip() or SMTP_USER
+EMAIL_ON  = bool(SMTP_HOST and SMTP_USER and SMTP_PASS)
+
+VAPID_PUBLIC_KEY  = os.environ.get("VAPID_PUBLIC_KEY", "").strip()
+VAPID_PRIVATE_KEY = os.environ.get("VAPID_PRIVATE_KEY", "").strip()
+VAPID_SUBJECT     = os.environ.get("VAPID_SUBJECT", "").strip() or ("mailto:" + (EMAIL_FROM or "admin@example.com"))
+PUSH_ON = bool(VAPID_PUBLIC_KEY and VAPID_PRIVATE_KEY)
+
+# Pushover (https://pushover.net) — keys come from env vars, not the source file.
+#   export PUSHOVER_USER_KEY=...      export PUSHOVER_API_TOKEN=...
+PUSHOVER_USER_KEY  = os.environ.get("PUSHOVER_USER_KEY", "").strip()
+PUSHOVER_API_TOKEN = os.environ.get("PUSHOVER_API_TOKEN", "").strip()
+PUSHOVER_URL       = "https://api.pushover.net/1/messages.json"
+PUSHOVER_ON = bool(PUSHOVER_USER_KEY and PUSHOVER_API_TOKEN)
+
+# Finnhub (earnings calendar + fundamentals) — free tier. Key from env, not source.
+#   export FINNHUB_KEY=...
+FINNHUB_KEY = os.environ.get("FINNHUB_KEY", "").strip()
+FINNHUB_URL = "https://finnhub.io/api/v1"
+HAVE_EARNINGS = bool(FINNHUB_KEY)
+EARNINGS_REFRESH_SECONDS = int(os.environ.get("EARNINGS_REFRESH_SECONDS", str(6 * 3600)))
+NOTABLE_MIN_REV = float(os.environ.get("NOTABLE_MIN_REV", "750e6"))  # >= $750M rev est = "notable"
+EARN_MAX_ROWS = int(os.environ.get("EARN_MAX_ROWS", "500"))
+
+# Anthropic API — powers the SimuCal earnings-beat calculator tab. Claude
+# researches any ticker on demand via server-side web_search. Never exposed
+# to the browser.
+#   export ANTHROPIC_API_KEY=sk-ant-...
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+ANTHROPIC_URL     = "https://api.anthropic.com/v1/messages"
+ANTHROPIC_MODEL   = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-5").strip()
+ANTHROPIC_VERSION = "2023-06-01"
+HAVE_SIMUCAL      = bool(ANTHROPIC_API_KEY)
+SIMUCAL_TIMEOUT   = int(os.environ.get("SIMUCAL_TIMEOUT", "90"))  # seconds
+
+_FALLBACK_ICON = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==")
+
+# =========================== DATABASE ===========================
+def _db():
+    if DATABASE_URL:
+        import psycopg
+        return psycopg.connect(DATABASE_URL), "pg"
+    import sqlite3
+    return sqlite3.connect(DB_PATH), "sqlite"
+
+
+def _ph(sql, kind):
+    return sql if kind == "pg" else sql.replace("%s", "?")
+
+
+def init_db():
+    conn, kind = _db()
+    try:
+        cur = conn.cursor()
+        if kind == "pg":
+            cur.execute("""CREATE TABLE IF NOT EXISTS users(
+                id SERIAL PRIMARY KEY, email TEXT UNIQUE NOT NULL,
+                pw_hash TEXT NOT NULL, created_at TIMESTAMP DEFAULT NOW())""")
+        else:
+            cur.execute("""CREATE TABLE IF NOT EXISTS users(
+                id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT UNIQUE NOT NULL,
+                pw_hash TEXT NOT NULL, created_at TEXT DEFAULT CURRENT_TIMESTAMP)""")
+        cur.execute("""CREATE TABLE IF NOT EXISTS watchlist(
+            user_id INTEGER NOT NULL, symbol TEXT NOT NULL, PRIMARY KEY(user_id, symbol))""")
+        cur.execute("""CREATE TABLE IF NOT EXISTS user_settings(
+            user_id INTEGER PRIMARY KEY, alerts_on INTEGER DEFAULT 1)""")
+        # Per-user watchlist display preference: 'cards' (default) or 'table'.
+        # ALTER TABLE IF NOT EXISTS handles the migration for existing rows.
+        if kind == "pg":
+            # IF NOT EXISTS: a failing ALTER would abort the whole Postgres
+            # transaction and silently skip every CREATE TABLE after it.
+            cur.execute("ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS watchlist_view TEXT DEFAULT 'cards'")
+        else:
+            try:
+                cur.execute("ALTER TABLE user_settings ADD COLUMN watchlist_view TEXT DEFAULT 'cards'")
+            except Exception:
+                pass  # column already exists — subsequent starts
+        cur.execute("""CREATE TABLE IF NOT EXISTS alerts_sent(
+            user_id INTEGER NOT NULL, symbol TEXT NOT NULL, day TEXT NOT NULL,
+            PRIMARY KEY(user_id, symbol, day))""")
+        cur.execute("""CREATE TABLE IF NOT EXISTS push_subs(
+            endpoint TEXT PRIMARY KEY, user_id INTEGER NOT NULL, sub TEXT NOT NULL)""")
+        cur.execute("""CREATE TABLE IF NOT EXISTS alert_log(
+            user_id INTEGER NOT NULL, symbol TEXT NOT NULL, day TEXT NOT NULL,
+            ts TEXT, price REAL, from_low REAL, change REAL,
+            PRIMARY KEY(user_id, symbol, day))""")
+        # One row per numbered alarm (grandpa's model): the Nth new-low bounce
+        # for a user/symbol on a given day. Powers the alert-history table.
+        cur.execute("""CREATE TABLE IF NOT EXISTS alarm_events(
+            user_id INTEGER NOT NULL, symbol TEXT NOT NULL, day TEXT NOT NULL,
+            num INTEGER NOT NULL, ts TEXT, price REAL, from_low REAL, change REAL,
+            PRIMARY KEY(user_id, symbol, day, num))""")
+        # Highest alarm number we've already *notified* a user about, so each new
+        # numbered alarm pushes exactly once (instead of once per whole day).
+        cur.execute("""CREATE TABLE IF NOT EXISTS alarm_progress(
+            user_id INTEGER NOT NULL, symbol TEXT NOT NULL, day TEXT NOT NULL,
+            last_num INTEGER DEFAULT 0, PRIMARY KEY(user_id, symbol, day))""")
+        cur.execute("""CREATE TABLE IF NOT EXISTS daily_history(
+            symbol TEXT NOT NULL, day TEXT NOT NULL, close REAL, low REAL,
+            high REAL, prev_close REAL, PRIMARY KEY(symbol, day))""")
+        # SimuCal same-day cache — one row per (symbol, day), refreshed
+        # whenever a research call completes. Keeps repeat lookups free.
+        cur.execute("""CREATE TABLE IF NOT EXISTS simucal_cache(
+            symbol TEXT NOT NULL, day TEXT NOT NULL,
+            data_json TEXT NOT NULL, updated_at TEXT,
+            PRIMARY KEY(symbol, day))""")
+        cur.execute("""CREATE TABLE IF NOT EXISTS simucal_usage(
+            day TEXT NOT NULL, user_id INTEGER NOT NULL,
+            symbol TEXT NOT NULL, ts TEXT NOT NULL,
+            PRIMARY KEY(day, user_id, symbol, ts))""")
+        # Per-user earnings analysis notes (the judgment columns from the
+        # weekly spreadsheet): Grade, Beat %, What-to-Watch, and a gold flag.
+        cur.execute("""CREATE TABLE IF NOT EXISTS earnings_notes(
+            user_id INTEGER NOT NULL, symbol TEXT NOT NULL, period TEXT NOT NULL,
+            grade TEXT, beat REAL, watch TEXT, gold INTEGER DEFAULT 0,
+            PRIMARY KEY(user_id, symbol, period))""")
+        # ☀️ Morning tab: grandpa's portfolio list + one saved report per day.
+        cur.execute("""CREATE TABLE IF NOT EXISTS morning_portfolio(
+            symbol TEXT PRIMARY KEY, name TEXT)""")
+        cur.execute("""CREATE TABLE IF NOT EXISTS morning_reports(
+            day TEXT PRIMARY KEY, data_json TEXT NOT NULL, updated_at TEXT)""")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def create_user(email, pw_hash):
+    conn, kind = _db()
+    try:
+        cur = conn.cursor()
+        cur.execute(_ph("SELECT id FROM users WHERE email=%s", kind), (email,))
+        if cur.fetchone():
+            return None
+        if kind == "pg":
+            cur.execute("INSERT INTO users(email, pw_hash) VALUES(%s,%s) RETURNING id", (email, pw_hash))
+            uid = cur.fetchone()[0]
+        else:
+            cur.execute("INSERT INTO users(email, pw_hash) VALUES(?,?)", (email, pw_hash))
+            uid = cur.lastrowid
+        conn.commit()
+        return uid
+    finally:
+        conn.close()
+
+
+def get_user_by_email(email):
+    conn, kind = _db()
+    try:
+        cur = conn.cursor()
+        cur.execute(_ph("SELECT id, pw_hash FROM users WHERE email=%s", kind), (email,))
+        return cur.fetchone()
+    finally:
+        conn.close()
+
+
+def get_email(uid):
+    conn, kind = _db()
+    try:
+        cur = conn.cursor()
+        cur.execute(_ph("SELECT email FROM users WHERE id=%s", kind), (uid,))
+        r = cur.fetchone()
+        return r[0] if r else None
+    finally:
+        conn.close()
+
+
+def get_watchlist(uid):
+    conn, kind = _db()
+    try:
+        cur = conn.cursor()
+        cur.execute(_ph("SELECT symbol FROM watchlist WHERE user_id=%s ORDER BY symbol", kind), (uid,))
+        return [r[0] for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+def add_watch(uid, symbol):
+    conn, kind = _db()
+    try:
+        cur = conn.cursor()
+        cur.execute(_ph("SELECT COUNT(*) FROM watchlist WHERE user_id=%s", kind), (uid,))
+        if cur.fetchone()[0] >= MAX_PER_USER:
+            return False
+        try:
+            cur.execute(_ph("INSERT INTO watchlist(user_id, symbol) VALUES(%s,%s)", kind), (uid, symbol))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+        return True
+    finally:
+        conn.close()
+
+
+def remove_watch(uid, symbol):
+    conn, kind = _db()
+    try:
+        cur = conn.cursor()
+        cur.execute(_ph("DELETE FROM watchlist WHERE user_id=%s AND symbol=%s", kind), (uid, symbol))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def all_user_symbols():
+    conn, kind = _db()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT DISTINCT symbol FROM watchlist")
+        return [r[0] for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+def get_alerts_on(uid):
+    conn, kind = _db()
+    try:
+        cur = conn.cursor()
+        cur.execute(_ph("SELECT alerts_on FROM user_settings WHERE user_id=%s", kind), (uid,))
+        r = cur.fetchone()
+        return True if r is None else bool(r[0])
+    finally:
+        conn.close()
+
+
+def set_alerts_on(uid, on):
+    conn, kind = _db()
+    try:
+        cur = conn.cursor()
+        val = 1 if on else 0
+        if kind == "pg":
+            cur.execute("""INSERT INTO user_settings(user_id, alerts_on) VALUES(%s,%s)
+                           ON CONFLICT (user_id) DO UPDATE SET alerts_on=EXCLUDED.alerts_on""", (uid, val))
+        else:
+            cur.execute("INSERT OR REPLACE INTO user_settings(user_id, alerts_on) VALUES(?,?)", (uid, val))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_watchlist_view(uid):
+    """Return the user's watchlist display preference: 'cards' or 'table'."""
+    conn, kind = _db()
+    try:
+        cur = conn.cursor()
+        cur.execute(_ph("SELECT watchlist_view FROM user_settings WHERE user_id=%s", kind), (uid,))
+        r = cur.fetchone()
+        v = (r[0] if r else None) or "cards"
+        return v if v in ("cards", "table") else "cards"
+    finally:
+        conn.close()
+
+
+def set_watchlist_view(uid, view):
+    """Save watchlist display preference. Accepts 'cards' or 'table'."""
+    if view not in ("cards", "table"):
+        view = "cards"
+    conn, kind = _db()
+    try:
+        cur = conn.cursor()
+        if kind == "pg":
+            cur.execute("""INSERT INTO user_settings(user_id, watchlist_view) VALUES(%s,%s)
+                           ON CONFLICT (user_id) DO UPDATE SET watchlist_view=EXCLUDED.watchlist_view""",
+                        (uid, view))
+        else:
+            # SQLite: use UPSERT via INSERT OR IGNORE + UPDATE
+            cur.execute("INSERT OR IGNORE INTO user_settings(user_id, watchlist_view) VALUES(?,?)", (uid, view))
+            cur.execute("UPDATE user_settings SET watchlist_view=? WHERE user_id=?", (view, uid))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def alert_users():
+    conn, kind = _db()
+    try:
+        cur = conn.cursor()
+        cur.execute("""SELECT u.id, u.email FROM users u
+                       LEFT JOIN user_settings s ON u.id=s.user_id
+                       WHERE COALESCE(s.alerts_on, 1)=1""")
+        return cur.fetchall()
+    finally:
+        conn.close()
+
+
+def already_alerted(uid, symbol, day):
+    conn, kind = _db()
+    try:
+        cur = conn.cursor()
+        cur.execute(_ph("SELECT 1 FROM alerts_sent WHERE user_id=%s AND symbol=%s AND day=%s", kind),
+                    (uid, symbol, day))
+        return cur.fetchone() is not None
+    finally:
+        conn.close()
+
+
+def mark_alerted(uid, symbol, day):
+    conn, kind = _db()
+    try:
+        cur = conn.cursor()
+        try:
+            cur.execute(_ph("INSERT INTO alerts_sent(user_id, symbol, day) VALUES(%s,%s,%s)", kind),
+                        (uid, symbol, day))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+    finally:
+        conn.close()
+
+
+def save_sub(uid, sub):
+    conn, kind = _db()
+    try:
+        cur = conn.cursor()
+        ep = sub.get("endpoint")
+        if not ep:
+            return
+        if kind == "pg":
+            cur.execute("""INSERT INTO push_subs(endpoint, user_id, sub) VALUES(%s,%s,%s)
+                           ON CONFLICT (endpoint) DO UPDATE SET user_id=EXCLUDED.user_id, sub=EXCLUDED.sub""",
+                        (ep, uid, json.dumps(sub)))
+        else:
+            cur.execute("INSERT OR REPLACE INTO push_subs(endpoint, user_id, sub) VALUES(?,?,?)",
+                        (ep, uid, json.dumps(sub)))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def delete_sub(endpoint):
+    conn, kind = _db()
+    try:
+        cur = conn.cursor()
+        cur.execute(_ph("DELETE FROM push_subs WHERE endpoint=%s", kind), (endpoint,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def subs_for_user(uid):
+    conn, kind = _db()
+    try:
+        cur = conn.cursor()
+        cur.execute(_ph("SELECT endpoint, sub FROM push_subs WHERE user_id=%s", kind), (uid,))
+        return [(r[0], json.loads(r[1])) for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+def all_user_ids():
+    conn, kind = _db()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT id FROM users")
+        return [r[0] for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+def log_alert(uid, symbol, day, ts, price, from_low, change):
+    conn, kind = _db()
+    try:
+        cur = conn.cursor()
+        try:
+            if kind == "pg":
+                cur.execute("""INSERT INTO alert_log(user_id, symbol, day, ts, price, from_low, change)
+                               VALUES(%s,%s,%s,%s,%s,%s,%s)
+                               ON CONFLICT (user_id, symbol, day) DO NOTHING""",
+                            (uid, symbol, day, ts, price, from_low, change))
+            else:
+                cur.execute("""INSERT OR IGNORE INTO alert_log(user_id, symbol, day, ts, price, from_low, change)
+                               VALUES(?,?,?,?,?,?,?)""", (uid, symbol, day, ts, price, from_low, change))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+    finally:
+        conn.close()
+
+
+def get_alert_log(uid, limit=200):
+    conn, kind = _db()
+    try:
+        cur = conn.cursor()
+        cur.execute(_ph("""SELECT symbol, day, ts, price, from_low, change FROM alert_log
+                           WHERE user_id=%s ORDER BY day DESC, ts DESC LIMIT %s""", kind), (uid, limit))
+        return [{"symbol": r[0], "day": r[1], "ts": r[2], "price": r[3],
+                 "from_low": r[4], "change": r[5]} for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+# --- numbered alarms (grandpa's model) ---
+def log_alarm_event(uid, symbol, day, num, ts, price, from_low, change):
+    """Record the Nth new-low bounce for a user/symbol/day (once, idempotent)."""
+    conn, kind = _db()
+    try:
+        cur = conn.cursor()
+        try:
+            if kind == "pg":
+                cur.execute("""INSERT INTO alarm_events(user_id, symbol, day, num, ts, price, from_low, change)
+                               VALUES(%s,%s,%s,%s,%s,%s,%s,%s)
+                               ON CONFLICT (user_id, symbol, day, num) DO NOTHING""",
+                            (uid, symbol, day, num, ts, price, from_low, change))
+            else:
+                cur.execute("""INSERT OR IGNORE INTO alarm_events(user_id, symbol, day, num, ts, price, from_low, change)
+                               VALUES(?,?,?,?,?,?,?,?)""", (uid, symbol, day, num, ts, price, from_low, change))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+    finally:
+        conn.close()
+
+
+def max_logged_alarm(uid, symbol, day):
+    """Highest alarm number already saved to history for this user/symbol/day."""
+    conn, kind = _db()
+    try:
+        cur = conn.cursor()
+        cur.execute(_ph("SELECT MAX(num) FROM alarm_events WHERE user_id=%s AND symbol=%s AND day=%s", kind),
+                    (uid, symbol, day))
+        r = cur.fetchone()
+        return int(r[0]) if r and r[0] is not None else 0
+    finally:
+        conn.close()
+
+
+def get_alarm_events(uid, limit=200):
+    """Most recent numbered alarms for the history table."""
+    conn, kind = _db()
+    try:
+        cur = conn.cursor()
+        cur.execute(_ph("""SELECT symbol, day, num, ts, price, from_low, change FROM alarm_events
+                           WHERE user_id=%s ORDER BY day DESC, ts DESC, num DESC LIMIT %s""", kind),
+                    (uid, limit))
+        return [{"symbol": r[0], "day": r[1], "num": r[2], "ts": r[3], "price": r[4],
+                 "from_low": r[5], "change": r[6]} for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+def get_notified_alarm(uid, symbol, day):
+    """Highest alarm number we've already pushed/emailed for this user/symbol/day."""
+    conn, kind = _db()
+    try:
+        cur = conn.cursor()
+        cur.execute(_ph("SELECT last_num FROM alarm_progress WHERE user_id=%s AND symbol=%s AND day=%s", kind),
+                    (uid, symbol, day))
+        r = cur.fetchone()
+        return int(r[0]) if r and r[0] is not None else 0
+    finally:
+        conn.close()
+
+
+def set_notified_alarm(uid, symbol, day, num):
+    conn, kind = _db()
+    try:
+        cur = conn.cursor()
+        if kind == "pg":
+            cur.execute("""INSERT INTO alarm_progress(user_id, symbol, day, last_num) VALUES(%s,%s,%s,%s)
+                           ON CONFLICT (user_id, symbol, day) DO UPDATE SET last_num=EXCLUDED.last_num""",
+                        (uid, symbol, day, num))
+        else:
+            cur.execute("INSERT OR REPLACE INTO alarm_progress(user_id, symbol, day, last_num) VALUES(?,?,?,?)",
+                        (uid, symbol, day, num))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def upsert_daily(symbol, day, close, low, high, prev_close):
+    conn, kind = _db()
+    try:
+        cur = conn.cursor()
+        if kind == "pg":
+            cur.execute("""INSERT INTO daily_history(symbol, day, close, low, high, prev_close)
+                           VALUES(%s,%s,%s,%s,%s,%s)
+                           ON CONFLICT (symbol, day) DO UPDATE SET
+                             close=EXCLUDED.close, low=EXCLUDED.low,
+                             high=EXCLUDED.high, prev_close=EXCLUDED.prev_close""",
+                        (symbol, day, close, low, high, prev_close))
+        else:
+            cur.execute("""INSERT OR REPLACE INTO daily_history(symbol, day, close, low, high, prev_close)
+                           VALUES(?,?,?,?,?,?)""", (symbol, day, close, low, high, prev_close))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_daily_history(symbol, limit=180):
+    conn, kind = _db()
+    try:
+        cur = conn.cursor()
+        cur.execute(_ph("""SELECT day, close, low, high, prev_close FROM daily_history
+                           WHERE symbol=%s ORDER BY day DESC LIMIT %s""", kind), (symbol, limit))
+        rows = [{"d": r[0], "close": r[1], "low": r[2], "high": r[3], "prev_close": r[4]}
+                for r in cur.fetchall()]
+        rows.reverse()
+        return rows
+    finally:
+        conn.close()
+
+
+# =========================== AUTH ===========================
+def hash_pw(pw, salt=None):
+    salt = salt or os.urandom(16)
+    h = hashlib.pbkdf2_hmac("sha256", pw.encode(), salt, 200_000)
+    return base64.b64encode(salt).decode() + ":" + base64.b64encode(h).decode()
+
+
+def verify_pw(pw, stored):
+    try:
+        s, h = stored.split(":")
+        salt, expected = base64.b64decode(s), base64.b64decode(h)
+        test = hashlib.pbkdf2_hmac("sha256", pw.encode(), salt, 200_000)
+        return hmac.compare_digest(test, expected)
+    except Exception:
+        return False
+
+
+def sign_session(uid):
+    msg = str(uid).encode()
+    sig = hmac.new(SECRET_KEY.encode(), msg, hashlib.sha256).hexdigest()
+    return base64.urlsafe_b64encode(msg).decode() + "." + sig
+
+
+def read_session(token):
+    try:
+        b64, sig = token.split(".")
+        msg = base64.urlsafe_b64decode(b64)
+        good = hmac.new(SECRET_KEY.encode(), msg, hashlib.sha256).hexdigest()
+        if hmac.compare_digest(good, sig):
+            return int(msg.decode())
+    except Exception:
+        pass
+    return None
+
+
+def clean_symbol(s):
+    s = (s or "").strip().upper()
+    if 1 <= len(s) <= 10 and all(c.isalnum() or c in ".-" for c in s):
+        return s
+    return None
+
+
+# =========================== QUOTES (Alpaca) + HISTORY ===========================
+_quotes = {}
+_qlock = threading.Lock()
+_hist = {}
+_hist_lock = threading.Lock()
+_hist_state = {"day": None}
+HIST_MAX = 480
+
+# Rolling per-symbol minute bars, used for the 3-minute average and the volume
+# spike test. Each entry is {symbol: [[minute_str, close, volume], ...]} and is
+# cleared at the start of each new trading day.
+_bars = {}
+_bars_lock = threading.Lock()
+_bars_state = {"day": None}
+BARS_MAX = 480
+
+# Grandpa's numbered-alarm tracker. Per symbol, per day:
+#   count      -> how many alarms have fired today (1st, 2nd, 3rd bounce...)
+#   armed_low  -> the intraday low that fired the last alarm; a new alarm can
+#                 only fire once the stock prints a low meaningfully BELOW this.
+# Shared across all users (it's a property of the stock's price action).
+_alarm = {}
+_alarm_lock = threading.Lock()
+_alarm_state = {"day": None}
+
+
+def _update_alarm(sym, day_low, bounced):
+    """Advance the numbered-alarm counter for one symbol on one tick.
+
+    Fires (increments the count) when the price has bounced RISE_PCT off the
+    intraday low (`bounced`) AND that low is a fresh new low at least
+    NEW_LOW_MIN_DROP below the low that fired the previous alarm. Returns
+    (current_count, fired_this_tick).
+    """
+    today = datetime.now(ET).strftime("%Y-%m-%d")
+    with _alarm_lock:
+        if _alarm_state["day"] != today:
+            _alarm.clear()
+            _alarm_state["day"] = today
+        st = _alarm.setdefault(sym, {"count": 0, "armed_low": None})
+        fired = False
+        if bounced and day_low is not None:
+            if st["armed_low"] is None or day_low <= st["armed_low"] * (1 - NEW_LOW_MIN_DROP):
+                st["count"] += 1
+                st["armed_low"] = day_low
+                fired = True
+        return st["count"], fired
+
+
+def record_history():
+    now = datetime.now(ET)
+    today = now.strftime("%Y-%m-%d")
+    hhmm = now.strftime("%H:%M")
+    with _qlock:
+        snapshot = {s: r.get("price") for s, r in _quotes.items()}
+    with _hist_lock:
+        if _hist_state["day"] != today:
+            _hist.clear()
+            _hist_state["day"] = today
+        for s, p in snapshot.items():
+            if p is None:
+                continue
+            lst = _hist.setdefault(s, [])
+            if lst and lst[-1][0] == hhmm:
+                lst[-1] = [hhmm, p]
+            else:
+                lst.append([hhmm, p])
+            if len(lst) > HIST_MAX:
+                del lst[:len(lst) - HIST_MAX]
+
+
+def history_for(sym):
+    with _hist_lock:
+        return [{"t": t, "p": p} for t, p in _hist.get(sym, [])]
+
+
+def market_open(dt):
+    if dt.weekday() >= 5:
+        return False
+    m = dt.hour * 60 + dt.minute
+    return 9 * 60 + 30 <= m < 16 * 60
+
+
+def session_label(dt):
+    if dt.weekday() >= 5:
+        return "Closed (weekend)"
+    m = dt.hour * 60 + dt.minute
+    if 4 * 60 <= m < 9 * 60 + 30:
+        return "Pre-market"
+    if 9 * 60 + 30 <= m < 16 * 60:
+        return "Open"
+    if 16 * 60 <= m < 20 * 60:
+        return "After-hours"
+    return "Closed"
+
+
+def _chunks(lst, n):
+    for i in range(0, len(lst), n):
+        yield lst[i:i + n]
+
+
+# Symbols Alpaca has rejected as invalid (e.g. an index ticker like NAS100).
+# Remembered so one bad ticker can't blank the whole batch, and so we stop
+# re-requesting it every cycle. Cleared on restart.
+_bad_symbols = set()
+_bad_lock = threading.Lock()
+_INVALID_RE = re.compile(r"invalid symbol[^A-Za-z0-9]*([A-Za-z0-9.\-]+)", re.I)
+
+
+def fetch_snapshots(syms):
+    """Alpaca multi-symbol snapshots -> {symbol: snapshot dict}.
+
+    Resilient to bad tickers: Alpaca rejects an ENTIRE batch with HTTP 400 if
+    even one symbol is invalid, so we parse out the offending symbol, drop it,
+    and retry the rest — instead of letting one bad ticker blank everything.
+    """
+    out = {}
+    headers = {"APCA-API-KEY-ID": ALPACA_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET,
+               "User-Agent": "stock-watch"}
+    with _bad_lock:
+        known_bad = set(_bad_symbols)
+    for chunk in _chunks(sorted(set(syms)), 90):
+        work = [s for s in chunk if s.upper() not in known_bad]
+        tries = 0
+        while work and tries < 10:
+            tries += 1
+            url = DATA_URL + "?symbols=" + urllib.parse.quote(",".join(work)) + "&feed=" + urllib.parse.quote(ALPACA_FEED)
+            req = urllib.request.Request(url, headers=headers)
+            try:
+                with urllib.request.urlopen(req, timeout=15) as r:
+                    data = json.loads(r.read().decode())
+                snaps = data.get("snapshots", data) if isinstance(data, dict) else {}
+                if isinstance(snaps, dict):
+                    out.update(snaps)
+                print(f"[ALPACA-DEBUG] OK: requested {len(work)} symbols, got {len(snaps) if isinstance(snaps, dict) else 0} snapshots", flush=True)
+                break
+            except urllib.error.HTTPError as e:
+                try:
+                    body = e.read().decode()[:300]
+                except Exception:
+                    body = "(could not read error body)"
+                if e.code == 400:
+                    m = _INVALID_RE.search(body)
+                    badsym = m.group(1).upper() if m else None
+                    upper = [w.upper() for w in work]
+                    if badsym and badsym in upper:
+                        work = [w for w in work if w.upper() != badsym]
+                        with _bad_lock:
+                            _bad_symbols.add(badsym)
+                        print(f"[ALPACA-DEBUG] invalid symbol {badsym} dropped; retrying {len(work)} others", flush=True)
+                        continue
+                    print(f"[ALPACA-DEBUG] HTTP 400 (could not identify bad symbol) -> {body}", flush=True)
+                    break
+                if e.code == 429 and tries < 6:
+                    time.sleep(1.5 * tries); continue
+                print(f"[ALPACA-DEBUG] HTTP {e.code} from Alpaca -> {body}", flush=True)
+                break
+            except Exception as e:
+                print(f"[ALPACA-DEBUG] error contacting Alpaca: {type(e).__name__}: {str(e)[:200]}", flush=True)
+                if tries < 3:
+                    time.sleep(0.8 * tries); continue
+                break
+    if not out:
+        print(f"[ALPACA-DEBUG] fetch_snapshots got NOTHING back (HAVE_DATA={HAVE_DATA}, feed={ALPACA_FEED})", flush=True)
+    return out
+
+
+def _as_of(ts):
+    if not ts:
+        return ""
+    try:
+        dt = datetime.strptime(ts[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
+        return dt.astimezone(ET).strftime("%H:%M ET")
+    except Exception:
+        return ""
+
+
+def _blank_row(t):
+    return {"ticker": t, "price": None, "from_low": None, "prev_close": None,
+            "change": None, "open": None, "high": None, "low": None, "vwap": None,
+            "as_of": "", "near": False, "alert": False, "signal": None, "conditions": [],
+            "alarm_num": 0, "new_alarm": False}
+
+
+def build_row(t, snap):
+    blank = _blank_row(t)
+    try:
+        if not snap:
+            return blank
+        lt = snap.get("latestTrade") or {}
+        db = snap.get("dailyBar") or {}
+        pdb = snap.get("prevDailyBar") or {}
+        mb = snap.get("minuteBar") or {}
+        c = lt.get("p") or db.get("c")
+        low = db.get("l")
+        o = db.get("o")
+        hi = db.get("h")
+        pc = pdb.get("c")
+        vwap = db.get("vw")          # Alpaca daily VWAP
+        if not c:
+            return blank
+        from_low = (c - low) / low * 100 if low else None
+        change = (c - pc) / pc * 100 if pc else None
+        row = {"ticker": t, "price": round(c, 2),
+               "from_low": None if from_low is None else round(from_low, 2),
+               "prev_close": None if not pc else round(pc, 2),
+               "change": None if change is None else round(change, 2),
+               "open": None if not o else round(o, 2),
+               "high": None if not hi else round(hi, 2),
+               "low": None if not low else round(low, 2),
+               "vwap": None if not vwap else round(vwap, 2),
+               "as_of": _as_of(lt.get("t")),
+               # condition 1: price is >= 0.5% above the intraday low
+               "near": bool(from_low is not None and from_low >= RISE_PCT * 100),
+               "alert": False, "signal": None, "conditions": [],
+               "alarm_num": 0, "new_alarm": False,
+               # raw minute bar, used by evaluate_signal for the 3-min tests
+               "_mb_t": mb.get("t"), "_mb_c": mb.get("c"), "_mb_v": mb.get("v")}
+        evaluate_signal(row)
+        return row
+    except Exception:
+        return blank
+
+
+def _update_bars(sym, minute_ts, close, vol):
+    """Append the latest minute bar (deduped by minute) to the rolling buffer."""
+    if not minute_ts or close is None:
+        return
+    today = datetime.now(ET).strftime("%Y-%m-%d")
+    minute = str(minute_ts)[:16]   # 'YYYY-MM-DDTHH:MM'
+    with _bars_lock:
+        if _bars_state["day"] != today:
+            _bars.clear()
+            _bars_state["day"] = today
+        lst = _bars.setdefault(sym, [])
+        v = 0.0 if vol is None else float(vol)
+        if lst and lst[-1][0] == minute:
+            lst[-1] = [minute, float(close), v]
+        else:
+            lst.append([minute, float(close), v])
+        if len(lst) > BARS_MAX:
+            del lst[:len(lst) - BARS_MAX]
+        return list(lst)
+
+
+def evaluate_signal(row):
+    """Apply grandpa's multi-condition logic and attach a confidence score.
+
+    Conditions (from the WatchList "Python" tab):
+      1. price rose >= 0.5% off the intraday low
+      2. price > 3-minute average
+      3. price > VWAP
+      4. last-3-min volume > 150% of the average minute volume
+      5. price < open  (only hunting for a bounce while still below the open)
+      6. stop once price >= 1.01 x open (the setup has played out)
+    Confidence:  1+2 = Good, 1+2+3 = Very Good, 1+2+3+4 = Excellent.
+    A push/email/Pushover alert fires only when 1 AND 2 AND 5 hold and the
+    stop (6) has not triggered. Conditions 3 and 4 raise the confidence label.
+    """
+    sym = row["ticker"]
+    price = row.get("price")
+    o = row.get("open")
+    bars = _update_bars(sym, row.pop("_mb_t", None), row.pop("_mb_c", None), row.pop("_mb_v", None))
+    if price is None:
+        return row
+
+    # Condition 1 — already computed as row["near"].
+    c1 = bool(row.get("near"))
+
+    # Condition 2 — price above the average close of the last 3 minute bars.
+    avg3 = None
+    if bars and len(bars) >= 1:
+        last3 = bars[-3:]
+        avg3 = sum(b[1] for b in last3) / len(last3)
+    c2 = bool(avg3 is not None and price > avg3)
+
+    # Condition 3 — price above the daily VWAP.
+    vwap = row.get("vwap")
+    c3 = bool(vwap is not None and price > vwap)
+
+    # Condition 4 — last-3-min volume exceeds 150% of the average minute volume.
+    c4 = False
+    if bars and len(bars) >= 4:
+        vol3 = sum(b[2] for b in bars[-3:])
+        baseline = sum(b[2] for b in bars) / len(bars)   # avg volume per minute
+        c4 = bool(baseline > 0 and vol3 > VOL_SPIKE_MULT * baseline * 3)
+
+    # Condition 5 — still trading below the open.
+    c5 = bool(o is not None and price < o)
+    # Condition 6 — stop watching once price has recovered to >= 1.01 x open.
+    stopped = bool(o is not None and price >= ABOVE_OPEN_STOP * o)
+
+    met = [i for i, ok in [(1, c1), (2, c2), (3, c3), (4, c4), (5, c5)] if ok]
+    row["conditions"] = met
+    row["vwap"] = None if vwap is None else round(vwap, 2)
+
+    # Confidence ladder requires the 1+2 base.
+    signal = None
+    if c1 and c2:
+        signal = "Good"
+        if c3:
+            signal = "Very Good"
+            if c4:
+                signal = "Excellent"
+    row["signal"] = signal
+
+    # Grandpa's numbered alarm: a fresh alarm each time a NEW lower intraday low
+    # bounces >= RISE_PCT. Independent of the confidence ladder above, which is
+    # kept intact as the quality label shown alongside the number.
+    count, fired = _update_alarm(sym, row.get("low"), c1)
+    row["alarm_num"] = count
+    row["new_alarm"] = fired
+    # Kept for reference/UI: the old full-confidence alert state.
+    row["alert"] = bool(c1 and c2 and c5 and not stopped)
+    return row
+
+
+def refresh_symbols(syms):
+    if not HAVE_DATA or not syms:
+        print(f"[ALPACA-DEBUG] refresh skipped: HAVE_DATA={HAVE_DATA} (keys present in env?), n_syms={len(list(syms)) if syms else 0}", flush=True)
+        return
+    snaps = fetch_snapshots(list(syms))
+    with _qlock:
+        for s in syms:
+            _quotes[s] = build_row(s, snaps.get(s))
+
+
+def rows_for(syms):
+    with _qlock:
+        missing = [s for s in syms if s not in _quotes]
+    if missing:
+        refresh_symbols(missing)
+    out = []
+    with _qlock:
+        for s in syms:
+            out.append(_quotes.get(s) or _blank_row(s))
+    return out
+
+
+# ==================== ALERTS (email + web push + Pushover) ====================
+def send_alert_email(to_email, row):
+    if not EMAIL_ON:
+        return False
+    t = row["ticker"]
+    sig = row.get("signal")
+    num = row.get("alarm_num") or 1
+    vwap_line = "" if row.get("vwap") is None else f"VWAP: ${row['vwap']:.2f}\n"
+    body = (f"Alarm #{num} for {t}: it just bounced {row['from_low']:.2f}% off a new intraday low.\n\n"
+            f"This is the #{num} new-low bounce today — the higher the number, the more the "
+            f"stock has been driven down and re-tested.\n\n"
+            f"Signal: {sig or 'n/a'} (conditions met: {row.get('conditions') or '—'})\n"
+            f"Price: ${row['price']:.2f}\nDay low: ${row['low']:.2f}\n"
+            f"{vwap_line}"
+            f"Change vs prev close: {row['change']:+.2f}%\nAs of: {row['as_of']}\n")
+    if APP_URL:
+        body += f"\nOpen the dashboard: {APP_URL}\n"
+    try:
+        msg = EmailMessage()
+        sig_tag = f" [{sig}]" if sig else ""
+        msg["Subject"] = f"🔔 {t} Alarm #{num}{sig_tag} — +{row['from_low']:.2f}% off a new low"
+        msg["From"] = EMAIL_FROM
+        msg["To"] = to_email
+        msg.set_content(body)
+        ctx = ssl.create_default_context()
+        if SMTP_SSL:
+            with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, context=ctx, timeout=15) as s:
+                s.login(SMTP_USER, SMTP_PASS); s.send_message(msg)
+        else:
+            with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as s:
+                s.starttls(context=ctx); s.login(SMTP_USER, SMTP_PASS); s.send_message(msg)
+        return True
+    except Exception as e:
+        print(f"  (alert email failed: {e})", flush=True)
+        return False
+
+
+def send_push(sub, title, body):
+    if not PUSH_ON:
+        return None
+    try:
+        from pywebpush import webpush, WebPushException
+    except Exception:
+        return None
+    try:
+        webpush(sub, json.dumps({"title": title, "body": body, "url": APP_URL or "/"}),
+                vapid_private_key=VAPID_PRIVATE_KEY, vapid_claims={"sub": VAPID_SUBJECT})
+        return True
+    except WebPushException as e:
+        code = getattr(getattr(e, "response", None), "status_code", None)
+        if code in (404, 410):
+            return "gone"
+        print(f"  (push failed: {str(e)[:90]})", flush=True)
+        return False
+    except Exception as e:
+        print(f"  (push error: {str(e)[:90]})", flush=True)
+        return False
+
+
+def send_pushover(title, body):
+    """Send a Pushover push notification to the configured user key."""
+    if not PUSHOVER_ON:
+        return None
+    try:
+        data = urllib.parse.urlencode({
+            "token": PUSHOVER_API_TOKEN,
+            "user": PUSHOVER_USER_KEY,
+            "title": title,
+            "message": body,
+            "url": APP_URL or "",
+        }).encode()
+        req = urllib.request.Request(PUSHOVER_URL, data=data, headers={"User-Agent": "stock-watch"})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            r.read()
+        return True
+    except Exception as e:
+        print(f"  (pushover failed: {str(e)[:90]})", flush=True)
+        return False
+
+
+def notify_user(uid, email, row):
+    sent = False
+    sig = row.get("signal")
+    num = row.get("alarm_num") or 1
+    sig_tag = f" [{sig}]" if sig else ""
+    if EMAIL_ON and send_alert_email(email, row):
+        sent = True
+    if PUSH_ON:
+        title = f"🔔 {row['ticker']} Alarm #{num}{sig_tag} +{row['from_low']:.2f}% off new low"
+        body = f"${row['price']:.2f} · {row['change']:+.2f}% on the day"
+        for endpoint, sub in subs_for_user(uid):
+            res = send_push(sub, title, body)
+            if res == "gone":
+                delete_sub(endpoint)
+            elif res:
+                sent = True
+    if PUSHOVER_ON:
+        title = f"🔔 {row['ticker']} Alarm #{num}{sig_tag} +{row['from_low']:.2f}% off new low"
+        body = f"${row['price']:.2f} · {row['change']:+.2f}% on the day · signal: {sig or 'n/a'}"
+        if send_pushover(title, body):
+            sent = True
+    return sent
+
+
+def alert_check():
+    if not (EMAIL_ON or PUSH_ON or PUSHOVER_ON):
+        return
+    now = datetime.now(ET)
+    if session_label(now) not in ALERT_SESSIONS:
+        return
+    day = now.strftime("%Y-%m-%d")
+    for uid, email in alert_users():
+        for s in get_watchlist(uid):
+            with _qlock:
+                row = _quotes.get(s)
+            # Grandpa's model: fire once per NEW numbered alarm (each new-low
+            # bounce), not just once per day. Notify only when this symbol's
+            # alarm count has climbed past what we've already sent this user.
+            if row and row.get("price") is not None:
+                num = row.get("alarm_num") or 0
+                if num > 0 and num > get_notified_alarm(uid, s, day):
+                    if notify_user(uid, email, row):
+                        set_notified_alarm(uid, s, day, num)
+
+
+def record_daily_all():
+    """Persist a daily price snapshot per watched symbol (survives restarts).
+
+    Uses ONE database connection and a single batched write, instead of opening
+    a fresh connection per symbol.
+    """
+    day = datetime.now(ET).strftime("%Y-%m-%d")
+    with _qlock:
+        snap = {s: dict(r) for s, r in _quotes.items()}
+    rows = [(s, day, r.get("price"), r.get("low"), r.get("high"), r.get("prev_close"))
+            for s, r in snap.items() if r.get("price") is not None]
+    if not rows:
+        return
+    conn, kind = _db()
+    try:
+        cur = conn.cursor()
+        if kind == "pg":
+            cur.executemany(
+                """INSERT INTO daily_history(symbol, day, close, low, high, prev_close)
+                   VALUES(%s,%s,%s,%s,%s,%s)
+                   ON CONFLICT (symbol, day) DO UPDATE SET
+                     close=EXCLUDED.close, low=EXCLUDED.low,
+                     high=EXCLUDED.high, prev_close=EXCLUDED.prev_close""", rows)
+        else:
+            cur.executemany(
+                """INSERT OR REPLACE INTO daily_history(symbol, day, close, low, high, prev_close)
+                   VALUES(?,?,?,?,?,?)""", rows)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def fetch_daily_bars(syms, days=365):
+    """Fetch historical daily OHLC bars from Alpaca -> {symbol: [bar, ...]}.
+
+    Uses the same keys/feed as the live snapshots. Handles symbol chunking and
+    Alpaca's page_token pagination. Used to backfill daily_history so the
+    Backtest tab has real data to work with immediately.
+    """
+    if not HAVE_DATA or not syms:
+        return {}
+    from datetime import timedelta
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(days=days)
+    start_s, end_s = start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")
+    headers = {"APCA-API-KEY-ID": ALPACA_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET,
+               "User-Agent": "stock-watch"}
+    bars_url = "https://data.alpaca.markets/v2/stocks/bars"
+    out = {}
+    for chunk in _chunks(sorted(set(syms)), 90):
+        page_token = None
+        for _ in range(50):  # page cap, just in case
+            params = {"symbols": ",".join(chunk), "timeframe": "1Day",
+                      "start": start_s, "end": end_s, "feed": ALPACA_FEED,
+                      "limit": "10000", "adjustment": "raw"}
+            if page_token:
+                params["page_token"] = page_token
+            url = bars_url + "?" + urllib.parse.urlencode(params)
+            req = urllib.request.Request(url, headers=headers)
+            try:
+                with urllib.request.urlopen(req, timeout=20) as r:
+                    data = json.loads(r.read().decode())
+            except urllib.error.HTTPError as e:
+                if e.code == 429:
+                    time.sleep(1.5); continue
+                break
+            except Exception:
+                break
+            for s, lst in (data.get("bars") or {}).items():
+                out.setdefault(s, []).extend(lst)
+            page_token = data.get("next_page_token")
+            if not page_token:
+                break
+    return out
+
+
+def backfill_daily_history(syms, days=365):
+    """Populate daily_history from Alpaca daily bars. Returns rows written."""
+    bars = fetch_daily_bars(syms, days)
+    rows = []
+    for s, lst in bars.items():
+        lst = sorted(lst, key=lambda b: str(b.get("t", "")))
+        prev_close = None
+        for b in lst:
+            day = str(b.get("t", ""))[:10]
+            close = b.get("c")
+            if not day or close is None:
+                continue
+            rows.append((s, day, close, b.get("l"), b.get("h"), prev_close))
+            prev_close = close
+    if not rows:
+        return 0
+    conn, kind = _db()
+    try:
+        cur = conn.cursor()
+        if kind == "pg":
+            cur.executemany(
+                """INSERT INTO daily_history(symbol, day, close, low, high, prev_close)
+                   VALUES(%s,%s,%s,%s,%s,%s)
+                   ON CONFLICT (symbol, day) DO UPDATE SET
+                     close=EXCLUDED.close, low=EXCLUDED.low,
+                     high=EXCLUDED.high, prev_close=EXCLUDED.prev_close""", rows)
+        else:
+            cur.executemany(
+                """INSERT OR REPLACE INTO daily_history(symbol, day, close, low, high, prev_close)
+                   VALUES(?,?,?,?,?,?)""", rows)
+        conn.commit()
+    finally:
+        conn.close()
+    return len(rows)
+
+
+def record_alarms():
+    """Save every numbered alarm to history, one row per (user, symbol, day, num).
+
+    Runs regardless of whether email/push alerts are configured, so the History
+    tab always shows the 1st / 2nd / 3rd ... new-low bounces for the day."""
+    now = datetime.now(ET)
+    if session_label(now) not in ALERT_SESSIONS:
+        return
+    day = now.strftime("%Y-%m-%d")
+    ts = now.strftime("%H:%M ET")
+    for uid in all_user_ids():
+        for s in get_watchlist(uid):
+            with _qlock:
+                row = _quotes.get(s)
+            if not (row and row.get("price") is not None):
+                continue
+            num = row.get("alarm_num") or 0
+            if num <= 0:
+                continue
+            already = max_logged_alarm(uid, s, day)
+            # Backfill any alarm numbers we haven't logged yet (usually just one).
+            for n in range(already + 1, num + 1):
+                log_alarm_event(uid, s, day, n, ts, row.get("price"),
+                                row.get("from_low"), row.get("change"))
+
+
+# =========================== EARNINGS (Finnhub) ===========================
+# Curated "notable" weekly earnings + per-user analysis notes + next-earnings
+# badges for watchlist cards. Every Finnhub call is best-effort and cached; if
+# FINNHUB_KEY is unset the whole feature is simply off and nothing else breaks.
+_EARN_NAME_HINT = {
+    "AAPL": "Apple", "MSFT": "Microsoft", "AMZN": "Amazon", "GOOG": "Alphabet", "GOOGL": "Alphabet",
+    "META": "Meta Platforms", "NVDA": "NVIDIA", "TSLA": "Tesla", "AVGO": "Broadcom", "JPM": "JPMorgan Chase",
+    "V": "Visa", "MA": "Mastercard", "KO": "Coca-Cola", "PEP": "PepsiCo", "JNJ": "Johnson & Johnson",
+    "LLY": "Eli Lilly", "PFE": "Pfizer", "MRK": "Merck", "ABBV": "AbbVie", "UNH": "UnitedHealth",
+    "HUM": "Humana", "WMT": "Walmart", "COST": "Costco", "HD": "Home Depot", "MCD": "McDonald's",
+    "NKE": "Nike", "DIS": "Disney", "NFLX": "Netflix", "INTC": "Intel", "AMD": "AMD", "MU": "Micron",
+    "QCOM": "Qualcomm", "TXN": "Texas Instruments", "IBM": "IBM", "ORCL": "Oracle", "CRM": "Salesforce",
+    "ADBE": "Adobe", "CSCO": "Cisco", "BA": "Boeing", "CAT": "Caterpillar", "GE": "GE Aerospace",
+    "LMT": "Lockheed Martin", "DE": "Deere", "UPS": "UPS", "XOM": "Exxon Mobil", "CVX": "Chevron",
+    "BAC": "Bank of America", "WFC": "Wells Fargo", "GS": "Goldman Sachs", "MS": "Morgan Stanley",
+    "C": "Citigroup", "PYPL": "PayPal", "BKNG": "Booking", "SBUX": "Starbucks", "T": "AT&T",
+    "VZ": "Verizon", "CMCSA": "Comcast", "INTU": "Intuit", "AMAT": "Applied Materials", "ADI": "Analog Devices",
+    "GILD": "Gilead", "AMGN": "Amgen", "BMY": "Bristol-Myers", "ADSK": "Autodesk", "GEV": "GE Vernova",
+    "RIO": "Rio Tinto", "BABA": "Alibaba", "FUTU": "Futu", "MAIN": "Main Street Capital", "CUBE": "CubeSmart",
+    "CL": "Colgate-Palmolive", "CBRL": "Cracker Barrel", "COPX": "Global X Copper ETF", "IEP": "Icahn Enterprises",
+}
+_HOUR_LABEL = {"bmo": "Before open", "amc": "After close", "dmh": "During market"}
+
+_earn_lock = threading.Lock()
+_earn_state = {"raw": [], "fetched": 0.0, "week_supp": {}}  # broad calendar cache + per-week supplement timestamps
+_fund = {}                                        # symbol -> {name, pe, consensus, color, t}
+_fund_lock = threading.Lock()
+_enrich_running = {"on": False}
+
+
+def _finnhub_get(path, params):
+    params = dict(params or {})
+    params["token"] = FINNHUB_KEY
+    url = FINNHUB_URL + path + "?" + urllib.parse.urlencode(params)
+    req = urllib.request.Request(url, headers={"User-Agent": "stock-watch"})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        return json.loads(r.read().decode())
+
+
+def fetch_earnings_calendar(dfrom, dto):
+    if not HAVE_EARNINGS:
+        return []
+    try:
+        data = _finnhub_get("/calendar/earnings", {"from": dfrom, "to": dto})
+        return data.get("earningsCalendar") or []
+    except Exception as e:
+        print(f"[EARN] calendar fetch failed: {str(e)[:140]}", flush=True)
+        return []
+
+
+def _refresh_earnings_raw(force=False):
+    """(Re)pull the broad earnings window. Finnhub only — no DB, safe off-hours."""
+    if not HAVE_EARNINGS:
+        return
+    now = time.monotonic()
+    with _earn_lock:
+        fresh = _earn_state["raw"] and (now - _earn_state["fetched"]) < EARNINGS_REFRESH_SECONDS
+    if fresh and not force:
+        return
+    today = datetime.now(ET).date()
+    dfrom = (today - timedelta(days=4)).strftime("%Y-%m-%d")
+    dto = (today + timedelta(days=14)).strftime("%Y-%m-%d")
+    rows = fetch_earnings_calendar(dfrom, dto)
+    if rows:
+        with _earn_lock:
+            _earn_state["raw"] = rows
+            _earn_state["fetched"] = now
+
+
+def _refresh_earnings_week(offset, force=False):
+    """Targeted Finnhub fetch for one specific week — supplements the broad
+    cache. Finnhub's free tier caps total rows and orders results by latest
+    date first, so a wide-range request truncates the earliest days off the
+    response entirely. Fetching each DAY individually gets complete data."""
+    if not HAVE_EARNINGS:
+        return
+    now = time.monotonic()
+    with _earn_lock:
+        last = _earn_state["week_supp"].get(offset, 0.0)
+    if not force and (now - last) < EARNINGS_REFRESH_SECONDS:
+        return
+    monday, sunday = _week_bounds(offset)
+    total_added = 0
+    day = monday
+    while day <= sunday:
+        d = day.strftime("%Y-%m-%d")
+        try:
+            supp = fetch_earnings_calendar(d, d)
+        except Exception as e:
+            print(f"[EARN] day {d} fetch failed: {str(e)[:120]}", flush=True)
+            supp = []
+        if supp:
+            with _earn_lock:
+                raw = list(_earn_state["raw"] or [])
+                seen = set((r.get("symbol"), r.get("date")) for r in raw)
+                for r in supp:
+                    key = (r.get("symbol"), r.get("date"))
+                    if key and key not in seen:
+                        raw.append(r)
+                        seen.add(key)
+                        total_added += 1
+                _earn_state["raw"] = raw
+        day += timedelta(days=1)
+    with _earn_lock:
+        _earn_state["week_supp"][offset] = now
+    if total_added:
+        print(f"[EARN] week {offset} per-day fetch added {total_added} rows "
+              f"({monday.isoformat()} → {sunday.isoformat()})", flush=True)
+
+
+def _week_bounds(offset):
+    today = datetime.now(ET).date()
+    monday = today - timedelta(days=today.weekday()) + timedelta(days=7 * offset)
+    return monday, monday + timedelta(days=6)
+
+
+def _rev_fmt(v):
+    if not v:
+        return None
+    a = abs(v)
+    if a >= 1e9:
+        return f"${v/1e9:.1f}B"
+    if a >= 1e6:
+        return f"${v/1e6:.0f}M"
+    return f"${v:,.0f}"
+
+
+def _consensus_label(r):
+    sb = r.get("strongBuy") or 0; b = r.get("buy") or 0; h = r.get("hold") or 0
+    s = r.get("sell") or 0; ss = r.get("strongSell") or 0
+    total = sb + b + h + s + ss
+    if not total:
+        return None, None
+    score = (1 * sb + 2 * b + 3 * h + 4 * s + 5 * ss) / total   # 1=Strong Buy .. 5=Strong Sell
+    if score <= 1.5:
+        return "Strong Buy", "green"
+    if score <= 2.4:
+        return "Buy", "green"
+    if score <= 2.9:
+        return "Moderate Buy", "amber"
+    if score <= 3.5:
+        return "Hold", "gray"
+    if score <= 4.5:
+        return "Sell", "red"
+    return "Strong Sell", "red"
+
+
+def _beat_history_score(sym):
+    """Cheap Grade + Beat% from Finnhub beat/miss history alone.
+    Matches Camila's conservative grading scale: no A's, B- caps big-cap
+    consistent-beat names, C+ for solid, C for mixed, C-/D for weak.
+    Also captures the most-recent report (for actuals swap after print)."""
+    try:
+        hist = _finnhub_get("/stock/earnings", {"symbol": sym, "limit": 4}) or []
+    except Exception:
+        return None
+    beats = 0
+    total = 0
+    for h in hist[:4]:
+        act, est = h.get("actual"), h.get("estimate")
+        if act is None or est is None:
+            continue
+        total += 1
+        if act > est:
+            beats += 1
+    # Capture the latest report — used to detect "already reported" rows.
+    # Finnhub populates .actual within hours of a print.
+    latest = None
+    if hist:
+        h0 = hist[0]  # most-recent quarter
+        if h0.get("actual") is not None and h0.get("date"):
+            act = h0["actual"]
+            est = h0.get("estimate")
+            surprise_pct = None
+            if est is not None and est != 0:
+                surprise_pct = ((act - est) / abs(est)) * 100.0
+            latest = {
+                "date": h0["date"],
+                "actual": act,
+                "estimate": est,
+                "surprise_pct": surprise_pct,
+            }
+    out = {"latest_report": latest}
+    if total == 0:
+        out["grade"] = None
+        out["beat"]  = None
+        return out
+    ratio = beats / total
+    if ratio >= 0.95:   out["grade"], out["beat"] = "B-", 70
+    elif ratio >= 0.70: out["grade"], out["beat"] = "C+", 65
+    elif ratio >= 0.45: out["grade"], out["beat"] = "C",  55
+    elif ratio >= 0.20: out["grade"], out["beat"] = "C-", 50
+    else:               out["grade"], out["beat"] = "D",  35
+    return out
+
+
+def _actual_grade(surprise_pct):
+    """Grade a REPORTED print based on EPS surprise vs consensus.
+    Unlike the predicted scale (which caps at B-), actuals can earn A
+    since the outcome is factual, not probabilistic."""
+    if surprise_pct is None:
+        return "B"  # reported but surprise unmeasurable — treat as neutral
+    if surprise_pct >= 10:  return "A"
+    if surprise_pct >= 5:   return "A-"
+    if surprise_pct >= 2:   return "B+"
+    if surprise_pct >= 0:   return "B"
+    if surprise_pct >= -2:  return "C+"
+    if surprise_pct >= -5:  return "C"
+    if surprise_pct >= -10: return "C-"
+    return "D"
+
+
+def _reported_watch(rep):
+    """Short 'REPORTED' narrative for the What to Watch cell."""
+    act = rep.get("actual")
+    est = rep.get("estimate")
+    pct = rep.get("surprise_pct")
+    if act is None:
+        return "REPORTED"
+    if est is not None:
+        verdict = "Beat" if act > est else ("Miss" if act < est else "In line")
+        tail = f" ({pct:+.1f}%)" if pct is not None else ""
+        return f"REPORTED · {verdict} — EPS ${act:.2f} vs ${est:.2f} est{tail}"
+    return f"REPORTED · EPS ${act:.2f}"
+
+
+def _prob_to_grade(p):
+    """Convert a SimuCal probability (10-90) to Camila's letter-grade scale."""
+    try:
+        p = float(p)
+    except Exception:
+        return "C"
+    if p >= 80: return "A"
+    if p >= 72: return "A-"
+    if p >= 66: return "B+"
+    if p >= 60: return "B"
+    if p >= 54: return "B-"
+    if p >= 48: return "C+"
+    if p >= 42: return "C"
+    if p >= 35: return "C-"
+    return "D"
+
+
+_simucal_running = {"on": False}
+
+
+def _start_simucal_for_watchlist(symbols):
+    """Run full SimuCal (Claude + web_search) on any of these symbols that are
+    in DEFAULT_WATCHLIST or any user's watchlist. Fills sc_grade / sc_beat /
+    sc_watch on _fund[sym] so the Earnings tab shows them.
+    Set env var SIMUCAL_AUTO=0 to disable this background auto-firing while
+    keeping the manual SimuCal tab fully functional."""
+    if os.environ.get("SIMUCAL_AUTO", "1").lower() in ("0", "false", "no", "off"):
+        return
+    if not HAVE_SIMUCAL or not HAVE_EARNINGS or not symbols:
+        return
+    watchlist = set(DEFAULT_WATCHLIST)
+    try:
+        watchlist |= set(all_user_symbols())
+    except Exception:
+        pass
+    targets = [s for s in symbols if s in watchlist]
+    if not targets:
+        return
+    with _fund_lock:
+        if _simucal_running["on"]:
+            return
+        _simucal_running["on"] = True
+
+    def run():
+        try:
+            today = datetime.now(ET).date().isoformat()
+            for sym in targets:
+                with _fund_lock:
+                    f = _fund.get(sym) or {}
+                if f.get("sc_t") and (time.monotonic() - f["sc_t"]) < 20 * 3600:
+                    continue
+                data = None
+                try:
+                    data = simucal_cache_get(sym, today)
+                except Exception:
+                    pass
+                if not data:
+                    try:
+                        cap = int(os.environ.get("SIMUCAL_MAX_PER_DAY", "20"))
+                    except Exception:
+                        cap = 20
+                    if simucal_usage_count_today() >= cap:
+                        print(f"[SIMUCAL-AUTO] daily cap of {cap} reached, skipping {sym}", flush=True)
+                        break
+                    try:
+                        data = simucal_research(sym)
+                        simucal_cache_put(sym, today, data)
+                        simucal_usage_log(1, sym)
+                    except Exception as e:
+                        print(f"[SIMUCAL-AUTO] {sym} failed: {str(e)[:120]}", flush=True)
+                        continue
+                prob = int(data.get("prob") or 50)
+                verdict = data.get("verdict") or ""
+                watch = ""
+                if isinstance(data.get("rubric"), list) and len(data["rubric"]) >= 6:
+                    r = data["rubric"][5]
+                    watch = f"{r[0]}: {r[2]}"
+                watch = f"SimuCal v5.0 \u00b7 {verdict} ({prob}%). {watch}".strip()
+                with _fund_lock:
+                    cur = _fund.get(sym) or {}
+                    cur["sc_grade"] = _prob_to_grade(prob)
+                    cur["sc_beat"]  = prob
+                    cur["sc_watch"] = watch
+                    cur["sc_t"]     = time.monotonic()
+                    _fund[sym] = cur
+                time.sleep(1.0)
+        finally:
+            with _fund_lock:
+                _simucal_running["on"] = False
+
+    threading.Thread(target=run, daemon=True).start()
+
+
+def _enrich_symbol(sym):
+    name = pe = consensus = color = None
+    try:
+        name = (_finnhub_get("/stock/profile2", {"symbol": sym}) or {}).get("name") or None
+    except Exception:
+        pass
+    time.sleep(0.4)
+    try:
+        m = (_finnhub_get("/stock/metric", {"symbol": sym, "metric": "all"}) or {}).get("metric") or {}
+        raw_pe = m.get("peTTM")
+        if raw_pe is None:
+            raw_pe = m.get("peBasicExclExtraTTM")
+        if raw_pe is not None:
+            pe = round(float(raw_pe), 1)
+    except Exception:
+        pass
+    time.sleep(0.4)
+    try:
+        rec = _finnhub_get("/stock/recommendation", {"symbol": sym})
+        if isinstance(rec, list) and rec:
+            consensus, color = _consensus_label(rec[0])
+    except Exception:
+        pass
+    time.sleep(0.4)
+    auto = _beat_history_score(sym)
+    with _fund_lock:
+        cur = _fund.get(sym) or {}
+        cur["name"]       = name or cur.get("name")
+        cur["pe"]         = pe if pe is not None else cur.get("pe")
+        cur["consensus"]  = consensus or cur.get("consensus")
+        cur["color"]      = color or cur.get("color")
+        cur["auto_grade"]    = (auto or {}).get("grade") or cur.get("auto_grade")
+        cur["auto_beat"]     = (auto or {}).get("beat")  or cur.get("auto_beat")
+        cur["latest_report"] = (auto or {}).get("latest_report") or cur.get("latest_report")
+        cur["t"]          = time.monotonic()
+        _fund[sym] = cur
+
+
+def _start_enrichment(symbols):
+    if not HAVE_EARNINGS or not symbols:
+        return
+    with _fund_lock:
+        if _enrich_running["on"]:
+            return
+        _enrich_running["on"] = True
+    syms = list(symbols)
+
+    def run():
+        try:
+            for sym in syms:
+                with _fund_lock:
+                    f = _fund.get(sym)
+                if f and (time.monotonic() - f.get("t", 0)) < 20 * 3600:
+                    continue
+                _enrich_symbol(sym)
+                time.sleep(0.6)
+        finally:
+            with _fund_lock:
+                _enrich_running["on"] = False
+    threading.Thread(target=run, daemon=True).start()
+
+
+def earnings_week_rows(offset=0):
+    """Curated notable earnings for the week (offset weeks from this one)."""
+    _refresh_earnings_raw()
+    _refresh_earnings_week(offset)  # ensure this week's data is complete (works around free-tier truncation)
+    with _earn_lock:
+        raw = list(_earn_state["raw"])
+    monday, sunday = _week_bounds(offset)
+    # For the current week only, hide days that have already passed — earnings
+    # are graded upcoming, not past. Prev-week views stay complete for review.
+    today = datetime.now(ET).date()
+    effective_start = max(monday, today) if offset == 0 else monday
+    ms, ss = effective_start.strftime("%Y-%m-%d"), sunday.strftime("%Y-%m-%d")
+    notable = set(BIG_NAME_TICKERS)
+    notable |= set(DEFAULT_WATCHLIST)
+    try:
+        notable |= set(all_user_symbols())
+    except Exception:
+        pass
+    # Escape hatch: EARN_SHOW_ALL=1 shows everything Finnhub returned (bypasses
+    # the whitelist). Off by default — the curated list keeps the tab focused.
+    if os.environ.get("EARN_SHOW_ALL", "").lower() in ("1", "true", "yes"):
+        for e in raw:
+            if e.get("symbol"):
+                notable.add(e["symbol"])
+    best = {}
+    for e in raw:
+        d = e.get("date"); sym = e.get("symbol")
+        if not d or not sym or d < ms or d > ss or sym not in notable:
+            continue
+        if sym in best and (e.get("revenueEstimate") or 0) <= (best[sym].get("revenueEstimate") or 0):
+            continue
+        best[sym] = e
+    rows = []
+    for sym, e in best.items():
+        with _fund_lock:
+            f = dict(_fund.get(sym) or {})
+        yr, q = e.get("year"), e.get("quarter")
+        period = f"{yr}Q{q}" if yr and q else (e.get("date") or sym)
+        rows.append({
+            "symbol": sym,
+            "company": f.get("name") or _EARN_NAME_HINT.get(sym) or sym,
+            "date": e.get("date"),
+            "when": _HOUR_LABEL.get((e.get("hour") or "").lower(), ""),
+            "eps_est": e.get("epsEstimate"),
+            "rev_est": _rev_fmt(e.get("revenueEstimate")),
+            "_rev": e.get("revenueEstimate") or 0,
+            "pe": f.get("pe"),
+            "consensus": f.get("consensus"),
+            "consensus_color": f.get("color"),
+            "auto_grade": f.get("auto_grade"),
+            "auto_beat":  f.get("auto_beat"),
+            "sc_grade":   f.get("sc_grade"),
+            "sc_beat":    f.get("sc_beat"),
+            "sc_watch":   f.get("sc_watch"),
+            # If Finnhub's most-recent report matches this earnings date and has
+            # .actual populated, the company already reported → actuals swap.
+            "reported":   ((f.get("latest_report") or {}) if
+                           (f.get("latest_report") or {}).get("date") == e.get("date")
+                           else None),
+            "period": period,
+        })
+    rows.sort(key=lambda r: (r["date"] or "9999-99-99", -r["_rev"]))
+    rows = rows[:EARN_MAX_ROWS]
+    syms_out = [r["symbol"] for r in rows]
+    _start_enrichment(syms_out)
+    _start_simucal_for_watchlist(syms_out)
+    return rows, (ms, ss)
+
+
+def earnings_badges(symbols):
+    """symbol -> {date, days, when} for its next report. Reads cache only (no fetch)."""
+    if not HAVE_EARNINGS or not symbols:
+        return {}
+    with _earn_lock:
+        raw = list(_earn_state["raw"])
+    if not raw:
+        return {}
+    today = datetime.now(ET).date()
+    tstr = today.strftime("%Y-%m-%d")
+    want = set(symbols)
+    best = {}
+    for e in raw:
+        sym = e.get("symbol"); d = e.get("date")
+        if sym not in want or not d or d < tstr:
+            continue
+        if sym not in best or d < best[sym]["date"]:
+            try:
+                days = (datetime.strptime(d, "%Y-%m-%d").date() - today).days
+            except Exception:
+                days = None
+            best[sym] = {"date": d, "days": days, "when": _HOUR_LABEL.get((e.get("hour") or "").lower(), "")}
+    return best
+
+
+def get_earn_notes(uid):
+    conn, kind = _db()
+    try:
+        cur = conn.cursor()
+        cur.execute(_ph("SELECT symbol, period, grade, beat, watch, gold FROM earnings_notes WHERE user_id=%s", kind), (uid,))
+        out = {}
+        for r in cur.fetchall():
+            out[(r[0], r[1])] = {"grade": r[2], "beat": r[3], "watch": r[4], "gold": bool(r[5])}
+        return out
+    finally:
+        conn.close()
+
+
+def save_earn_note(uid, symbol, period, grade, beat, watch, gold):
+    conn, kind = _db()
+    try:
+        cur = conn.cursor()
+        g = 1 if gold else 0
+        if kind == "pg":
+            cur.execute("""INSERT INTO earnings_notes(user_id, symbol, period, grade, beat, watch, gold)
+                           VALUES(%s,%s,%s,%s,%s,%s,%s)
+                           ON CONFLICT (user_id, symbol, period) DO UPDATE SET
+                             grade=EXCLUDED.grade, beat=EXCLUDED.beat,
+                             watch=EXCLUDED.watch, gold=EXCLUDED.gold""",
+                        (uid, symbol, period, grade, beat, watch, g))
+        else:
+            cur.execute("""INSERT OR REPLACE INTO earnings_notes(user_id, symbol, period, grade, beat, watch, gold)
+                           VALUES(?,?,?,?,?,?,?)""", (uid, symbol, period, grade, beat, watch, g))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+# ============================ SIMUCAL ==============================
+# v5.0 anchored-rubric earnings-beat probability calculator. Finnhub
+# pre-fills the objective columns (date, consensus, beat history) so
+# Claude focuses its web_search budget on the judgment factors.
+
+SIMUCAL_RUBRIC_SPEC = """
+The v5.0 anchored rubric scores 6 categories from 0-10:
+1. Recent beat streak (last 4 quarters of EPS beats/misses)
+2. Estimate revisions (90d) (are analysts raising or cutting into the print?)
+3. Demand backdrop (top-line demand trends, comps, category dynamics)
+4. Margin/cost setup (input costs, mix, opex, one-timers)
+5. Guide cushion (is management guide below/above/at Street?)
+6. Sector-specific factor (FX, tariffs, spring season, capex cycle, or
+   whatever is the swing variable for THIS name)
+
+Translate to a beat probability (0-100):
+- Sum the 6 scores (max 60). 30 = ~50%, every +2 pts = ~+5%.
+- Cap at 90%, floor at 10%.
+- Verdict labels: 65+ = "Beat likely", 55-64 = "Slight beat lean",
+  45-54 = "Toss-up", 35-44 = "Slight miss lean", <35 = "Miss tilt".
+"""
+
+
+def _extract_json(text):
+    """Pull the first {...} JSON object out of a text blob."""
+    if not text:
+        raise ValueError("empty response")
+    text = re.sub(r"```json\s*|\s*```", "", text)
+    m = re.search(r"\{[\s\S]*\}", text)
+    if not m:
+        raise ValueError("no JSON object found")
+    return json.loads(m.group(0))
+
+
+def simucal_prefill(sym):
+    """Pull the objective columns from Finnhub so Claude doesn't have to search
+    for what we already know. Returns dict with next-earnings metadata + a
+    normalised period key ({year}Q{quarter}) that matches earnings_notes."""
+    out = {"symbol": sym, "period": "", "date": "", "hour": "", "eps": None,
+           "rev": None, "beat_history": "", "prev_actual": None,
+           "prev_estimate": None}
+    if not HAVE_EARNINGS:
+        return out
+
+    today = datetime.now(ET).date()
+    try:
+        rows = fetch_earnings_calendar(today.isoformat(),
+                                        (today + timedelta(days=120)).isoformat())
+    except Exception:
+        rows = []
+    upcoming = [r for r in rows if (r.get("symbol") or "").upper() == sym]
+    upcoming.sort(key=lambda r: r.get("date") or "")
+    if upcoming:
+        e = upcoming[0]
+        yr, q = e.get("year"), e.get("quarter")
+        out["period"] = f"{yr}Q{q}" if yr and q else (e.get("date") or sym)
+        out["date"] = e.get("date") or ""
+        out["hour"] = e.get("hour") or ""  # 'bmo', 'amc', 'dmh'
+        out["eps"] = e.get("epsEstimate")
+        out["rev"] = e.get("revenueEstimate")
+
+    try:
+        hist = _finnhub_get("/stock/earnings", {"symbol": sym, "limit": 4}) or []
+    except Exception:
+        hist = []
+    beats = 0
+    total = 0
+    for h in hist[:4]:
+        act, est = h.get("actual"), h.get("estimate")
+        if act is None or est is None:
+            continue
+        total += 1
+        if act > est:
+            beats += 1
+    out["beat_history"] = f"{beats} / {total}" if total else ""
+    if hist:
+        out["prev_actual"] = hist[0].get("actual")
+        out["prev_estimate"] = hist[0].get("estimate")
+    return out
+
+
+def simucal_research(symbol):
+    """Call the Anthropic API with web_search enabled and parse the rubric JSON."""
+    if not HAVE_SIMUCAL:
+        raise RuntimeError("ANTHROPIC_API_KEY not set on the server.")
+    sym = (symbol or "").strip().upper()
+    if not sym or not re.match(r"^[A-Z][A-Z0-9\.\-]{0,9}$", sym):
+        raise ValueError("Invalid ticker.")
+
+    pre = simucal_prefill(sym)
+    hour_label = {"bmo": "pre-market", "amc": "after-close",
+                  "dmh": "during-hours"}.get((pre.get("hour") or "").lower(), "")
+
+    context_block = ""
+    if pre.get("date"):
+        context_block = (
+            "\nObjective metrics already retrieved from Finnhub — use these "
+            "verbatim in the JSON, do NOT re-search for them:\n"
+            + f"- Next report date: {pre['date']}"
+            + (f" ({hour_label})" if hour_label else "") + "\n"
+            + (f"- Consensus EPS: ${pre['eps']}\n" if pre.get('eps') is not None else "")
+            + (f"- Consensus revenue: ${pre['rev']:,.0f}\n" if pre.get('rev') else "")
+            + (f"- Beat rate (last 4Q): {pre['beat_history']}\n" if pre.get('beat_history') else "")
+            + (f"- Most recent quarter: actual ${pre['prev_actual']} vs est ${pre['prev_estimate']}\n"
+               if pre.get('prev_actual') is not None else "")
+            + "\nFocus your web search on: 90-day estimate revisions, "
+            "demand backdrop, margin/cost setup, guide cushion, and the "
+            "sector-specific swing factor for THIS name.\n"
+        )
+
+    prompt = (
+        "You are the v5.0 Earnings-Beat Probability Calculator. Research ticker "
+        + sym + " for its NEXT upcoming earnings report and return ONLY a JSON "
+        "object with no preamble, no markdown fences.\n"
+        + context_block +
+        SIMUCAL_RUBRIC_SPEC +
+        "\n\nReturn this exact JSON structure:\n\n"
+        "{\n"
+        '  "name": "Company Name",\n'
+        '  "date": "Month DD, YYYY (pre-market or after-close)",\n'
+        '  "eps": "$X.XX",\n'
+        '  "rev": "$XX.XB",\n'
+        '  "beat": "X / 4",\n'
+        '  "prob": <integer 10-90>,\n'
+        '  "verdict": "Beat likely" | "Slight beat lean" | "Toss-up" | "Slight miss lean" | "Miss tilt",\n'
+        '  "rubric": [\n'
+        '    ["Recent beat streak", <0-10>, "one-line evidence"],\n'
+        '    ["Estimate revisions (90d)", <0-10>, "one-line evidence"],\n'
+        '    ["Demand backdrop", <0-10>, "one-line evidence"],\n'
+        '    ["Margin/cost setup", <0-10>, "one-line evidence"],\n'
+        '    ["Guide cushion", <0-10>, "one-line evidence"],\n'
+        '    ["<sector-specific factor>", <0-10>, "one-line evidence"]\n'
+        '  ],\n'
+        '  "foot": "Sources: <2-3 real sources you found>."\n'
+        "}\n\n"
+        "Ticker: " + sym
+    )
+
+    payload = {
+        "model": ANTHROPIC_MODEL,
+        "max_tokens": 2000,
+        "messages": [{"role": "user", "content": prompt}],
+        "tools": [{"type": "web_search_20250305", "name": "web_search"}],
+    }
+    req = urllib.request.Request(
+        ANTHROPIC_URL,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "x-api-key": ANTHROPIC_API_KEY,
+            "anthropic-version": ANTHROPIC_VERSION,
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=SIMUCAL_TIMEOUT) as resp:
+            raw = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", "ignore")[:200]
+        raise RuntimeError(f"Anthropic API {e.code}: {body}")
+
+    text = "\n".join(
+        b.get("text", "") for b in (raw.get("content") or [])
+        if isinstance(b, dict) and b.get("type") == "text"
+    )
+    data = _extract_json(text)
+
+    for k in ("name", "date", "eps", "rev", "beat", "prob", "verdict", "rubric", "foot"):
+        if k not in data:
+            raise ValueError(f"missing field: {k}")
+    try:
+        data["prob"] = max(10, min(90, int(round(float(data["prob"])))))
+    except Exception:
+        raise ValueError("bad prob value")
+    if not isinstance(data["rubric"], list) or len(data["rubric"]) != 6:
+        raise ValueError("rubric must be 6 rows")
+
+    data["symbol"] = sym
+    data["period"] = pre.get("period") or ""
+    # 8-quarter earnings history (used by SimuCal basket export → Quarterly History sheet)
+    history = []
+    if HAVE_EARNINGS:
+        try:
+            hist_raw = _finnhub_get("/stock/earnings", {"symbol": sym, "limit": 8}) or []
+        except Exception:
+            hist_raw = []
+        for h in hist_raw:
+            act = h.get("actual"); est = h.get("estimate")
+            yr = h.get("year"); q = h.get("quarter")
+            if act is None or est is None or not yr or not q:
+                continue
+            history.append({
+                "quarter": f"Q{q} {yr}",
+                "estimate": est,
+                "actual": act,
+                "result": "Beat" if act > est else ("Miss" if act < est else "In line"),
+            })
+    data["earnings_history"] = history
+    return data
+
+
+def _simucal_build_xlsx(basket):
+    """Build a 2-sheet workbook matching Camila's Earnings_Beat_Probability.xlsx
+    template. Sheet 1 = summary table + notes. Sheet 2 = per-ticker quarterly
+    history in horizontal 4-column blocks with a blank spacer between each.
+    Returns raw bytes."""
+    try:
+        import openpyxl
+        from openpyxl.styles import Font, PatternFill, Alignment
+    except ImportError:
+        raise RuntimeError("openpyxl not installed on server. Add 'openpyxl' to requirements.txt and redeploy.")
+
+    HDR_FILL = PatternFill("solid", fgColor="FF1F4E78")
+    HDR_FONT = Font(name="Arial", size=10, bold=True, color="FFFFFFFF")
+    TITLE_FONT = Font(name="Arial", size=13, bold=True, color="FF1F4E78")
+    NOTE_FONT  = Font(name="Arial", size=9, italic=True, color="FF595959")
+    SIG_HIGH_FILL = PatternFill("solid", fgColor="FFDCFCE7")
+    SIG_MOD_FILL  = PatternFill("solid", fgColor="FFFFF3C4")
+    SIG_LOW_FILL  = PatternFill("solid", fgColor="FFFCE7E7")
+    BEAT_FONT     = Font(name="Arial", size=10, color="FF166534", bold=True)
+    MISS_FONT     = Font(name="Arial", size=10, color="FF991B1B", bold=True)
+    SEC_FILL      = PatternFill("solid", fgColor="FFF3F4F6")
+
+    CENTER = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    LEFT   = Alignment(horizontal="left",   vertical="center", wrap_text=True)
+
+    def signal(prob):
+        try:
+            p = float(prob)
+        except Exception:
+            return "Low"
+        if p >= 70: return "High"
+        if p >= 55: return "Moderate"
+        return "Low"
+
+    def beat_decimal(beat_str):
+        m = re.match(r"^\s*(\d+)\s*/\s*(\d+)\s*$", str(beat_str or ""))
+        if not m: return None
+        n, d = int(m.group(1)), int(m.group(2))
+        return (n / d) if d else None
+
+    def eps_num(eps_str):
+        m = re.search(r"-?\d+(\.\d+)?", str(eps_str or ""))
+        return float(m.group(0)) if m else None
+
+    def short_date(d):
+        return str(d or "").split(" (")[0]
+
+    tickers_str = ", ".join((b.get("symbol") or "") for b in basket)
+    today_str = datetime.now(ET).strftime("%b %d, %Y")
+
+    wb = openpyxl.Workbook()
+
+    # ---------- Sheet 1: Beat Probability ----------
+    ws = wb.active
+    ws.title = "Beat Probability"
+    ws["A1"] = f"Earnings Beat Probability — {tickers_str}"
+    ws["A1"].font = TITLE_FONT
+    ws.merge_cells("A1:J1")
+    ws["A2"] = "Estimated likelihood of beating consensus EPS at the next earnings report"
+    ws["A2"].font = NOTE_FONT
+    ws.merge_cells("A2:J2")
+    ws["A3"] = f"Prepared: {today_str}"
+    ws["A3"].font = NOTE_FONT
+    ws.merge_cells("A3:J3")
+
+    headers = ["Ticker","Company","Next Earnings\nDate","Consensus EPS\nEstimate",
+               "Beats (last\n8 qtrs)","Historical\nBeat Rate","Zacks\nEarnings ESP",
+               "Zacks\nRank","Estimated Beat\nProbability","Signal"]
+    for i, h in enumerate(headers, start=1):
+        c = ws.cell(row=5, column=i, value=h)
+        c.font = HDR_FONT; c.fill = HDR_FILL; c.alignment = CENTER
+    ws.row_dimensions[5].height = 30
+
+    widths = {"A":9,"B":22,"C":15,"D":13,"E":11,"F":11,"G":11,"H":11,"I":13,"J":11}
+    for col, w in widths.items():
+        ws.column_dimensions[col].width = w
+
+    row = 6
+    for b in basket:
+        prob = int(b.get("prob") or 0)
+        sig = signal(prob)
+        hist = b.get("earnings_history") or []
+        beats_n = sum(1 for h in hist if h.get("result") == "Beat")
+        beats_txt = f"{beats_n} of {len(hist)}" if hist else str(b.get("beat","")).replace("/", "of")
+        hist_rate = (beats_n / len(hist)) if hist else beat_decimal(b.get("beat"))
+        cells = [
+            b.get("symbol",""),
+            b.get("name",""),
+            short_date(b.get("date","")),
+            eps_num(b.get("eps","")),
+            beats_txt,
+            hist_rate,
+            "",  # Zacks ESP — SimuCal doesn't produce
+            "",  # Zacks Rank — SimuCal doesn't produce
+            prob / 100.0,
+            sig,
+        ]
+        for i, v in enumerate(cells, start=1):
+            c = ws.cell(row=row, column=i, value=v)
+            c.alignment = CENTER if i != 2 else LEFT
+        # Signal cell fill
+        sig_cell = ws.cell(row=row, column=10)
+        sig_cell.fill = {"High": SIG_HIGH_FILL, "Moderate": SIG_MOD_FILL, "Low": SIG_LOW_FILL}[sig]
+        sig_cell.font = Font(name="Arial", size=10, bold=True)
+        # Rate and probability formatted as decimals
+        if hist_rate is not None:
+            ws.cell(row=row, column=6).number_format = "0.00"
+        ws.cell(row=row, column=9).number_format = "0.00"
+        if cells[3] is not None:
+            ws.cell(row=row, column=4).number_format = "0.00"
+        row += 1
+    row += 1
+
+    # Explanatory footer
+    ws.cell(row=row, column=1, value="How the probability is estimated").font = Font(name="Arial", size=10, bold=True)
+    ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=10)
+    row += 1
+    for note in [
+        "• SimuCal v5.0 anchored rubric: 6 factors scored 0-10 each — beat streak, 90d estimate revisions, demand backdrop, margin/cost setup, guide cushion, sector-specific factor.",
+        "• Historical Beat Rate = share of the last N reported quarters that beat consensus EPS.",
+        "• Signal maps directly from probability: ≥70% = High, 55–69% = Moderate, <55% = Low.",
+        "• Zacks Earnings ESP and Zacks Rank columns are blank — SimuCal doesn't compute those proprietary metrics. Fill in manually if you use them.",
+        "• Directional estimates from Claude research + web search — NOT guarantees. Actual results depend on guidance, macro conditions, and one-off items. Not investment advice.",
+    ]:
+        c = ws.cell(row=row, column=1, value=note)
+        c.font = NOTE_FONT
+        c.alignment = LEFT
+        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=10)
+        row += 1
+
+    ws.freeze_panes = "A6"
+
+    # ---------- Sheet 2: Quarterly History ----------
+    ws2 = wb.create_sheet("Quarterly History")
+    ws2["A1"] = "EPS: Actual vs. Estimate — last several quarters"
+    ws2["A1"].font = TITLE_FONT
+    ws2.merge_cells("A1:R1")
+
+    # Horizontal blocks: 4 cols per ticker + 1 spacer between
+    for idx, b in enumerate(basket):
+        block_start = 1 + idx * 5  # col 1, 6, 11, 16, ...
+        # Ticker header on row 3
+        header_txt = f"{b.get('symbol','')} ({b.get('name','')})"
+        hc = ws2.cell(row=3, column=block_start, value=header_txt)
+        hc.font = Font(name="Arial", size=11, bold=True, color="FF1F4E78")
+        hc.fill = SEC_FILL
+        ws2.merge_cells(start_row=3, start_column=block_start, end_row=3, end_column=block_start+3)
+        # Column subheaders on row 4
+        for j, sub in enumerate(["Quarter","Est.","Actual","Result"]):
+            c = ws2.cell(row=4, column=block_start+j, value=sub)
+            c.font = HDR_FONT; c.fill = HDR_FILL; c.alignment = CENTER
+        # Data rows starting row 5
+        hist = b.get("earnings_history") or []
+        beat_ct = 0
+        for i, h in enumerate(hist):
+            r = 5 + i
+            ws2.cell(row=r, column=block_start,   value=h.get("quarter",""))
+            ws2.cell(row=r, column=block_start+1, value=h.get("estimate"))
+            ws2.cell(row=r, column=block_start+2, value=h.get("actual"))
+            res_cell = ws2.cell(row=r, column=block_start+3, value=h.get("result",""))
+            if h.get("result") == "Beat":
+                res_cell.font = BEAT_FONT
+                beat_ct += 1
+            elif h.get("result") == "Miss":
+                res_cell.font = MISS_FONT
+            for j in range(4):
+                cell = ws2.cell(row=r, column=block_start+j)
+                cell.alignment = CENTER
+                if j in (1, 2):
+                    cell.number_format = "0.00"
+        # Summary row
+        summary_row = 5 + len(hist) + 1
+        sc = ws2.cell(row=summary_row, column=block_start, value="Beats:")
+        sc.font = Font(name="Arial", size=10, bold=True)
+        val = ws2.cell(row=summary_row, column=block_start+1,
+                       value=f"{beat_ct} of {len(hist)}" if hist else "no data")
+        val.font = Font(name="Arial", size=10, bold=True)
+        ws2.merge_cells(start_row=summary_row, start_column=block_start+1,
+                        end_row=summary_row, end_column=block_start+3)
+        # Column widths for this block
+        for j, w in enumerate([13, 8, 8, 9]):
+            ws2.column_dimensions[openpyxl.utils.get_column_letter(block_start+j)].width = w
+        if idx < len(basket) - 1:
+            ws2.column_dimensions[openpyxl.utils.get_column_letter(block_start+4)].width = 3
+
+    ws2.freeze_panes = "A5"
+    ws2.row_dimensions[3].height = 22
+
+    # Serialize to bytes
+    import io
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def simucal_cache_get(sym, day):
+    conn, kind = _db()
+    try:
+        cur = conn.cursor()
+        cur.execute(_ph("SELECT data_json FROM simucal_cache WHERE symbol=%s AND day=%s", kind),
+                    (sym, day))
+        row = cur.fetchone()
+        return json.loads(row[0]) if row else None
+    finally:
+        conn.close()
+
+
+def simucal_usage_count_today():
+    """How many uncached SimuCal calls have been made today. Cheap guard."""
+    conn, kind = _db()
+    try:
+        cur = conn.cursor()
+        today = datetime.now(ET).date().isoformat()
+        cur.execute(_ph("SELECT COUNT(*) FROM simucal_usage WHERE day=%s", kind), (today,))
+        row = cur.fetchone()
+        return int(row[0]) if row else 0
+    finally:
+        conn.close()
+
+
+def simucal_cache_put(sym, day, data):
+    conn, kind = _db()
+    try:
+        cur = conn.cursor()
+        now = datetime.now(timezone.utc).isoformat()
+        payload = json.dumps(data)
+        if kind == "pg":
+            cur.execute("""INSERT INTO simucal_cache(symbol, day, data_json, updated_at)
+                           VALUES(%s,%s,%s,%s)
+                           ON CONFLICT (symbol, day) DO UPDATE SET
+                             data_json=EXCLUDED.data_json, updated_at=EXCLUDED.updated_at""",
+                        (sym, day, payload, now))
+        else:
+            cur.execute("""INSERT OR REPLACE INTO simucal_cache(symbol, day, data_json, updated_at)
+                           VALUES(?,?,?,?)""", (sym, day, payload, now))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def simucal_usage_log(uid, sym):
+    conn, kind = _db()
+    try:
+        cur = conn.cursor()
+        now = datetime.now(ET)
+        cur.execute(_ph("""INSERT INTO simucal_usage(day, user_id, symbol, ts)
+                           VALUES(%s,%s,%s,%s)""", kind),
+                    (now.date().isoformat(), uid, sym, now.strftime("%H:%M:%S")))
+        conn.commit()
+    except Exception:
+        pass
+    finally:
+        conn.close()
+
+
+def refresher():
+    """Background loop.
+
+    Only contacts the database while the market is in an alerting session
+    (pre-market / regular hours). Outside those hours it sleeps WITHOUT making
+    any DB calls, so Neon's free-tier compute can auto-suspend overnight, on
+    weekends and on holidays. That idle time is what keeps usage under quota.
+    """
+    cached_syms = []
+    last_syms_fetch = 0.0
+    last_daily_save = None   # date string of the last persisted daily snapshot
+    while True:
+        now = datetime.now(ET)
+        # Keep the earnings calendar warm even off-hours (Finnhub only, no DB),
+        # so watchlist cards can show "reports in N days" any time of day.
+        try:
+            _refresh_earnings_raw()
+        except Exception:
+            pass
+        # Active only during the sessions we actually alert in. Otherwise stay
+        # idle and make NO database calls, letting the DB endpoint suspend.
+        if session_label(now) not in ALERT_SESSIONS:
+            time.sleep(IDLE_SLEEP_SECONDS)
+            continue
+        try:
+            # Re-read the watchlist from the DB occasionally, not every cycle.
+            mono = time.monotonic()
+            if not cached_syms or (mono - last_syms_fetch) > SYMS_REFRESH_SECONDS:
+                try:
+                    cached_syms = sorted(set(all_user_symbols()))
+                    last_syms_fetch = mono
+                except Exception:
+                    pass
+            refresh_symbols(cached_syms)
+            try:
+                record_history()      # in-memory only, no DB
+            except Exception:
+                pass
+            # Persist the daily snapshot once near the close, not every minute.
+            day = now.strftime("%Y-%m-%d")
+            if (now.hour == DAILY_SAVE_HOUR and now.minute >= DAILY_SAVE_MINUTE
+                    and last_daily_save != day):
+                try:
+                    record_daily_all()
+                    last_daily_save = day
+                except Exception:
+                    pass
+            try:
+                record_alarms()
+            except Exception:
+                pass
+            try:
+                alert_check()
+            except Exception as e:
+                print(f"  (alert_check error: {e})", flush=True)
+        except Exception:
+            pass
+        time.sleep(REFRESH_SECONDS)
+
+
+# ========================= MORNING UPDATE =========================
+# Grandpa's daily pre-market sheet ("JT My Portfolio Pre-Market Price for
+# <Day Month DD YYYY>.xlsx"). Built once each weekday morning at
+# MORNING_TIME_CT (Central), emailed to MORNING_EMAIL_TO, and downloadable from
+# the ☀️ Morning tab.
+#   Prices  : Alpaca snapshots (last close + latest pre-market trade).
+#   Columns : News / Risk Alert, Ex-Div Date, Earnings Date — written by Claude
+#             with web_search, a few tickers per call, once per day (cached).
+#
+#   export MORNING_EMAIL_TO="grandpa@example.com,me@example.com"
+#   export MORNING_TIME_CT="05:30"        (24h, Central time; weekdays only)
+#   export MORNING_AI=1                   (0 = prices only, no Claude cost)
+#   export MORNING_KEY=<random string>    (optional: lets an outside cron hit
+#                                          /api/morning/cron?key=... to wake
+#                                          the server and run the job)
+CT = ZoneInfo("America/Chicago")
+MORNING_EMAIL_TO = [e.strip() for e in os.environ.get("MORNING_EMAIL_TO", "").split(",") if e.strip()]
+MORNING_TIME_CT  = os.environ.get("MORNING_TIME_CT", "05:30").strip()
+MORNING_AI       = os.environ.get("MORNING_AI", "1").lower() not in ("0", "false", "no", "off")
+MORNING_KEY      = os.environ.get("MORNING_KEY", "").strip()
+MORNING_TIMEOUT  = int(os.environ.get("MORNING_TIMEOUT", "300"))   # per Claude batch
+MORNING_BATCH    = int(os.environ.get("MORNING_BATCH", "7"))       # tickers per Claude call
+MORNING_MAX      = 60                                              # portfolio size cap
+
+# Grandpa's portfolio as of the Oct 1 2026 sheet. Seeded into the DB the first
+# time the Morning tab is used; edit it from the tab afterwards.
+MORNING_DEFAULT = [
+    ("AAPL", "Apple Inc."), ("ADSK", "Autodesk Inc."), ("AMZN", "Amazon.com Inc."),
+    ("BA", "Boeing Co."), ("CAT", "Caterpillar Inc."), ("CL", "Colgate-Palmolive Co."),
+    ("DAL", "Delta Air Lines Inc."), ("DD", "DuPont de Nemours Inc."), ("GE", "GE Aerospace"),
+    ("GEV", "GE Vernova Inc."), ("GLD", "SPDR Gold Shares"), ("GOOG", "Alphabet Inc."),
+    ("HON", "Honeywell Intl."), ("JNJ", "Johnson & Johnson"), ("JPM", "JPMorgan Chase & Co."),
+    ("KO", "Coca-Cola Co."), ("LMT", "Lockheed Martin Corp."), ("MA", "Mastercard Inc."),
+    ("MPC", "Marathon Petroleum Corp."), ("MRK", "Merck & Co. Inc."), ("MSFT", "Microsoft Corp."),
+    ("NVDA", "NVIDIA Corp."), ("PEP", "PepsiCo Inc."), ("RIO", "Rio Tinto PLC"),
+    ("RTX", "RTX Corp."), ("TSLA", "Tesla Inc."), ("WMT", "Walmart Inc."), ("WWD", "Woodward Inc."),
+]
+
+_morning_lock = threading.Lock()
+_morning_state = {"running": False, "step": "", "error": "", "started": None}
+
+
+_morning_tables_ok = False
+
+
+def _morning_ensure_tables():
+    """Create the Morning tables on first use (independent of init_db)."""
+    global _morning_tables_ok
+    if _morning_tables_ok:
+        return
+    conn, kind = _db()
+    try:
+        cur = conn.cursor()
+        cur.execute("""CREATE TABLE IF NOT EXISTS morning_portfolio(
+            symbol TEXT PRIMARY KEY, name TEXT)""")
+        cur.execute("""CREATE TABLE IF NOT EXISTS morning_reports(
+            day TEXT PRIMARY KEY, data_json TEXT NOT NULL, updated_at TEXT)""")
+        conn.commit()
+        _morning_tables_ok = True
+    finally:
+        conn.close()
+
+
+def _morning_time():
+    try:
+        h, m = MORNING_TIME_CT.split(":")
+        return int(h), int(m)
+    except Exception:
+        return 5, 30
+
+
+def morning_get_portfolio():
+    """[(symbol, name)] sorted by symbol. Seeds the default list on first use."""
+    _morning_ensure_tables()
+    conn, kind = _db()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT symbol, name FROM morning_portfolio ORDER BY symbol")
+        rows = cur.fetchall()
+        if not rows and not _morning_seeded(cur):
+            for s, n in MORNING_DEFAULT:
+                cur.execute(_ph("INSERT INTO morning_portfolio(symbol, name) VALUES(%s,%s)", kind), (s, n))
+            _morning_mark_seeded(cur, kind)
+            conn.commit()
+            rows = sorted(MORNING_DEFAULT)
+        return [(r[0], r[1] or "") for r in rows]
+    finally:
+        conn.close()
+
+
+def _morning_seeded(cur):
+    cur.execute("SELECT 1 FROM morning_reports WHERE day='__seeded__'")
+    return cur.fetchone() is not None
+
+
+def _morning_mark_seeded(cur, kind):
+    cur.execute(_ph("INSERT INTO morning_reports(day, data_json, updated_at) VALUES(%s,%s,%s)", kind),
+                ("__seeded__", "{}", datetime.now(timezone.utc).isoformat()))
+
+
+def _company_name(sym):
+    if not HAVE_EARNINGS:
+        return ""
+    try:
+        p = _finnhub_get("/stock/profile2", {"symbol": sym}) or {}
+        return (p.get("name") or "").strip()
+    except Exception:
+        return ""
+
+
+def morning_add(sym):
+    port = morning_get_portfolio()
+    if any(s == sym for s, _ in port):
+        return True, ""
+    if len(port) >= MORNING_MAX:
+        return False, f"Portfolio limit is {MORNING_MAX}."
+    name = _company_name(sym)
+    conn, kind = _db()
+    try:
+        cur = conn.cursor()
+        cur.execute(_ph("INSERT INTO morning_portfolio(symbol, name) VALUES(%s,%s)", kind), (sym, name))
+        conn.commit()
+    finally:
+        conn.close()
+    return True, ""
+
+
+def morning_remove(sym):
+    _morning_ensure_tables()
+    conn, kind = _db()
+    try:
+        cur = conn.cursor()
+        cur.execute(_ph("DELETE FROM morning_portfolio WHERE symbol=%s", kind), (sym,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def morning_report_get(day):
+    _morning_ensure_tables()
+    conn, kind = _db()
+    try:
+        cur = conn.cursor()
+        cur.execute(_ph("SELECT data_json FROM morning_reports WHERE day=%s", kind), (day,))
+        row = cur.fetchone()
+        return json.loads(row[0]) if row else None
+    finally:
+        conn.close()
+
+
+def morning_report_days(limit=15):
+    _morning_ensure_tables()
+    conn, kind = _db()
+    try:
+        cur = conn.cursor()
+        cur.execute(_ph("SELECT day FROM morning_reports WHERE day<>'__seeded__' "
+                        "ORDER BY day DESC LIMIT %s", kind), (limit,))
+        return [r[0] for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+def morning_report_put(day, data):
+    _morning_ensure_tables()
+    conn, kind = _db()
+    try:
+        cur = conn.cursor()
+        now = datetime.now(timezone.utc).isoformat()
+        payload = json.dumps(data)
+        if kind == "pg":
+            cur.execute("""INSERT INTO morning_reports(day, data_json, updated_at) VALUES(%s,%s,%s)
+                           ON CONFLICT (day) DO UPDATE SET data_json=EXCLUDED.data_json,
+                           updated_at=EXCLUDED.updated_at""", (day, payload, now))
+        else:
+            cur.execute("INSERT OR REPLACE INTO morning_reports(day, data_json, updated_at) VALUES(?,?,?)",
+                        (day, payload, now))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _bar_day(bar):
+    """ET calendar date of an Alpaca bar/trade timestamp, or None."""
+    ts = (bar or {}).get("t")
+    if not ts:
+        return None
+    try:
+        dt = datetime.strptime(ts[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
+        return dt.astimezone(ET).date()
+    except Exception:
+        return None
+
+
+def morning_prices(symbols, today):
+    """{sym: {"close", "close_day", "pre", "pre_time"}} from Alpaca snapshots.
+
+    Last close = the most recent COMPLETED regular session before `today`.
+    Pre-market = latest trade stamped today before 9:30 ET (else None)."""
+    out = {s: {"close": None, "close_day": "", "pre": None, "pre_time": ""} for s in symbols}
+    if not HAVE_DATA:
+        return out
+    snaps = fetch_snapshots(symbols)
+    for s in symbols:
+        sn = snaps.get(s) or {}
+        db, pdb, lt = sn.get("dailyBar") or {}, sn.get("prevDailyBar") or {}, sn.get("latestTrade") or {}
+        bar = pdb if _bar_day(db) == today else db       # skip today's (in-progress) bar
+        if bar.get("c"):
+            out[s]["close"] = round(bar["c"], 2)
+            d = _bar_day(bar)
+            out[s]["close_day"] = d.isoformat() if d else ""
+        if lt.get("p") and _bar_day(lt) == today:
+            dt = datetime.strptime(lt["t"][:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc).astimezone(ET)
+            if dt.hour * 60 + dt.minute < 9 * 60 + 30:
+                out[s]["pre"] = round(lt["p"], 2)
+                out[s]["pre_time"] = dt.strftime("%H:%M ET")
+    return out
+
+
+def _morning_finnhub_earnings(symbols):
+    """{sym: "YYYY-MM-DD (bmo|amc)"} next earnings from Finnhub, used as a hint for Claude."""
+    if not HAVE_EARNINGS:
+        return {}
+    today = datetime.now(ET).date()
+    try:
+        rows = fetch_earnings_calendar(today.isoformat(), (today + timedelta(days=100)).isoformat())
+    except Exception:
+        return {}
+    want, out = set(symbols), {}
+    for r in sorted(rows, key=lambda r: r.get("date") or ""):
+        s = (r.get("symbol") or "").upper()
+        if s in want and s not in out and r.get("date"):
+            out[s] = r["date"] + (f" ({r['hour']})" if r.get("hour") else "")
+    return out
+
+
+MORNING_PROMPT = """You are preparing the "News / Risk Alert", "Ex-Div Date" and "Earnings Date"
+columns of a pre-market portfolio sheet for a retired investor. Today is {today_long}
+(US Eastern, before the market opens). Use web search to check CURRENT information.
+
+Tickers (with last close and Finnhub's next-earnings hint, which may be an estimate):
+{lines}
+
+For EACH ticker return:
+- "name": short company name (e.g. "Apple Inc.").
+- "news": ONE line, max ~220 characters. The most decision-relevant items from the last
+  ~3 trading days: analyst rating/price-target changes, company news, legal/regulatory,
+  macro hits specific to the name, scheduled events today/tomorrow. Put the date of each
+  item in parentheses, e.g. "(Sep 30)". Prefix "⚠ " when it is a real risk to the stock;
+  use "TODAY"/"TOMORROW" in caps for imminent binary events. If nothing new in 3 days,
+  give the most relevant recent item WITH its date. Never repeat old news as if new.
+  Be precise with numbers: if a figure is a total across several companies, say so.
+- "level": "high" (major mover / must-read this morning), "risk" (⚠ item), or "normal".
+- "exdiv": the next ex-dividend date with the QUARTERLY (per-payment) amount, e.g.
+  "Oct 20 ($0.53)". If the dividend is declared, give it as is. If not yet declared but
+  the regular pattern puts it within the next ~60 days, give "~Nov 18 (est. $1.00)".
+  Otherwise "—". ETFs: "— (ETF)". No dividend at all: "—".
+- "earnings": next earnings release, e.g. "Oct 22, 2026". Append " (est.)" unless the
+  company has officially confirmed the date. If it already reported this season and the
+  next date is far away, give the best estimate with " (est.)".
+
+Return ONLY a JSON object, no markdown fences, no commentary:
+{{"rows": [{{"ticker": "AAPL", "name": "...", "news": "...", "level": "normal",
+  "exdiv": "—", "earnings": "Oct 29, 2026 (est.)"}}, ...]}}
+Include every ticker listed above exactly once."""
+
+
+def _morning_claude_batch(batch, prices, hints, today):
+    lines = "\n".join(
+        f"- {s} | last close {('$%.2f' % prices[s]['close']) if prices.get(s, {}).get('close') else 'n/a'}"
+        f" | earnings hint: {hints.get(s, 'unknown')}" for s in batch)
+    prompt = MORNING_PROMPT.format(today_long=today.strftime("%A, %B %d, %Y"), lines=lines)
+    payload = {
+        "model": ANTHROPIC_MODEL,
+        "max_tokens": 4000,
+        "messages": [{"role": "user", "content": prompt}],
+        "tools": [{"type": "web_search_20250305", "name": "web_search",
+                   "max_uses": max(4, len(batch) * 2)}],
+    }
+    req = urllib.request.Request(
+        ANTHROPIC_URL, data=json.dumps(payload).encode("utf-8"), method="POST",
+        headers={"Content-Type": "application/json", "x-api-key": ANTHROPIC_API_KEY,
+                 "anthropic-version": ANTHROPIC_VERSION})
+    try:
+        with urllib.request.urlopen(req, timeout=MORNING_TIMEOUT) as resp:
+            raw = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"Anthropic API {e.code}: {e.read().decode('utf-8', 'ignore')[:200]}")
+    text = "\n".join(b.get("text", "") for b in (raw.get("content") or [])
+                     if isinstance(b, dict) and b.get("type") == "text")
+    data = _extract_json(text)
+    out = {}
+    for r in data.get("rows") or []:
+        s = (r.get("ticker") or "").upper().strip()
+        if s in batch:
+            lvl = (r.get("level") or "normal").lower()
+            out[s] = {"name": (r.get("name") or "").strip()[:60],
+                      "news": (r.get("news") or "").strip()[:400],
+                      "level": lvl if lvl in ("high", "risk", "normal") else "normal",
+                      "exdiv": (r.get("exdiv") or "—").strip()[:60],
+                      "earnings": (r.get("earnings") or "").strip()[:60]}
+    return out
+
+
+def morning_ai_columns(symbols, prices, today):
+    """Run Claude over the portfolio in parallel batches. Returns ({sym: cols}, [errors])."""
+    hints = _morning_finnhub_earnings(symbols)
+    batches = [symbols[i:i + MORNING_BATCH] for i in range(0, len(symbols), MORNING_BATCH)]
+    cols, errors = {}, []
+
+    def run(b):
+        for attempt in (1, 2):
+            try:
+                return _morning_claude_batch(b, prices, hints, today)
+            except Exception as e:
+                if attempt == 2:
+                    errors.append(f"{b[0]}–{b[-1]}: {str(e)[:160]}")
+                time.sleep(5)
+        return {}
+
+    with ThreadPoolExecutor(max_workers=3) as ex:
+        for res in ex.map(run, batches):
+            cols.update(res)
+    # Fall back to Finnhub's earnings date for anything Claude missed.
+    for s in symbols:
+        if s not in cols and s in hints:
+            d = hints[s].split(" ")[0]
+            try:
+                cols[s] = {"earnings": datetime.strptime(d, "%Y-%m-%d").strftime("%b %-d, %Y") + " (est.)"}
+            except Exception:
+                pass
+    return cols, errors
+
+
+def build_morning_report(use_ai=True):
+    """Build (or rebuild) today's report. With use_ai=False the Claude columns
+    are reused from today's existing report, so only prices are refreshed."""
+    now = datetime.now(ET)
+    today = now.date()
+    day = today.isoformat()
+    _morning_state["step"] = "Loading portfolio…"
+    port = morning_get_portfolio()
+    symbols = [s for s, _ in port]
+    names = dict(port)
+    _morning_state["step"] = "Fetching prices from Alpaca…"
+    prices = morning_prices(symbols, today)
+    prior = morning_report_get(day) or {}
+    prior_cols = {r["ticker"]: r for r in prior.get("rows", [])}
+    errors = []
+    if use_ai and MORNING_AI and HAVE_SIMUCAL:
+        _morning_state["step"] = f"Claude is researching news for {len(symbols)} stocks (2–4 min)…"
+        cols, errors = morning_ai_columns(symbols, prices, today)
+        ai_at = now.strftime("%-I:%M %p ET")
+    else:
+        cols = {s: {k: prior_cols[s].get(k) for k in ("news", "level", "exdiv", "earnings")}
+                for s in symbols if s in prior_cols}
+        ai_at = prior.get("ai_at", "")
+    rows = []
+    for s in symbols:
+        p, c = prices.get(s, {}), cols.get(s, {})
+        name = names.get(s) or c.get("name") or ""
+        if not names.get(s) and c.get("name"):
+            try:
+                conn, kind = _db(); cur = conn.cursor()
+                cur.execute(_ph("UPDATE morning_portfolio SET name=%s WHERE symbol=%s", kind), (c["name"], s))
+                conn.commit(); conn.close()
+            except Exception:
+                pass
+        rows.append({"ticker": s, "name": name, "close": p.get("close"), "close_day": p.get("close_day", ""),
+                     "pre": p.get("pre"), "pre_time": p.get("pre_time", ""),
+                     "news": c.get("news") or "", "level": c.get("level") or "normal",
+                     "exdiv": c.get("exdiv") or "—", "earnings": c.get("earnings") or ""})
+    close_days = sorted({r["close_day"] for r in rows if r["close_day"]})
+    report = {"day": day, "built_at": now.strftime("%-I:%M %p ET"), "ai_at": ai_at,
+              "close_day": close_days[-1] if close_days else "", "rows": rows,
+              "errors": errors, "emailed": prior.get("emailed", [])}
+    morning_report_put(day, report)
+    return report
+
+
+def _morning_filename(day):
+    d = datetime.strptime(day, "%Y-%m-%d")
+    return f"JT My Portfolio Pre-Market Price for {d.strftime('%A %B %d %Y')}.xlsx"
+
+
+def morning_build_xlsx(report):
+    """Workbook in the same layout/colours as Camila's hand-made morning sheet."""
+    import io
+    import openpyxl
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+
+    d = datetime.strptime(report["day"], "%Y-%m-%d")
+    cd = report.get("close_day")
+    close_lbl = datetime.strptime(cd, "%Y-%m-%d").strftime("%a %b %-d") if cd else "prev"
+    day_lbl = d.strftime("%a %b %-d")
+    fill = lambda c: PatternFill("solid", fgColor=c)
+    thin = Side(style="thin", color="FF000000")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    center = Alignment(horizontal="center", vertical="center")
+    wrap = Alignment(wrap_text=True, vertical="center")
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Entry Analysis"
+    ws.merge_cells("A1:G1"); ws.merge_cells("A2:G2")
+    ws["A1"] = f"Pre-Market Stock Price — {d.strftime('%A, %B %-d, %Y')}"
+    ws["A1"].font = Font(name="Calibri", size=14, bold=True, color="FFFFFFFF")
+    ws["A1"].fill = fill("FF1F3864"); ws["A1"].alignment = center
+    ws.row_dimensions[1].height = 22
+    ws["A2"] = f"Pre-Market Data as of ~{report.get('built_at', '')}"
+    ws["A2"].font = Font(name="Calibri", size=11, italic=True, color="FF808080")
+    hdr = ["Ticker", "Company Name", f"Last Close ({close_lbl})", f"Pre-Market ({day_lbl})",
+           "News / Risk Alert", "Ex-Div Date", "Earnings Date"]
+    for i, h in enumerate(hdr, 1):
+        c = ws.cell(3, i, h)
+        c.font = Font(name="Calibri", size=11, bold=True, color="FFFFFFFF")
+        c.fill = fill("FF2F5496"); c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        c.border = border
+    ws.row_dimensions[3].height = 30
+
+    GREEN, GREEN_TXT = "FFC6EFCE", "FF276221"
+    RED, RED_TXT = "FFFFC7CE", "FF9C0006"
+    for i, r in enumerate(report["rows"]):
+        row = 4 + i
+        base = "FFF2F2F2" if i % 2 == 0 else "FFFFFFFF"
+        if r.get("level") == "high":
+            base = "FFFFD966"
+        elif r.get("level") == "risk":
+            base = "FFFFF2CC"
+        vals = [r["ticker"], r.get("name") or "", r.get("close"),
+                r.get("pre") if r.get("pre") is not None else "N/A",
+                r.get("news") or "", r.get("exdiv") or "—", r.get("earnings") or ""]
+        for j, v in enumerate(vals, 1):
+            c = ws.cell(row, j, v)
+            c.border = border
+            c.font = Font(name="Calibri", size=11, bold=(j == 1))
+            c.fill = fill(base)
+            c.alignment = Alignment(vertical="center", wrap_text=(j == 2))
+        # price cells: green if pre-market >= close, red if below
+        pre, close = r.get("pre"), r.get("close")
+        for j in (3, 4):
+            c = ws.cell(row, j)
+            c.alignment = center
+            if isinstance(c.value, (int, float)):
+                c.number_format = "$#,##0.00"
+            if pre is not None and close:
+                up = pre >= close
+                c.fill = fill(GREEN if up else RED)
+                c.font = Font(name="Calibri", size=11, color=GREEN_TXT if up else RED_TXT)
+            else:
+                c.fill = fill("FFFFFFFF")
+        ws.cell(row, 1).alignment = center
+        ws.cell(row, 5).alignment = wrap
+        ex = ws.cell(row, 6)
+        ex.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        if ex.value and not str(ex.value).startswith("—"):
+            ex.fill = fill("FFFFF2CC")
+            ex.font = Font(name="Calibri", size=11, bold=True, italic="est" in str(ex.value))
+        eg = ws.cell(row, 7)
+        eg.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        if eg.value and not str(eg.value).startswith("—"):
+            eg.fill = fill("FFDEEAF1"); eg.font = Font(name="Calibri", size=11, bold=True)
+        lines = max(1, -(-len(str(r.get("news") or "")) // 92))
+        ws.row_dimensions[row].height = max(16, 15 * lines + 2)
+
+    foot = 4 + len(report["rows"])
+    ws.merge_cells(start_row=foot, start_column=1, end_row=foot, end_column=7)
+    note = (f"Source: Alpaca (IEX) — Pre-Market data as of ~{report.get('built_at', '')}, "
+            f"{d.strftime('%A, %B %-d, %Y')}. N/A = no pre-market trade yet. | News, ex-div and earnings "
+            f"researched by Claude with web search{(' at ' + report['ai_at']) if report.get('ai_at') else ''}; "
+            f"\"est.\" = projected, not yet confirmed by the company. Not investment advice.")
+    c = ws.cell(foot, 1, note)
+    c.font = Font(name="Calibri", size=10, italic=True, color="FFFFFFFF")
+    c.fill = fill("FF1F3864"); c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    ws.row_dimensions[foot].height = 44
+    for col, w in zip("ABCDEFG", [8, 24, 16, 16, 90, 20, 22]):
+        ws.column_dimensions[col].width = w
+    ws.freeze_panes = "A4"
+    ws.page_setup.orientation = "landscape"
+    ws.page_setup.fitToWidth = 1; ws.page_setup.fitToHeight = 0
+    ws.sheet_properties.pageSetUpPr.fitToPage = True
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def _html_escape(s):
+    return (str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+
+
+def send_morning_email(report, to_list=None):
+    """Email the sheet as an attachment with a short HTML summary. Returns (ok, msg)."""
+    to_list = to_list or MORNING_EMAIL_TO
+    if not EMAIL_ON:
+        return False, "Email isn't set up on the server (SMTP_* env vars)."
+    if not to_list:
+        return False, "No recipients — set MORNING_EMAIL_TO on the server."
+    d = datetime.strptime(report["day"], "%Y-%m-%d")
+    rows = report["rows"]
+    flagged = sorted([r for r in rows if r.get("level") in ("high", "risk")],
+                     key=lambda r: 0 if r.get("level") == "high" else 1)
+    movers = sorted([r for r in rows if r.get("pre") is not None and r.get("close")],
+                    key=lambda r: abs(r["pre"] / r["close"] - 1), reverse=True)[:5]
+
+    def pct(r):
+        return (r["pre"] / r["close"] - 1) * 100
+
+    html = [f"<p>Good morning! Here is today's pre-market sheet for <b>{d.strftime('%A, %B %-d')}</b> "
+            f"(prices as of ~{report.get('built_at', '')}). The full sheet is attached.</p>"]
+    if movers:
+        html.append("<p><b>Biggest pre-market moves</b><br>" + "<br>".join(
+            f"{r['ticker']}: ${r['close']:.2f} → ${r['pre']:.2f} "
+            f"(<span style='color:{'#15803d' if pct(r) >= 0 else '#b91c1c'}'>{pct(r):+.2f}%</span>)"
+            for r in movers) + "</p>")
+    if flagged:
+        html.append("<p><b>Alerts to read</b></p><ul>" + "".join(
+            f"<li><b>{r['ticker']}</b> — {_html_escape(r['news'])}</li>" for r in flagged) + "</ul>")
+    if APP_URL:
+        html.append(f"<p>Open it on the website: <a href='{APP_URL}'>{APP_URL}</a> (☀️ Morning tab)</p>")
+    html.append("<p style='color:#6b7280;font-size:12px'>Prices: Alpaca (IEX). News, dividends and "
+                "earnings dates researched by Claude — double-check anything you plan to trade on.</p>")
+    text = (f"Pre-market sheet for {d.strftime('%A, %B %-d, %Y')} is attached.\n\n" +
+            "\n".join(f"{r['ticker']}: {r['news']}" for r in flagged))
+    try:
+        msg = EmailMessage()
+        msg["Subject"] = f"☀️ Pre-Market Sheet — {d.strftime('%a %b %-d, %Y')}" + \
+                         (f" · {len(flagged)} alert{'s' if len(flagged) != 1 else ''}" if flagged else "")
+        msg["From"] = EMAIL_FROM
+        msg["To"] = ", ".join(to_list)
+        msg.set_content(text)
+        msg.add_alternative("<html><body style='font-family:Arial,sans-serif;font-size:14px'>" +
+                            "".join(html) + "</body></html>", subtype="html")
+        msg.add_attachment(morning_build_xlsx(report), maintype="application",
+                           subtype="vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                           filename=_morning_filename(report["day"]))
+        ctx = ssl.create_default_context()
+        if SMTP_SSL:
+            with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, context=ctx, timeout=30) as s:
+                s.login(SMTP_USER, SMTP_PASS); s.send_message(msg)
+        else:
+            with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as s:
+                s.starttls(context=ctx); s.login(SMTP_USER, SMTP_PASS); s.send_message(msg)
+    except Exception as e:
+        print(f"[MORNING] email failed: {e}", flush=True)
+        return False, f"Email failed: {str(e)[:160]}"
+    report.setdefault("emailed", []).append(
+        {"at": datetime.now(ET).strftime("%-I:%M %p ET"), "to": to_list})
+    morning_report_put(report["day"], report)
+    return True, "Sent to " + ", ".join(to_list)
+
+
+def morning_run(use_ai=True, email=False):
+    """Build (and optionally email) in the caller's thread. One run at a time."""
+    if not _morning_lock.acquire(blocking=False):
+        return None
+    _morning_state.update(running=True, error="", step="Starting…",
+                          started=datetime.now(ET).strftime("%-I:%M %p ET"))
+    try:
+        report = build_morning_report(use_ai=use_ai)
+        if email:
+            _morning_state["step"] = "Emailing…"
+            ok, m = send_morning_email(report)
+            if not ok:
+                _morning_state["error"] = m
+        return report
+    except Exception as e:
+        _morning_state["error"] = f"{type(e).__name__}: {str(e)[:200]}"
+        print(f"[MORNING] build failed: {e}", flush=True)
+        return None
+    finally:
+        _morning_state.update(running=False, step="")
+        _morning_lock.release()
+
+
+def morning_run_async(use_ai=True, email=False):
+    if _morning_state["running"]:
+        return False
+    threading.Thread(target=morning_run, args=(use_ai, email), daemon=True).start()
+    return True
+
+
+def _is_trading_day(d):
+    """Weekday + not an exchange holiday (Alpaca calendar; assumes open if the check fails)."""
+    if d.weekday() >= 5:
+        return False
+    if not HAVE_DATA:
+        return True
+    try:
+        url = f"https://paper-api.alpaca.markets/v2/calendar?start={d.isoformat()}&end={d.isoformat()}"
+        req = urllib.request.Request(url, headers={"APCA-API-KEY-ID": ALPACA_KEY,
+                                                   "APCA-API-SECRET-KEY": ALPACA_SECRET})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            cal = json.loads(r.read().decode())
+        return any((c.get("date") or "") == d.isoformat() for c in cal)
+    except Exception:
+        return True
+
+
+def morning_due_job():
+    """If it's past MORNING_TIME_CT on a trading day and today's scheduled run
+    hasn't happened, build + email. Returns True if it ran (or already had)."""
+    now_ct = datetime.now(CT)
+    h, m = _morning_time()
+    if (now_ct.hour, now_ct.minute) < (h, m):
+        return False
+    today = datetime.now(ET).date()
+    rep = morning_report_get(today.isoformat())
+    if rep and rep.get("scheduled_done"):
+        return True
+    if not _is_trading_day(today):
+        return True
+    report = morning_run(use_ai=True, email=bool(MORNING_EMAIL_TO))
+    if report:
+        report["scheduled_done"] = True
+        morning_report_put(report["day"], report)
+        return True
+    return False
+
+
+def morning_scheduler():
+    """Background loop. Checks once a minute but only touches the DB after the
+    scheduled time, and only until today's run is done (keeps Neon idle)."""
+    done_day = None
+    fails = 0
+    while True:
+        try:
+            today = datetime.now(ET).date()
+            now_ct = datetime.now(CT)
+            h, m = _morning_time()
+            # Give up for the day after ~3 failed attempts or once it's past noon.
+            if done_day != today and (now_ct.hour, now_ct.minute) >= (h, m) and now_ct.hour < 12 and fails < 3:
+                if morning_due_job():
+                    done_day = today; fails = 0
+                elif not _morning_state["running"]:
+                    fails += 1
+            if done_day != today and now_ct.hour >= 12:
+                done_day = today; fails = 0
+        except Exception as e:
+            print(f"[MORNING] scheduler error: {e}", flush=True)
+            fails += 1
+        time.sleep(60)
+
+
+def meta():
+    now = datetime.now(ET)
+    return {"as_of": now.strftime("%a %b %d, %H:%M:%S ET"),
+            "date": now.strftime("%Y-%m-%d"),
+            "market_open": market_open(now),
+            "session": session_label(now),
+            "rule": f"You get a new numbered alarm each time a stock bounces {RISE_PCT*100:.1f}%+ off a "
+                    f"fresh intraday low. Alarm #1 can be a false alarm — if the stock keeps making "
+                    f"lower lows you'll see #2, #3… and the bounce off the deepest low is the real signal.",
+            "have_key": HAVE_DATA,
+            "email_on": EMAIL_ON, "push_on": PUSH_ON}
+
+
+MANIFEST = json.dumps({
+    "name": "Stock Watch", "short_name": "Stock Watch", "start_url": "/",
+    "display": "standalone", "background_color": "#f6f7f9", "theme_color": "#1d4ed8",
+    "icons": [{"src": "/icon.png", "sizes": "192x192", "type": "image/png"},
+              {"src": "/icon.png", "sizes": "512x512", "type": "image/png"}],
+})
+
+SW_JS = """self.addEventListener('push', function(e){
+  var d={}; try{d=e.data.json();}catch(_){d={title:'Stock Watch', body:(e.data?e.data.text():'')};}
+  e.waitUntil(self.registration.showNotification(d.title||'Stock Watch',
+    {body:d.body||'', icon:'/icon.png', badge:'/icon.png', data:(d.url||'/')}));
+});
+self.addEventListener('notificationclick', function(e){
+  e.notification.close();
+  e.waitUntil(clients.matchAll({type:'window'}).then(function(cl){
+    for(var i=0;i<cl.length;i++){ if('focus' in cl[i]) return cl[i].focus(); }
+    if(clients.openWindow) return clients.openWindow(e.notification.data||'/');
+  }));
+});"""
+
+
+SIMUCAL_JS = r"""/* ============================================================
+   SimuCal — v5.0 Earnings-Beat Probability Calculator
+   Renders inside #view-simucal. Talks to POST /api/simucal/research,
+   which proxies to Claude with server-side web_search.
+   ============================================================ */
+(function(){
+  function $(id){ return document.getElementById(id); }
+  function esc(s){ return String(s==null?'':s).replace(/[&<>"']/g,function(c){
+    return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];
+  }); }
+
+  function probClass(p){ return p>=65?'sc-green':p>=45?'sc-amber':'sc-red'; }
+  function verdictClass(p){ return p>=65?'sc-vbeat':p>=45?'sc-vtoss':'sc-vmiss'; }
+
+  // Map v5.0 probability -> letter grade for earnings_notes.
+  // Adjust to your grading convention if you use a different scale.
+  function probToGrade(p){
+    if (p >= 70) return 'A';
+    if (p >= 55) return 'B';
+    if (p >= 40) return 'C';
+    return 'D';
+  }
+
+  // The current rendered payload, kept in closure so the Save button can read it.
+  var _current = null;
+
+  // Session basket — every successful research pushes here; Copy to Excel
+  // dumps the whole basket as TSV in Camila's Earnings_Beat_Probability format.
+  var _basket = [];
+  var BASKET_KEY = 'simucal_basket_v1';
+
+  function saveBasket(){
+    try { localStorage.setItem(BASKET_KEY, JSON.stringify(_basket)); } catch(e){}
+  }
+  function loadBasket(){
+    try {
+      var s = localStorage.getItem(BASKET_KEY);
+      if (s) { var parsed = JSON.parse(s); if (Array.isArray(parsed)) _basket = parsed; }
+    } catch(e){ _basket = []; }
+  }
+
+  function beatToDecimal(beatStr){
+    // "3 / 4" -> 0.75
+    if(!beatStr) return null;
+    var m = String(beatStr).match(/(\d+)\s*\/\s*(\d+)/);
+    if(!m) return null;
+    var n = Number(m[1]), d = Number(m[2]);
+    return d > 0 ? (n/d) : null;
+  }
+
+  function probSignal(p){
+    if (p >= 70) return 'High';
+    if (p >= 55) return 'Moderate';
+    return 'Low';
+  }
+
+  function shortDate(d){
+    // Trim "(pre-market)" tail
+    return String(d||'').split(' (')[0];
+  }
+
+  function todayLabel(){
+    var m = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+    var t = new Date();
+    return m[t.getMonth()]+' '+t.getDate()+', '+t.getFullYear();
+  }
+
+  function renderBasket(){
+    var el = $('sc-basket');
+    if(!el) return;
+    if(!_basket.length){ el.innerHTML=''; return; }
+    var pills = _basket.map(function(b, i){
+      return '<span class="sc-pill">'+esc(b.symbol)
+        + ' <a href="#" class="sc-x" onclick="simucalBasketRemove('+i+');return false" title="Remove">\u00d7</a></span>';
+    }).join('');
+    el.innerHTML =
+      '<div class="sc-basket-card">'
+      +  '<div class="sc-basket-head">'
+      +    '<span class="sc-basket-title">Session basket \u00b7 '+_basket.length+' ticker'+(_basket.length===1?'':'s')+'</span>'
+      +    '<span class="sc-basket-actions">'
+      +      '<button class="sc-basket-btn primary" onclick="simucalCopyBasket()">\ud83d\udccb Copy TSV</button>'
+      +      '<button class="sc-basket-btn primary" onclick="simucalDownloadXlsx()">\ud83d\udcc5 Download .xlsx</button>'
+      +      '<button class="sc-basket-btn" onclick="simucalClearBasket()">Clear</button>'
+      +    '</span>'
+      +  '</div>'
+      +  '<div class="sc-pills">'+pills+'</div>'
+      +  '<div class="sc-basket-hint">Each research adds to the basket. Paste into Excel and it drops into columns like <i>Earnings_Beat_Probability.xlsx</i>.</div>'
+      + '</div>';
+  }
+
+  function basketAdd(d){
+    // Dedupe on symbol — re-researching the same ticker updates the existing row
+    var sym = d.symbol || '';
+    if(!sym) return;
+    for(var i=0; i<_basket.length; i++){
+      if(_basket[i].symbol === sym){ _basket[i] = d; saveBasket(); renderBasket(); return; }
+    }
+    _basket.push(d);
+    saveBasket();
+    renderBasket();
+  }
+
+  window.simucalBasketRemove = function(i){
+    _basket.splice(i, 1);
+    saveBasket();
+    renderBasket();
+  };
+
+  window.simucalClearBasket = function(){
+    if(!_basket.length) return;
+    if(!confirm('Clear all '+_basket.length+' tickers from the basket?')) return;
+    _basket = [];
+    saveBasket();
+    renderBasket();
+  };
+
+  window.simucalCopyBasket = function(){
+    if(!_basket.length) return;
+    var tickers = _basket.map(function(b){ return b.symbol; }).join(', ');
+    var lines = [];
+    // Title / subtitle / prep-date (each on its own row so they land in col A when pasted)
+    lines.push('Earnings Beat Probability \u2014 ' + tickers);
+    lines.push('Estimated likelihood of beating consensus EPS at the next earnings report');
+    lines.push('Prepared: ' + todayLabel());
+    lines.push('');
+    // Column headers
+    lines.push([
+      'Ticker','Company','Next Earnings Date','Consensus EPS Estimate',
+      'Beats (last 4 qtrs)','Historical Beat Rate','Zacks Earnings ESP',
+      'Zacks Rank','Estimated Beat Probability','Signal'
+    ].join('\t'));
+    // Data rows
+    _basket.forEach(function(b){
+      var eps = String(b.eps||'').replace(/[^0-9.\-]/g,'');
+      var beatsTxt = String(b.beat||'').replace('/', 'of');  // "3 / 4" -> "3 of 4"
+      var rate = beatToDecimal(b.beat);
+      var probDec = (Number(b.prob)||0) / 100;
+      lines.push([
+        b.symbol||'', b.name||'', shortDate(b.date), eps,
+        beatsTxt, (rate!=null ? rate.toFixed(2) : ''),
+        '',  // Zacks Earnings ESP — SimuCal doesn't produce this
+        '',  // Zacks Rank — SimuCal doesn't produce this
+        probDec.toFixed(2),
+        probSignal(Number(b.prob)||0)
+      ].map(function(c){ return String(c==null?'':c).replace(/\t/g,' ').replace(/\r?\n/g,' '); }).join('\t'));
+    });
+    // Explanation footer (matches Camila's template phrasing)
+    lines.push('');
+    lines.push('How the probability is estimated');
+    lines.push('\u2022 SimuCal v5.0 anchored rubric: 6 factors scored 0-10 each (beat streak, 90d estimate revisions, demand backdrop, margin/cost setup, guide cushion, sector-specific factor).');
+    lines.push('\u2022 Directional estimates from Claude research + web search \u2014 NOT guarantees. Actual results depend on guidance, macro, and one-off items. Not investment advice.');
+
+    var tsv = lines.join('\n');
+    var done = function(ok){
+      var el = $('sc-basket');
+      if(!el) return;
+      var msg = el.querySelector('.sc-basket-msg');
+      if(!msg){
+        msg = document.createElement('div');
+        msg.className = 'sc-basket-msg';
+        el.querySelector('.sc-basket-card').appendChild(msg);
+      }
+      msg.innerHTML = ok
+        ? '<span style="color:#166534;font-weight:600">\u2713 Copied '+_basket.length+' ticker'+(_basket.length===1?'':'s')+' to clipboard. Paste into Excel.</span>'
+        : '<span style="color:#991b1b">Copy failed \u2014 clipboard access blocked. Try Chrome.</span>';
+      setTimeout(function(){ if(msg && msg.parentNode) msg.parentNode.removeChild(msg); }, 4000);
+    };
+    if(navigator.clipboard && navigator.clipboard.writeText){
+      navigator.clipboard.writeText(tsv).then(function(){done(true);}).catch(function(){
+        try{
+          var ta=document.createElement('textarea'); ta.value=tsv; ta.style.position='fixed';
+          ta.style.left='-9999px'; document.body.appendChild(ta); ta.select();
+          var ok=document.execCommand('copy'); document.body.removeChild(ta); done(ok);
+        } catch(e){ done(false); }
+      });
+    } else {
+      try{
+        var ta2=document.createElement('textarea'); ta2.value=tsv; ta2.style.position='fixed';
+        ta2.style.left='-9999px'; document.body.appendChild(ta2); ta2.select();
+        var ok2=document.execCommand('copy'); document.body.removeChild(ta2); done(ok2);
+      } catch(e){ done(false); }
+    }
+  };
+
+  function render(d){
+    _current = d;
+    var dateShort = String(d.date||'').split(' (')[0];
+    var rubricRows = (d.rubric||[]).map(function(r){
+      return '<div class="sc-rline">'
+        + '<span class="sc-rname">'+esc(r[0])+'</span>'
+        + '<span class="sc-rscore">'+esc(r[1])+'/10</span>'
+        + '<span class="sc-rnote">'+esc(r[2])+'</span>'
+        + '</div>';
+    }).join('');
+
+    $('sc-result').innerHTML =
+      '<div class="sc-card">'
+      +   '<div class="sc-prob-row">'
+      +     '<div>'
+      +       '<div class="sc-plabel">'+esc(d.name)+' \u00b7 Probability of beating consensus EPS</div>'
+      +       '<div class="sc-pvalue '+probClass(d.prob)+'">'+esc(d.prob)+'%</div>'
+      +     '</div>'
+      +     '<span class="sc-verdict '+verdictClass(d.prob)+'">'+esc(d.verdict)+'</span>'
+      +   '</div>'
+      +   '<div class="sc-bar"><div class="sc-bfill '+probClass(d.prob)+'" style="width:'+esc(d.prob)+'%"></div></div>'
+      +   '<div class="sc-metrics">'
+      +     '<div class="sc-m"><div class="sc-mlbl">Consensus EPS</div><div class="sc-mval">'+esc(d.eps)+'</div></div>'
+      +     '<div class="sc-m"><div class="sc-mlbl">Consensus revenue</div><div class="sc-mval">'+esc(d.rev)+'</div></div>'
+      +     '<div class="sc-m"><div class="sc-mlbl">Report date</div><div class="sc-mval">'+esc(dateShort)+'</div></div>'
+      +     '<div class="sc-m"><div class="sc-mlbl">Beat rate (4Q)</div><div class="sc-mval">'+esc(d.beat)+'</div></div>'
+      +   '</div>'
+      +   '<h3 class="sc-rhead">v5.0 anchored rubric</h3>'
+      +   '<div class="sc-rubric">'+rubricRows+'</div>'
+      +   '<div class="sc-foot">'+esc(d.foot)+(d._cached?' \u00b7 <span class="sc-cached">cached \u00b7 <a href="#" onclick="simucalRefresh();return false">refresh</a></span>':'')+'</div>'
+      +   (d.period ? '<div class="sc-save-row"><button class="sc-save" onclick="simucalSave()">\ud83d\udcbe Save to Earnings notes</button><span id="sc-save-msg"></span></div>' : '<div class="sc-save-row"><span class="muted" style="font-size:12px">No period matched from Finnhub \u2014 can\'t save to notes.</span></div>')
+      + '</div>';
+  }
+
+  window.simucalDownloadXlsx = async function(){
+    if(!_basket.length) return;
+    var el = $('sc-basket');
+    var setMsg = function(html){
+      if(!el) return;
+      var msg = el.querySelector('.sc-basket-msg');
+      if(!msg){
+        msg = document.createElement('div');
+        msg.className = 'sc-basket-msg';
+        var card = el.querySelector('.sc-basket-card');
+        if(card) card.appendChild(msg);
+      }
+      msg.innerHTML = html;
+    };
+    setMsg('<span style="color:#374151">Building workbook…</span>');
+    try {
+      var r = await fetch('/api/simucal/export_xlsx', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({basket: _basket})
+      });
+      if(!r.ok){
+        // Try to parse json error
+        var errTxt = 'Export failed ('+r.status+')';
+        try { var e = await r.json(); if(e && e.error) errTxt = e.error; } catch(_){}
+        setMsg('<span style="color:#991b1b">'+esc(errTxt)+'</span>');
+        return;
+      }
+      var contentType = r.headers.get('Content-Type') || '';
+      if(contentType.indexOf('json') !== -1){
+        // Server returned an error as JSON
+        var j = await r.json();
+        setMsg('<span style="color:#991b1b">'+esc(j.error || 'Export failed')+'</span>');
+        return;
+      }
+      var blob = await r.blob();
+      var url = URL.createObjectURL(blob);
+      var a = document.createElement('a');
+      a.href = url;
+      a.download = 'Earnings_Beat_Probability.xlsx';
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setTimeout(function(){ URL.revokeObjectURL(url); }, 1500);
+      setMsg('<span style="color:#166534;font-weight:600">\u2713 Downloaded '+_basket.length+' ticker'+(_basket.length===1?'':'s')+'.</span>');
+      setTimeout(function(){
+        var msg = el && el.querySelector('.sc-basket-msg');
+        if(msg && msg.parentNode) msg.parentNode.removeChild(msg);
+      }, 4000);
+    } catch(e){
+      setMsg('<span style="color:#991b1b">Network error — try again.</span>');
+    }
+  };
+
+  window.simucalRun = async function(){
+    var t = ($('sc-ticker').value||'').trim().toUpperCase();
+    if(!t){ return; }
+    $('sc-ticker').value = t;
+    $('sc-status').innerHTML = '<div class="sc-load"><span class="sc-spin"></span>Researching '+esc(t)+' \u2014 this takes 30\u201360 seconds\u2026</div>';
+    $('sc-result').innerHTML = '';
+    try {
+      var r = await fetch('/api/simucal/research', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({symbol: t})
+      });
+      var d = await r.json();
+      $('sc-status').innerHTML = '';
+      if (d.error) {
+        $('sc-status').innerHTML = '<div class="warn">'+esc(d.error)+'</div>';
+        return;
+      }
+      render(d);
+      basketAdd(d);
+    } catch(e) {
+      $('sc-status').innerHTML = '<div class="warn">Network error \u2014 try again.</div>';
+    }
+  };
+
+  window.simucalSave = async function(){
+    if (!_current || !_current.period) return;
+    var d = _current;
+    var watch = '';
+    if (d.rubric && d.rubric[5]) {
+      watch = d.rubric[5][0] + ': ' + d.rubric[5][2];
+    }
+    watch = 'SimuCal v5.0 \u00b7 ' + d.verdict + ' (' + d.prob + '%). ' + watch;
+    var body = {
+      symbol: d.symbol || ($('sc-ticker').value||'').trim().toUpperCase(),
+      period: d.period,
+      grade:  probToGrade(d.prob),
+      beat:   d.prob,
+      watch:  watch,
+      gold:   d.prob >= 70
+    };
+    var msg = $('sc-save-msg');
+    msg.textContent = 'Saving\u2026';
+    try {
+      var r = await fetch('/api/earnings/note', {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify(body)
+      });
+      var res = await r.json();
+      if (res.ok) {
+        msg.innerHTML = '<span style="color:#166534">\u2713 Saved to Earnings tab \u00b7 '+esc(body.period)+'</span>';
+      } else {
+        msg.innerHTML = '<span style="color:#991b1b">'+esc(res.error||'Save failed')+'</span>';
+      }
+    } catch(e) {
+      msg.innerHTML = '<span style="color:#991b1b">Network error.</span>';
+    }
+  };
+
+  window.simucalRefresh = async function(){
+    var t = ($('sc-ticker').value||'').trim().toUpperCase();
+    if (!t) return;
+    $('sc-status').innerHTML = '<div class="sc-load"><span class="sc-spin"></span>Re-researching '+esc(t)+' (bypassing cache)\u2026</div>';
+    $('sc-result').innerHTML = '';
+    try {
+      var r = await fetch('/api/simucal/research', {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({symbol: t, force: true})
+      });
+      var d = await r.json();
+      $('sc-status').innerHTML = '';
+      if (d.error) { $('sc-status').innerHTML = '<div class="warn">'+esc(d.error)+'</div>'; return; }
+      render(d);
+      basketAdd(d);
+    } catch(e) {
+      $('sc-status').innerHTML = '<div class="warn">Network error \u2014 try again.</div>';
+    }
+  };
+
+  window.initSimuCal = function(){
+    var status = $('sc-status');
+    if (window.ME && !ME.logged_in) {
+      status.innerHTML = '<div class="warn">Sign in above to use SimuCal \u2014 research calls hit Claude and cost API credits, so this tab is gated to your account.</div>';
+      return;
+    }
+    // Restore basket across page refreshes / browser restarts
+    loadBasket();
+    renderBasket();
+    var el = $('sc-ticker');
+    if (el) el.focus();
+    if (status) status.innerHTML = '';
+  };
+
+  // Inject SimuCal styles once.
+  if (!document.getElementById('sc-css')) {
+    var s = document.createElement('style');
+    s.id = 'sc-css';
+    s.textContent =
+      '#view-simucal input#sc-ticker{font-weight:600;font-size:15px;letter-spacing:0.02em}'
+      + '.sc-card{background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:20px;margin-top:4px}'
+      + '.sc-prob-row{display:flex;align-items:baseline;justify-content:space-between;gap:16px;flex-wrap:wrap;margin-bottom:12px}'
+      + '.sc-plabel{font-size:12px;color:#6b7280;margin-bottom:4px}'
+      + '.sc-pvalue{font-size:44px;font-weight:600;line-height:1;letter-spacing:-0.02em}'
+      + '.sc-pvalue.sc-green{color:#0ca30c}.sc-pvalue.sc-amber{color:#c2830a}.sc-pvalue.sc-red{color:#d03b3b}'
+      + '.sc-verdict{display:inline-block;padding:5px 12px;border-radius:999px;font-size:12px;font-weight:600}'
+      + '.sc-verdict.sc-vbeat{background:#dcfce7;color:#166534}'
+      + '.sc-verdict.sc-vtoss{background:#f3f4f6;color:#374151}'
+      + '.sc-verdict.sc-vmiss{background:#fee2e2;color:#991b1b}'
+      + '.sc-bar{height:5px;background:#f3f4f6;border-radius:3px;overflow:hidden;margin:8px 0 20px}'
+      + '.sc-bfill{height:100%;transition:width 0.4s ease}'
+      + '.sc-bfill.sc-green{background:#0ca30c}.sc-bfill.sc-amber{background:#c2830a}.sc-bfill.sc-red{background:#d03b3b}'
+      + '.sc-metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;margin-bottom:18px}'
+      + '.sc-m{background:#f9fafb;border-radius:8px;padding:12px 14px}'
+      + '.sc-mlbl{font-size:11px;color:#6b7280;margin-bottom:3px;text-transform:uppercase;letter-spacing:0.03em}'
+      + '.sc-mval{font-size:17px;font-weight:600;color:#111827}'
+      + '.sc-rhead{font-size:14px;font-weight:700;margin:16px 0 8px;color:#374151}'
+      + '.sc-rubric{border-top:1px solid #e5e7eb}'
+      + '.sc-rline{display:grid;grid-template-columns:1.4fr 60px 2fr;gap:14px;padding:10px 0;border-bottom:1px solid #f3f4f6;font-size:13px;align-items:center}'
+      + '.sc-rline:last-child{border-bottom:none}'
+      + '.sc-rname{color:#111827;font-weight:500}'
+      + '.sc-rscore{font-weight:600;color:#111827;text-align:right;font-variant-numeric:tabular-nums}'
+      + '.sc-rnote{color:#6b7280;font-size:12px}'
+      + '.sc-foot{font-size:11px;color:#9ca3af;font-style:italic;margin-top:14px;padding-top:12px;border-top:1px solid #f3f4f6}'
+      + '.sc-cached{color:#6b7280;font-style:normal}.sc-cached a{color:#1d4ed8;text-decoration:none}.sc-cached a:hover{text-decoration:underline}'
+      + '.sc-save-row{margin-top:14px;display:flex;align-items:center;gap:12px;flex-wrap:wrap}'
+      + '.sc-save{background:#1d4ed8;color:#fff;border:none;border-radius:8px;padding:9px 16px;font-size:13px;font-weight:600;cursor:pointer}'
+      + '.sc-save:hover{background:#1e40af}'
+      + '.sc-basket-card{background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:14px 16px}'
+      + '.sc-basket-head{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;margin-bottom:10px}'
+      + '.sc-basket-title{font-size:13px;font-weight:700;color:#374151}'
+      + '.sc-basket-actions{display:flex;gap:8px}'
+      + '.sc-basket-btn{background:#f3f4f6;color:#111827;border:1px solid #d1d5db;border-radius:8px;padding:6px 12px;font-size:12px;font-weight:600;cursor:pointer}'
+      + '.sc-basket-btn.primary{background:#1d4ed8;color:#fff;border-color:#1d4ed8}'
+      + '.sc-basket-btn.primary:hover{background:#1e40af}'
+      + '.sc-basket-btn:hover:not(.primary){background:#e5e7eb}'
+      + '.sc-pills{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px}'
+      + '.sc-pill{display:inline-flex;align-items:center;gap:6px;background:#eef2ff;color:#312e81;font-size:12px;font-weight:700;padding:4px 10px;border-radius:999px;letter-spacing:0.02em}'
+      + '.sc-pill .sc-x{color:#6b7280;text-decoration:none;font-weight:400;line-height:1}'
+      + '.sc-pill .sc-x:hover{color:#991b1b}'
+      + '.sc-basket-hint{font-size:11px;color:#9ca3af;font-style:italic}'
+      + '.sc-basket-msg{margin-top:8px;font-size:12px}'
+      + '.sc-load{display:flex;align-items:center;gap:10px;color:#6b7280;font-size:14px;padding:12px 0}'
+      + '.sc-spin{width:14px;height:14px;border:2px solid #e5e7eb;border-top-color:#374151;border-radius:50%;animation:sc-spin 0.8s linear infinite;display:inline-block}'
+      + '@keyframes sc-spin{to{transform:rotate(360deg)}}'
+      + '@media (max-width:600px){.sc-pvalue{font-size:34px}.sc-rline{grid-template-columns:1fr 50px}.sc-rnote{grid-column:1/-1}}';
+    document.head.appendChild(s);
+  }
+
+  document.addEventListener('input', function(e){
+    if (e.target && e.target.id === 'sc-ticker') {
+      e.target.value = e.target.value.toUpperCase();
+    }
+  });
+})();
+"""
+
+
+SIM_JS = r"""/* ============================================================
+   Stock Watch — Backtest simulator ("buy the lowest")
+   Served at /sim.js. Depends on Chart.js (already loaded by the page)
+   and on the app's existing /api/quotes and /api/hist/daily endpoints.
+   All logic is client-side; nothing here touches the server data layer.
+   ============================================================ */
+(function () {
+  "use strict";
+
+  // ---- strategy palette (matches the app's colors) ----
+  var STRATS = [
+    { key: "oracle", name: "Perfect low",  color: "#1d4ed8", hint: "needs hindsight" },
+    { key: "dip",    name: "Buy the dip",  color: "#16a34a", hint: "realistic rule" },
+    { key: "hold",   name: "Buy & hold",   color: "#d97706", hint: "buy day one" },
+    { key: "random", name: "Random entry", color: "#64748b", hint: "no skill" }
+  ];
+  var ALARM_COLOR = "#7c3aed";
+  // Daily analog of the app's numbered-alarm rule. Mirrors the server defaults:
+  //   RISE_PCT (bounce off the low)      = 0.5%
+  //   NEW_LOW_MIN_DROP (fresh lower low) = 0.3%
+  var RISE_PCT_D = 0.005, NEW_LOW_DROP_D = 0.003;
+
+  // ---- seedable RNG (mulberry32) + normal via Marsaglia polar ----
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  function makeNormal(rng) {
+    var spare = null;
+    return function () {
+      if (spare !== null) { var s = spare; spare = null; return s; }
+      var u, v, q;
+      do { u = rng() * 2 - 1; v = rng() * 2 - 1; q = u * u + v * v; } while (q >= 1 || q === 0);
+      var m = Math.sqrt(-2 * Math.log(q) / q);
+      spare = v * m; return u * m;
+    };
+  }
+
+  // ---- formatting ----
+  function pct(x) { return (x * 100).toFixed(1) + "%"; }
+  function pctS(x) { return (x >= 0 ? "+" : "") + (x * 100).toFixed(1) + "%"; }
+  function cls(x) { return x >= 0 ? "up" : "dn"; }
+
+  // ---------------------------------------------------------
+  //  MONTE CARLO ENGINE
+  // ---------------------------------------------------------
+  function simulateMC(p) {
+    var rng = mulberry32(p.seed >>> 0);
+    var norm = makeNormal(rng);
+    var dt = 1 / 252;
+    var drift = (p.mu - 0.5 * p.sigma * p.sigma) * dt;
+    var vol = p.sigma * Math.sqrt(dt);
+
+    var returns = { oracle: [], dip: [], hold: [], random: [] };
+    var dipTriggered = 0, dipBeatHold = 0, sample = null;
+
+    for (var r = 0; r < p.runs; r++) {
+      var n = p.days + 1;
+      var path = new Float64Array(n);
+      path[0] = 100;
+      for (var t = 1; t < n; t++) path[t] = path[t - 1] * Math.exp(drift + vol * norm());
+
+      var exit = path[n - 1], start = path[0];
+
+      var minP = Infinity, minIdx = 0;
+      for (t = 0; t < n - 1; t++) { if (path[t] < minP) { minP = path[t]; minIdx = t; } }
+
+      var runMax = path[0], dipIdx = -1;
+      for (t = 0; t < n - 1; t++) {
+        if (path[t] > runMax) runMax = path[t];
+        if (path[t] <= runMax * (1 - p.dip)) { dipIdx = t; break; }
+      }
+      var dipEntry = dipIdx >= 0 ? path[dipIdx] : start;
+      if (dipIdx >= 0) dipTriggered++;
+
+      var randIdx = Math.floor(rng() * (n - 1));
+      var randEntry = path[randIdx];
+
+      var rH = exit / start - 1, rD = exit / dipEntry - 1;
+      returns.oracle.push(exit / minP - 1);
+      returns.dip.push(rD);
+      returns.hold.push(rH);
+      returns.random.push(exit / randEntry - 1);
+      if (rD > rH) dipBeatHold++;
+
+      if (r === 0) sample = { path: path, minIdx: minIdx, dipIdx: dipIdx, randIdx: randIdx };
+    }
+
+    var stats = {};
+    STRATS.forEach(function (s) {
+      var arr = returns[s.key].slice().sort(function (a, b) { return a - b; });
+      var m = arr.length;
+      stats[s.key] = {
+        mean: arr.reduce(function (x, y) { return x + y; }, 0) / m,
+        median: arr[Math.floor(m / 2)],
+        win: returns[s.key].filter(function (x) { return x > 0; }).length / m,
+        p95: arr[Math.floor(m * 0.95)],
+        p05: arr[Math.floor(m * 0.05)]
+      };
+    });
+
+    return {
+      mode: "mc", returns: returns, stats: stats, sample: sample,
+      dipTriggerRate: dipTriggered / p.runs, dipBeatHoldRate: dipBeatHold / p.runs
+    };
+  }
+
+  // ---------------------------------------------------------
+  //  APP ALARM RULE — daily analog of the numbered-alarm model
+  // ---------------------------------------------------------
+  // A new numbered alarm fires each day the stock (a) bounces >= RISE off that
+  // day's low [close is RISE above the low] AND (b) that low is a fresh new low
+  // at least DROP below the low that armed the previous alarm. This mirrors the
+  // server's _update_alarm(), applied to daily bars instead of intraday ticks.
+  function computeAlarms(points, rise, drop) {
+    // The first saved day sets the baseline reference low (no alarm — on daily
+    // bars almost every day closes >RISE above its own low, so firing on day one
+    // would be meaningless). After that, an alarm fires on a day that prints a
+    // fresh lower low (>= DROP below the last armed low) AND closes >= RISE above
+    // that day's low. Each fire arms the reference at the new, lower low — so the
+    // numbers climb only as the stock is driven to genuinely deeper lows.
+    var armed = null, count = 0, out = [];
+    for (var i = 0; i < points.length; i++) {
+      var low = points[i].low, close = points[i].close;
+      if (low == null || close == null || low <= 0) continue;
+      if (armed === null) { armed = low; continue; }             // baseline day
+      var bounced = ((close - low) / low) >= rise;               // condition 1
+      if (bounced && low <= armed * (1 - drop)) {                // fresh lower low
+        count++; armed = low;
+        out.push({ num: count, idx: i, close: close, low: low, fromLow: (close - low) / low });
+      }
+    }
+    return out;
+  }
+
+  // ---------------------------------------------------------
+  //  REAL-HISTORY ENGINE  (single actual price series)
+  // ---------------------------------------------------------
+  function backtestReal(points, dipPct, alarmN) {
+    // points: [{d, low, close}], oldest -> newest
+    var closes = points.map(function (p) { return p.close; });
+    var n = closes.length;
+    var exit = closes[n - 1], start = closes[0];
+
+    var minP = Infinity, minIdx = 0;
+    for (var i = 0; i < n - 1; i++) { if (closes[i] < minP) { minP = closes[i]; minIdx = i; } }
+
+    var runMax = closes[0], dipIdx = -1;
+    for (i = 0; i < n - 1; i++) {
+      if (closes[i] > runMax) runMax = closes[i];
+      if (closes[i] <= runMax * (1 - dipPct)) { dipIdx = i; break; }
+    }
+    var dipEntry = dipIdx >= 0 ? closes[dipIdx] : start;
+
+    // "random" benchmark on one path = average over every possible entry day
+    var sumRand = 0;
+    for (i = 0; i < n - 1; i++) sumRand += exit / closes[i] - 1;
+    var avgRandom = sumRand / (n - 1);
+
+    // the app's own signal
+    var alarms = computeAlarms(points, RISE_PCT_D, NEW_LOW_DROP_D);
+    var alarmReturns = alarms.map(function (a) {
+      return { num: a.num, idx: a.idx, d: points[a.idx].d, close: a.close, ret: exit / a.close - 1 };
+    });
+    var pick = alarms[(alarmN || 1) - 1] || null;
+
+    var res = {
+      oracle: { ret: exit / minP - 1, idx: minIdx, entry: minP },
+      dip: { ret: exit / dipEntry - 1, idx: dipIdx, entry: dipEntry, triggered: dipIdx >= 0 },
+      hold: { ret: exit / start - 1, idx: 0, entry: start },
+      random: { ret: avgRandom, idx: -1, entry: null },
+      alarm: pick
+        ? { ret: exit / pick.close - 1, idx: pick.idx, entry: pick.close, num: alarmN, fired: alarms.length }
+        : { ret: null, idx: -1, entry: null, num: alarmN, fired: alarms.length }
+    };
+    return { mode: "real", n: n, exit: exit, closes: closes, points: points,
+      res: res, alarms: alarms, alarmReturns: alarmReturns };
+  }
+
+  // ---------------------------------------------------------
+  //  RENDERING
+  // ---------------------------------------------------------
+  var pathChart = null, distChart = null, realChart = null;
+  var lastMC = null;
+
+  function tile(name, color, valHtml, meta) {
+    return '<div class="sim-tile"><div class="sim-tname"><span class="sim-dot" style="background:' +
+      color + '"></span>' + name + '</div><div class="sim-tval ' + (valHtml.indexOf("-") === 0 ? "dn" : "up") +
+      '">' + valHtml + '</div><div class="sim-tmeta">' + meta + '</div></div>';
+  }
+
+  function renderMCTiles(res) {
+    var html = STRATS.map(function (s) {
+      var st = res.stats[s.key];
+      return tile(s.name, s.color, pctS(st.mean), s.hint + " · wins " + pct(st.win) + " of runs");
+    }).join("");
+    document.getElementById("sim-tiles").innerHTML = html;
+  }
+
+  function renderMCTable(res) {
+    var body = STRATS.map(function (s) {
+      var st = res.stats[s.key];
+      return '<div class="sim-trow"><span><span class="sim-dot" style="background:' + s.color + '"></span>' +
+        s.name + '</span><span class="' + cls(st.mean) + '">' + pctS(st.mean) + '</span><span class="' +
+        cls(st.median) + '">' + pctS(st.median) + '</span><span>' + pct(st.win) + '</span><span class="up">' +
+        pctS(st.p95) + '</span><span class="dn">' + pctS(st.p05) + '</span></div>';
+    }).join("");
+    document.getElementById("sim-table").innerHTML =
+      '<div class="sim-trow sim-thead"><span>Strategy</span><span>Avg</span><span>Median</span>' +
+      '<span>Win rate</span><span>Best 5%</span><span>Worst 5%</span></div>' + body;
+  }
+
+  function renderMCPath(res) {
+    var s = res.sample, path = s.path, pts = [];
+    for (var i = 0; i < path.length; i++) pts.push({ x: i, y: path[i] });
+    var marks = [
+      { idx: s.minIdx, color: STRATS[0].color, label: "Perfect low" },
+      { idx: s.dipIdx, color: STRATS[1].color, label: "Buy the dip" },
+      { idx: 0, color: STRATS[2].color, label: "Buy & hold" },
+      { idx: s.randIdx, color: STRATS[3].color, label: "Random" }
+    ].filter(function (m) { return m.idx >= 0; });
+
+    var ds = [{ type: "line", label: "Price", data: pts, borderColor: "#94a3b8",
+      borderWidth: 1.6, pointRadius: 0, tension: 0.15, order: 2 }];
+    marks.forEach(function (m) {
+      ds.push({ type: "scatter", label: m.label,
+        data: [{ x: m.idx, y: path[m.idx] }],
+        backgroundColor: m.color, borderColor: "#fff", borderWidth: 2,
+        pointRadius: 6, pointHoverRadius: 8, order: 1 });
+    });
+
+    if (pathChart) pathChart.destroy();
+    pathChart = new Chart(document.getElementById("sim-path"), {
+      data: { datasets: ds },
+      options: {
+        responsive: true, maintainAspectRatio: false,
+        plugins: {
+          legend: { display: true, labels: { boxWidth: 10, font: { size: 11 } } },
+          tooltip: {
+            callbacks: {
+              label: function (c) {
+                if (c.dataset.type === "scatter")
+                  return c.dataset.label + ": day " + c.parsed.x + " · $" + c.parsed.y.toFixed(2);
+                return "day " + c.parsed.x + " · $" + c.parsed.y.toFixed(2);
+              }
+            }
+          }
+        },
+        scales: {
+          x: { type: "linear", title: { display: true, text: "day", font: { size: 10 } },
+            ticks: { font: { size: 10 }, maxTicksLimit: 8 } },
+          y: { title: { display: true, text: "price ($)", font: { size: 10 } },
+            ticks: { font: { size: 10 } } }
+        }
+      }
+    });
+  }
+
+  function renderMCDist(res) {
+    var all = [];
+    STRATS.forEach(function (s) { all = all.concat(res.returns[s.key]); });
+    all.sort(function (a, b) { return a - b; });
+    var lo = all[Math.floor(all.length * 0.01)], hi = all[Math.floor(all.length * 0.99)];
+    var nBins = 32, binW = (hi - lo) / nBins;
+
+    var labels = [];
+    for (var b = 0; b < nBins; b++) labels.push(((lo + (b + 0.5) * binW) * 100));
+
+    var ds = STRATS.map(function (s) {
+      var counts = new Array(nBins).fill(0);
+      res.returns[s.key].forEach(function (v) {
+        var bi = Math.floor((v - lo) / binW);
+        if (bi < 0) bi = 0; if (bi >= nBins) bi = nBins - 1;
+        counts[bi]++;
+      });
+      return { label: s.name, data: counts, borderColor: s.color, backgroundColor: "transparent",
+        borderWidth: 2, pointRadius: 0, stepped: true, tension: 0 };
+    });
+
+    if (distChart) distChart.destroy();
+    distChart = new Chart(document.getElementById("sim-dist"), {
+      type: "line",
+      data: { labels: labels, datasets: ds },
+      options: {
+        responsive: true, maintainAspectRatio: false,
+        interaction: { mode: "index", intersect: false },
+        plugins: {
+          legend: { display: true, labels: { boxWidth: 10, font: { size: 11 } } },
+          tooltip: {
+            callbacks: {
+              title: function (items) { return "return ~ " + items[0].label.slice(0, 6) + "%"; },
+              label: function (c) { return c.dataset.label + ": " + c.parsed.y + " runs"; }
+            }
+          }
+        },
+        scales: {
+          x: { title: { display: true, text: "final return (%)", font: { size: 10 } },
+            ticks: { font: { size: 10 }, maxTicksLimit: 9,
+              callback: function (v) { return Math.round(this.getLabelForValue(v)) + "%"; } } },
+          y: { title: { display: true, text: "runs", font: { size: 10 } }, ticks: { font: { size: 10 } } }
+        }
+      }
+    });
+  }
+
+  function renderMCTakeaway(res) {
+    var so = res.stats.oracle.mean, sd = res.stats.dip.mean, sh = res.stats.hold.mean;
+    var timing = so - sh;
+    var captured = timing !== 0 ? (sd - sh) / timing : 0;
+    var dipVsHold = sd - sh;
+    var edge = dipVsHold >= 0
+      ? 'beat plain buy-&-hold by <span class="up">' + pctS(dipVsHold) + '</span> on average'
+      : 'actually <span class="dn">trailed</span> buy-&-hold by ' + pct(Math.abs(dipVsHold)) + ' on average';
+    document.getElementById("sim-takeaway").innerHTML =
+      'Buying the <b>perfect low</b> returned <b>' + pctS(so) + '</b> vs <b>' + pctS(sh) +
+      '</b> for just holding — so flawless timing was worth about <b>' + pctS(timing) +
+      '</b> of extra return here. But that needs hindsight. The realistic <b>buy-the-dip</b> rule ' + edge +
+      ', capturing roughly <b>' + (captured * 100).toFixed(0) + '%</b> of what perfect timing offered, and it beat holding in <b>' +
+      pct(res.dipBeatHoldRate) + '</b> of runs. The dip trigger fired at all in <b>' + pct(res.dipTriggerRate) +
+      '</b> of runs. Dip-buying tends to shine in <b>choppy, sideways</b> markets and to cost you in <b>strong steady uptrends</b>.';
+  }
+
+  function runMC() {
+    var g = function (id) { return +document.getElementById(id).value; };
+    var p = { runs: g("sim-runs"), days: g("sim-days"), mu: g("sim-mu") / 100,
+      sigma: g("sim-sigma") / 100, dip: g("sim-dip") / 100, seed: g("sim-seed") };
+    var note = document.getElementById("sim-note");
+    note.textContent = "Running " + p.runs.toLocaleString() + " paths…";
+    setTimeout(function () {
+      var t0 = performance.now();
+      lastMC = simulateMC(p);
+      renderMCTiles(lastMC); renderMCPath(lastMC); renderMCDist(lastMC);
+      renderMCTable(lastMC); renderMCTakeaway(lastMC);
+      note.textContent = "Done — " + p.runs.toLocaleString() + " paths in " +
+        Math.round(performance.now() - t0) + " ms.";
+    }, 20);
+  }
+
+  // ---- real history ----
+  function renderReal(bt, sym) {
+    var r = bt.res, note = document.getElementById("sim-real-note");
+    note.innerHTML = sym + " · " + bt.n + " saved trading days · exit at last close $" + bt.exit.toFixed(2) +
+      " · " + bt.alarms.length + " app alarm" + (bt.alarms.length === 1 ? "" : "s") + " fired";
+
+    // tiles (incl. the app's own alarm signal)
+    var order = [["oracle", "Perfect low", STRATS[0].color], ["dip", "Buy the dip", STRATS[1].color],
+      ["hold", "Buy & hold", STRATS[2].color], ["random", "Avg random day", STRATS[3].color]];
+    var html = order.map(function (o) {
+      var d = r[o[0]];
+      var meta = o[0] === "dip" ? (d.triggered ? "bought a real dip" : "never dipped — held") :
+        (o[0] === "oracle" ? "the true bottom" : (o[0] === "random" ? "every entry averaged" : "first saved day"));
+      return tile(o[1], o[2], pctS(d.ret), meta);
+    }).join("");
+    var a = r.alarm;
+    var alarmVal = (a.ret == null) ? "—" : pctS(a.ret);
+    var alarmMeta = (a.ret == null)
+      ? "alarm #" + a.num + " never fired (" + a.fired + " total)"
+      : "bought your alarm #" + a.num + " signal";
+    html += tile("App alarm #" + a.num, ALARM_COLOR, alarmVal, alarmMeta);
+    document.getElementById("sim-real-tiles").innerHTML = html;
+
+    // price chart with entry markers + every alarm firing
+    var closes = bt.closes, pts = closes.map(function (c, i) { return { x: i, y: c }; });
+    var ds = [{ type: "line", label: sym, data: pts, borderColor: "#94a3b8",
+      borderWidth: 1.6, pointRadius: 0, tension: 0.1, order: 3 }];
+    // faint markers for all alarm firings
+    if (bt.alarms.length) {
+      ds.push({ type: "scatter", label: "Alarms", order: 2,
+        data: bt.alarms.map(function (al) { return { x: al.idx, y: closes[al.idx] }; }),
+        backgroundColor: "rgba(124,58,237,0.28)", borderColor: ALARM_COLOR, borderWidth: 1,
+        pointRadius: 4, pointHoverRadius: 6 });
+    }
+    var marks = [["oracle", "Perfect low", STRATS[0].color], ["dip", "Buy the dip", STRATS[1].color],
+      ["hold", "Buy & hold", STRATS[2].color]];
+    if (a.idx >= 0) marks.push(["alarm", "Bought alarm #" + a.num, ALARM_COLOR]);
+    marks.forEach(function (o) {
+      var d = r[o[0]];
+      if (!d || d.idx < 0) return;
+      ds.push({ type: "scatter", label: o[1], data: [{ x: d.idx, y: closes[d.idx] }],
+        backgroundColor: o[2], borderColor: "#fff", borderWidth: 2, pointRadius: 6, pointHoverRadius: 8, order: 1 });
+    });
+
+    if (realChart) realChart.destroy();
+    realChart = new Chart(document.getElementById("sim-real-chart"), {
+      data: { datasets: ds },
+      options: {
+        responsive: true, maintainAspectRatio: false,
+        plugins: { legend: { labels: { boxWidth: 10, font: { size: 11 } } },
+          tooltip: { callbacks: { label: function (c) {
+            var base = c.dataset.type === "scatter" ? c.dataset.label + ": " : "";
+            return base + "day " + c.parsed.x + " · $" + c.parsed.y.toFixed(2); } } } },
+        scales: { x: { type: "linear", title: { display: true, text: "trading day (oldest → newest)", font: { size: 10 } },
+            ticks: { font: { size: 10 }, maxTicksLimit: 8 } },
+          y: { title: { display: true, text: "close ($)", font: { size: 10 } }, ticks: { font: { size: 10 } } } }
+      }
+    });
+
+    // per-alarm breakdown — does buying a DEEPER (higher-numbered) alarm pay off?
+    var box = document.getElementById("sim-real-alarms");
+    if (!bt.alarmReturns.length) {
+      box.innerHTML = '<div class="muted" style="font-size:13px">No alarms fired on ' + sym +
+        "'s saved history — it never bounced 0.5%+ off a fresh lower low. Deeper history or a choppier stock will surface some.</div>";
+    } else {
+      var head = '<div class="sim-trow sim-thead"><span>Alarm</span><span>Bought (date)</span>' +
+        '<span>Entry $</span><span>Return to now</span></div>';
+      var rows = bt.alarmReturns.map(function (ar) {
+        var sel = (ar.num === a.num) ? ' style="background:#f5f3ff"' : "";
+        return '<div class="sim-trow sim-arow"' + sel + '><span><span class="sim-dot" style="background:' +
+          ALARM_COLOR + '"></span>#' + ar.num + '</span><span>' + (ar.d || "day " + ar.idx) + '</span><span>$' +
+          ar.close.toFixed(2) + '</span><span class="' + cls(ar.ret) + '">' + pctS(ar.ret) + '</span></div>';
+      }).join("");
+      box.innerHTML = '<div class="sim-table sim-atable">' + head + rows + '</div>';
+    }
+
+    // takeaway
+    var best = r.oracle.ret, held = r.hold.ret, dipR = r.dip.ret;
+    var gap = best - held;
+    var capt = gap !== 0 ? (dipR - held) / gap : 0;
+    var txt = 'On ' + sym + "'s real saved history, nailing the exact bottom would have returned <b>" + pctS(best) +
+      '</b> vs <b>' + pctS(held) + '</b> for buying the first day. ' +
+      (r.dip.triggered
+        ? 'The buy-the-dip rule ' + (dipR >= held ? 'added ' : 'gave up ') + pctS(Math.abs(dipR - held)) +
+          ' vs holding, capturing about <b>' + (capt * 100).toFixed(0) + '%</b> of the perfect-timing gap. '
+        : 'The stock never fell far enough to trigger the dip rule, so it fell back to buying the first day. ');
+    // grade the app's own signal
+    if (r.alarm.ret != null) {
+      txt += 'Your app’s <b>alarm #' + a.num + '</b> signal would have returned <b>' + pctS(r.alarm.ret) +
+        '</b> — ' + (r.alarm.ret >= held ? '<span class="up">' + pctS(r.alarm.ret - held) + ' better</span>'
+          : '<span class="dn">' + pctS(r.alarm.ret - held) + '</span>') + ' than just holding. ';
+      // deepest vs first, to test the "deeper low = truer signal" thesis
+      if (bt.alarmReturns.length >= 2) {
+        var first = bt.alarmReturns[0], deepest = bt.alarmReturns[bt.alarmReturns.length - 1];
+        txt += 'Testing the “deeper low is the real signal” idea: alarm #' + first.num + ' returned ' +
+          pctS(first.ret) + ' while the deepest (#' + deepest.num + ') returned ' + pctS(deepest.ret) + ' — ' +
+          (deepest.ret > first.ret ? 'the deeper alarm did pay off here.' : 'the deeper alarm did not beat the first one here.');
+        var bestA = bt.alarmReturns.slice().sort(function (x, y) { return y.ret - x.ret; })[0];
+        txt += ' With full hindsight, buying <b>alarm #' + bestA.num + '</b> was the best of the ' +
+          bt.alarmReturns.length + ' fired — it returned <b>' + pctS(bestA.ret) + '</b>.';
+      }
+    } else {
+      txt += 'Your app’s alarm #' + a.num + ' never fired on this history (' + a.fired + ' alarm' +
+        (a.fired === 1 ? '' : 's') + ' total), so there was nothing to buy on that signal.';
+    }
+    document.getElementById("sim-real-takeaway").innerHTML = txt;
+  }
+
+  function cleanSym(s) { return (s || "").trim().toUpperCase().replace(/[^A-Z0-9.-]/g, "").slice(0, 10); }
+
+  function clearReal() {
+    document.getElementById("sim-real-tiles").innerHTML = "";
+    document.getElementById("sim-real-alarms").innerHTML = "";
+    document.getElementById("sim-real-takeaway").innerHTML = "";
+    if (realChart) { realChart.destroy(); realChart = null; }
+  }
+
+  // Load a stock's saved daily history; if we don't have enough yet, auto-pull
+  // ~1 year of real bars from Alpaca once, then hand the points to the callback.
+  function loadRealHistory(sym, alreadyBackfilled, cb) {
+    var note = document.getElementById("sim-real-note");
+    fetch("/api/hist/daily?symbol=" + encodeURIComponent(sym), { cache: "no-store" })
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        var pts = (d.points || []).filter(function (p) { return p.close != null; });
+        if (pts.length < 5 && !alreadyBackfilled) {
+          note.textContent = "Fetching " + sym + "’s past year from the market…";
+          fetch("/api/hist/backfill", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ symbol: sym }) })
+            .then(function (r) { return r.json(); })
+            .then(function (bd) {
+              if (bd.error) { note.innerHTML = "<b>" + bd.error + "</b>"; cb(null); return; }
+              loadRealHistory(sym, true, cb);
+            })
+            .catch(function () { note.textContent = "Couldn’t load " + sym + " right now — try again in a moment."; cb(null); });
+          return;
+        }
+        cb(pts);
+      })
+      .catch(function () { note.textContent = "Couldn’t load " + sym + " right now — try again in a moment."; cb(null); });
+  }
+
+  function runReal() {
+    var inp = document.getElementById("sim-real-sym");
+    var sym = cleanSym(inp.value);
+    var note = document.getElementById("sim-real-note");
+    var dip = (+document.getElementById("sim-real-dip").value) / 100;
+    var alarmN = +document.getElementById("sim-real-alarm").value;
+    if (!sym) { note.innerHTML = 'Type a stock symbol above (for example <b>AAPL</b>), then press “See how it did”.'; return; }
+    inp.value = sym;
+    note.textContent = "Loading " + sym + " prices…";
+    loadRealHistory(sym, false, function (pts) {
+      if (!pts) return;
+      if (pts.length < 5) {
+        note.innerHTML = 'We couldn’t find enough price history for <b>' + sym + '</b>. Double-check the symbol — it needs to be a US-listed stock (for example AAPL, MSFT, KO). Some foreign or over-the-counter tickers aren’t available on the free data feed.';
+        clearReal();
+        return;
+      }
+      renderReal(backtestReal(pts, dip, alarmN), sym);
+    });
+  }
+
+  // Pull real daily bars from Alpaca into saved history, then backtest.
+  function runBackfill() {
+    var sym = document.getElementById("sim-real-sym").value;
+    var note = document.getElementById("sim-real-note");
+    if (!sym) { note.textContent = "Pick a stock first (add one to your watchlist)."; return; }
+    var btn = document.getElementById("sim-real-load");
+    btn.disabled = true;
+    note.textContent = "Pulling " + sym + " history from Alpaca…";
+    fetch("/api/hist/backfill", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ symbol: sym }) })
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        btn.disabled = false;
+        if (d.error) { note.innerHTML = "<b>" + d.error + "</b>"; return; }
+        note.textContent = "Loaded " + (d.saved || 0) + " days for " + sym + ". Backtesting…";
+        runReal();
+      })
+      .catch(function () { btn.disabled = false; note.textContent = "Couldn’t reach Alpaca to load history."; });
+  }
+
+  function refreshRealSymbols() {
+    var dl = document.getElementById("sim-real-list");
+    if (!dl) return;
+    var syms = (window.LAST && window.LAST.mine ? window.LAST.mine : []).map(function (t) { return t.ticker; });
+    dl.innerHTML = syms.map(function (s) { return '<option value="' + s + '">'; }).join("");
+  }
+
+  // ---------------------------------------------------------
+  //  UI SCAFFOLD (built once into #sim-root)
+  // ---------------------------------------------------------
+  function styleTag() {
+    var css =
+      "#sim-root{max-width:960px}" +
+      ".sim-seg{display:inline-flex;border:1px solid #d1d5db;border-radius:9px;overflow:hidden;margin:2px 0 12px}" +
+      ".sim-seg button{border:none;border-radius:0;background:#fff;padding:7px 14px;font-weight:600;color:#374151}" +
+      ".sim-seg button.on{background:#1d4ed8;color:#fff}" +
+      ".sim-card{background:#fff;border:1px solid #e7e9ee;border-radius:12px;padding:14px 16px;margin-bottom:14px}" +
+      ".sim-controls{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:14px 20px}" +
+      ".sim-ctrl label{display:flex;justify-content:space-between;font-size:12px;color:#374151;margin-bottom:5px}" +
+      ".sim-ctrl label b{color:#16181d}" +
+      ".sim-ctrl input[type=range]{width:100%;accent-color:#1d4ed8}" +
+      ".sim-tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px}" +
+      ".sim-tile{border:1px solid #e7e9ee;border-radius:10px;padding:10px 12px}" +
+      ".sim-tname{font-size:12px;color:#374151;display:flex;align-items:center;gap:6px}" +
+      ".sim-dot{width:9px;height:9px;border-radius:3px;display:inline-block;flex:none}" +
+      ".sim-tval{font-size:23px;font-weight:700;margin-top:5px}" +
+      ".sim-tmeta{font-size:11px;color:#9ca3af;margin-top:1px}" +
+      ".sim-chartbox{height:250px}" +
+      ".sim-grid2{display:grid;grid-template-columns:1fr 1fr;gap:16px}" +
+      "@media(max-width:760px){.sim-grid2{grid-template-columns:1fr}}" +
+      ".sim-table{font-size:13px}" +
+      ".sim-trow{display:grid;grid-template-columns:1.6fr 1fr 1fr 1fr 1fr 1fr;gap:6px;padding:7px 4px;border-bottom:1px solid #f1f1f1}" +
+      ".sim-trow span:not(:first-child){text-align:right;font-variant-numeric:tabular-nums}" +
+      ".sim-atable .sim-trow{grid-template-columns:1fr 1.4fr 1fr 1fr}" +
+      ".sim-atable .sim-arow span:nth-child(2){text-align:right;color:#374151}" +
+      ".sim-thead span{color:#9ca3af;font-weight:700;font-size:11px}" +
+      ".sim-take{font-size:14px;line-height:1.6}" +
+      ".sim-sub{font-size:12px;color:#374151;margin-bottom:6px}" +
+      ".sim-h{font-size:13px;font-weight:700;color:#374151;text-transform:uppercase;letter-spacing:.04em;margin:0 0 10px}";
+    var el = document.createElement("style");
+    el.textContent = css;
+    return el;
+  }
+
+  function slider(id, label, min, max, step, val, fmt) {
+    return '<div class="sim-ctrl"><label>' + label + ' <b id="' + id + '-v">' + fmt(val) +
+      '</b></label><input type="range" id="' + id + '" min="' + min + '" max="' + max +
+      '" step="' + step + '" value="' + val + '"></div>';
+  }
+
+  function buildUI(root) {
+    root.appendChild(styleTag());
+
+    var mc =
+      '<div id="sim-mc">' +
+      '<div class="sim-card"><div class="sim-h">Market &amp; strategy settings</div>' +
+      '<div class="sim-controls">' +
+      slider("sim-runs", "Simulated runs", 200, 10000, 200, 2000, function (v) { return (+v).toLocaleString(); }) +
+      slider("sim-days", "Days per run", 30, 756, 6, 252, function (v) { return v; }) +
+      slider("sim-mu", "Annual drift", -20, 30, 1, 8, function (v) { return v + "%"; }) +
+      slider("sim-sigma", "Annual volatility", 5, 80, 1, 30, function (v) { return v + "%"; }) +
+      slider("sim-dip", "Dip trigger (buy on drop of)", 2, 40, 1, 10, function (v) { return v + "%"; }) +
+      slider("sim-seed", "Random seed", 1, 999, 1, 42, function (v) { return v; }) +
+      '</div><div style="margin-top:14px"><button class="primary" id="sim-run">Run simulation</button> ' +
+      '<span class="muted" id="sim-note" style="font-size:12px">Ready.</span></div></div>' +
+      '<div class="sim-card"><div class="sim-h">Average return per strategy · hold to end</div>' +
+      '<div class="sim-tiles" id="sim-tiles"></div></div>' +
+      '<div class="sim-card"><div class="sim-grid2">' +
+      '<div><div class="sim-sub">One example path &amp; where each strategy buys</div><div class="sim-chartbox"><canvas id="sim-path"></canvas></div></div>' +
+      '<div><div class="sim-sub">Distribution of final returns across all runs</div><div class="sim-chartbox"><canvas id="sim-dist"></canvas></div></div>' +
+      '</div></div>' +
+      '<div class="sim-card"><div class="sim-h">Full results</div><div class="sim-table" id="sim-table"></div></div>' +
+      '<div class="sim-card"><div class="sim-h">The takeaway</div><div class="sim-take" id="sim-takeaway"></div></div>' +
+      '</div>';
+
+    var real =
+      '<div id="sim-real">' +
+      '<div class="sim-card">' +
+      '<div class="sim-h">Try a stock</div>' +
+      '<div class="sim-sub">Type any US stock symbol and press the button — we’ll pull its real prices and show how a few simple “when to buy” ideas would have done.</div>' +
+      '<div class="bar" style="align-items:center">' +
+      '<input id="sim-real-sym" list="sim-real-list" placeholder="e.g. AAPL" maxlength="10" style="min-width:150px;text-transform:uppercase">' +
+      '<datalist id="sim-real-list"></datalist>' +
+      '<button class="primary" id="sim-real-run">See how it did →</button>' +
+      '</div>' +
+      '<div class="bar" style="margin-top:2px">' +
+      '<label style="font-size:12px;color:#374151">Buy after it drops&nbsp;' +
+      '<select id="sim-real-dip"><option value="5">5%</option><option value="10" selected>10%</option>' +
+      '<option value="15">15%</option><option value="20">20%</option></select></label>' +
+      '<label style="font-size:12px;color:#374151;margin-left:8px">Use alarm&nbsp;' +
+      '<select id="sim-real-alarm"><option value="1" selected>#1</option><option value="2">#2</option>' +
+      '<option value="3">#3</option><option value="4">#4</option><option value="5">#5</option></select></label>' +
+      '</div>' +
+      '<div class="muted" id="sim-real-note" style="font-size:12px;margin-top:8px"></div></div>' +
+      '<div class="sim-card"><div class="sim-h">How each way of buying did</div><div class="sim-tiles" id="sim-real-tiles"></div></div>' +
+      '<div class="sim-card"><div class="sim-sub">The stock’s price, and where each idea would have bought · faint dots = every alarm the app fired</div>' +
+      '<div class="sim-chartbox"><canvas id="sim-real-chart"></canvas></div></div>' +
+      '<div class="sim-card"><div class="sim-h">Each alarm the app fired</div>' +
+      '<div class="sim-sub">Every numbered alarm on this stock, and what buying it would have returned by today. The highlighted row is the alarm number you picked above.</div>' +
+      '<div id="sim-real-alarms"></div></div>' +
+      '<div class="sim-card"><div class="sim-h">In plain English</div><div class="sim-take" id="sim-real-takeaway"></div></div>' +
+      '</div>';
+
+    var advanced =
+      '<details id="sim-adv" style="margin-top:6px">' +
+      '<summary style="cursor:pointer;font-weight:600;color:#374151;font-size:13px;padding:6px 0">⚙️ Advanced: experiment with pretend markets</summary>' +
+      '<div class="sim-sub" style="margin-top:6px">This part isn’t a real stock — it invents thousands of random markets to show, on average, how much perfect timing pays versus a simple rule. Just for tinkering.</div>' +
+      mc +
+      '</details>';
+
+    var wrap = document.createElement("div");
+    wrap.innerHTML =
+      '<h2>🧪 SimuWatch — would buying the dips have paid off?</h2>' +
+      '<div class="rule">Type any stock and see how a few simple “when to buy” ideas would have worked on its real prices over the past year — from perfect hindsight to a rule you could actually follow.</div>' +
+      real + advanced;
+    root.appendChild(wrap);
+
+    document.getElementById("sim-run").addEventListener("click", runMC);
+    document.getElementById("sim-real-run").addEventListener("click", runReal);
+    document.getElementById("sim-real-sym").addEventListener("keydown", function (e) { if (e.key === "Enter") runReal(); });
+    ["sim-runs", "sim-days", "sim-mu", "sim-sigma", "sim-dip", "sim-seed"].forEach(function (id) {
+      var inp = document.getElementById(id), lab = document.getElementById(id + "-v");
+      var fmt = (id === "sim-runs") ? function (v) { return (+v).toLocaleString(); }
+        : (id === "sim-mu" || id === "sim-sigma" || id === "sim-dip") ? function (v) { return v + "%"; }
+        : function (v) { return v; };
+      inp.addEventListener("input", function () { lab.textContent = fmt(inp.value); });
+    });
+    var adv = document.getElementById("sim-adv");
+    if (adv) adv.addEventListener("toggle", function () { if (adv.open && !mcRan) { mcRan = true; runMC(); } });
+  }
+
+  function showSub(which) {
+    document.getElementById("sim-mc").style.display = which === "mc" ? "block" : "none";
+    document.getElementById("sim-real").style.display = which === "real" ? "block" : "none";
+    document.getElementById("sim-tab-mc").classList.toggle("on", which === "mc");
+    document.getElementById("sim-tab-real").classList.toggle("on", which === "real");
+    if (which === "real") {
+      refreshRealSymbols();
+      var rn = document.getElementById("sim-real-note");
+      if (rn && !document.getElementById("sim-real-tiles").children.length)
+        rn.innerHTML = 'Pick a stock and click <b>Backtest</b> to replay the four strategies on the real daily closes this app has saved. History builds up one close per day, so the more days saved, the richer this gets.';
+    }
+  }
+
+  var booted = false, mcRan = false;
+  window.initSim = function () {
+    var root = document.getElementById("sim-root");
+    if (!root) return;
+    if (!booted) { buildUI(root); booted = true; }
+    refreshRealSymbols();
+    // Friendly first impression: show an example using the first watchlist stock.
+    var inp = document.getElementById("sim-real-sym");
+    if (inp && !inp.value) {
+      var syms = (window.LAST && window.LAST.mine ? window.LAST.mine : []).map(function (t) { return t.ticker; });
+      if (syms.length) { inp.value = syms[0]; runReal(); }
+      else { document.getElementById("sim-real-note").innerHTML = 'Type a stock symbol above (for example <b>AAPL</b>) and press “See how it did”.'; }
+    }
+  };
+
+  // expose engines for testing / reuse
+  window.StockSim = { simulateMC: simulateMC, backtestReal: backtestReal };
+})();
+"""
+
+
+def icon_bytes():
+    try:
+        with open(ICON_PATH, "rb") as f:
+            return f.read()
+    except Exception:
+        return _FALLBACK_ICON
+
+
+# =========================== WEB PAGE ===========================
+MORNING_JS = r"""/* ============================================================
+   ☀️ Morning tab — grandpa's daily pre-market sheet.
+   Server builds it at MORNING_TIME_CT on weekdays; this view shows it,
+   lets you rebuild / email / download it, and edit the portfolio list.
+   ============================================================ */
+(function(){
+ var M = {data:null, day:'', poll:null};
+ function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];});}
+ function $(id){return document.getElementById(id);}
+ function fmt(v){return (v===null||v===undefined)?'N/A':'$'+Number(v).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2});}
+ function longDay(iso){if(!iso)return '';var p=iso.split('-');var d=new Date(+p[0],+p[1]-1,+p[2]);return d.toLocaleDateString('en-US',{weekday:'long',month:'long',day:'numeric',year:'numeric'});}
+ function shortDay(iso){if(!iso)return '';var p=iso.split('-');var d=new Date(+p[0],+p[1]-1,+p[2]);return d.toLocaleDateString('en-US',{weekday:'short',month:'short',day:'numeric'});}
+ function msg(t,ok){var m=$('mo-msg');m.style.color=ok?'#047857':'#b91c1c';m.textContent=t||'';if(t)setTimeout(function(){if(m.textContent===t)m.textContent='';},6000);}
+
+ async function load(day){
+  var url='/api/morning'+(day?('?day='+encodeURIComponent(day)):'');
+  try{
+   var d=await (await fetch(url,{cache:'no-store'})).json();
+   M.data=d; render();
+   if(d.state&&d.state.running){startPoll();}else{stopPoll();}
+  }catch(e){stopPoll();$('mo-root').innerHTML='<div class="warn">Could not load the morning sheet ('+esc(e&&e.message||e)+'). Try refreshing the page.</div>';}
+ }
+ function startPoll(){if(!M.poll)M.poll=setInterval(function(){load(M.day);},4000);}
+ function stopPoll(){if(M.poll){clearInterval(M.poll);M.poll=null;}}
+
+ function render(){
+  var d=M.data, root=$('mo-root');
+  if(!d.logged_in){root.innerHTML='<div class="empty">Sign in above to see the morning sheet.</div>';return;}
+  if(d.fatal){root.innerHTML='<div class="warn" style="background:#fef2f2;color:#991b1b;border-color:#fecaca">Server error loading the morning sheet: '+esc(d.fatal)+'</div>';return;}
+  M.day=d.day;
+  var r=d.report, st=d.state||{};
+  var opts=(d.days||[]).slice();
+  if(opts.indexOf(d.day)<0)opts.unshift(d.day);
+  var sel='<select id="mo-day" onchange="moLoad(this.value)">'+opts.map(function(x){return '<option value="'+x+'"'+(x===d.day?' selected':'')+'>'+shortDay(x)+(x===d.today?' (today)':'')+'</option>';}).join('')+'</select>';
+  var h='';
+  h+='<div class="bar" style="align-items:center;margin-top:4px">'+sel;
+  h+='<button class="primary" onclick="moDownload()" '+(r?'':'disabled')+'>📥 Download .xlsx</button>';
+  if(d.day===d.today){
+   h+='<button onclick="moGen(false)" title="Re-pull prices only — keeps today\'s news (free)">🔄 Refresh prices</button>';
+   h+='<button onclick="moGen(true)" title="Re-run Claude for news, dividends and earnings (uses API credit)" '+(d.ai_on?'':'disabled')+'>✨ Rebuild with Claude</button>';
+  }
+  h+='<button onclick="moEmail()" '+(r&&d.email_on?'':'disabled')+' title="'+esc(d.email_to&&d.email_to.length?('Send to '+d.email_to.join(', ')):'Set MORNING_EMAIL_TO on the server')+'">✉️ Email now</button>';
+  h+='<span id="mo-msg" style="font-size:12px"></span></div>';
+  if(st.running){h+='<div class="warn">⏳ '+esc(st.step||'Working…')+' <span class="muted">(started '+esc(st.started||'')+')</span></div>';}
+  else if(st.error){h+='<div class="warn" style="background:#fef2f2;color:#991b1b;border-color:#fecaca">Last run problem: '+esc(st.error)+'</div>';}
+  var info=[];
+  if(r){
+   info.push('Built '+esc(r.built_at));
+   if(r.ai_at)info.push('news by Claude at '+esc(r.ai_at));
+   if(r.emailed&&r.emailed.length){var e=r.emailed[r.emailed.length-1];info.push('emailed '+esc(e.at)+' to '+esc((e.to||[]).join(', ')));}
+  }
+  info.push('runs automatically '+esc(d.schedule)+(d.email_to&&d.email_to.length?' and emails '+esc(d.email_to.join(', ')):''));
+  if(!d.ai_on)info.push('<b>Claude is off</b> (needs ANTHROPIC_API_KEY, MORNING_AI≠0) — prices only');
+  h+='<div class="muted" style="font-size:12px;margin:2px 0 10px;color:#4b5563">'+info.join(' · ')+'</div>';
+  if(r&&r.errors&&r.errors.length){h+='<div class="warn">Some stocks are missing news: '+esc(r.errors.join(' | '))+'</div>';}
+  if(!r){
+   h+='<div class="empty" style="margin:18px 0">No sheet for '+esc(longDay(d.day))+' yet.'+(d.day===d.today?' It builds itself at '+esc(d.schedule)+', or press <b>✨ Rebuild with Claude</b> to make it now (2–4 min).':'')+'</div>';
+  }else{
+   h+=table(r);
+  }
+  h+=portfolioEditor(d.portfolio||[]);
+  root.innerHTML=h;
+ }
+
+ function table(r){
+  var closeLbl=r.close_day?shortDay(r.close_day):'prev';
+  var h='<div style="overflow:auto"><table class="motbl"><thead>';
+  h+='<tr><th colspan="7" class="mo-title">Pre-Market Stock Price — '+esc(longDay(r.day))+'</th></tr>';
+  h+='<tr><th>Ticker</th><th>Company Name</th><th>Last Close ('+esc(closeLbl)+')</th><th>Pre-Market ('+esc(shortDay(r.day))+')</th><th>News / Risk Alert</th><th>Ex-Div Date</th><th>Earnings Date</th></tr></thead><tbody>';
+  r.rows.forEach(function(x,i){
+   var cls=x.level==='high'?'mo-high':(x.level==='risk'?'mo-risk':(i%2?'':'mo-alt'));
+   var pc='';
+   if(x.pre!=null&&x.close){pc=x.pre>=x.close?'mo-up':'mo-dn';}
+   var chg='';
+   if(x.pre!=null&&x.close){var p=(x.pre/x.close-1)*100;chg='<div class="mo-chg">'+(p>=0?'+':'')+p.toFixed(2)+'%</div>';}
+   var ex=x.exdiv||'—', hasEx=ex.charAt(0)!=='—';
+   var eg=x.earnings||'', hasEg=eg&&eg.charAt(0)!=='—';
+   h+='<tr class="'+cls+'"><td class="mo-tk">'+esc(x.ticker)+'</td><td>'+esc(x.name)+'</td>'+
+      '<td class="mo-num '+pc+'">'+fmt(x.close)+'</td>'+
+      '<td class="mo-num '+pc+'" title="'+esc(x.pre_time?('last pre-market trade '+x.pre_time):'no pre-market trade yet')+'">'+fmt(x.pre)+chg+'</td>'+
+      '<td class="mo-news">'+esc(x.news)+'</td>'+
+      '<td class="mo-c'+(hasEx?' mo-ex'+(/est/.test(ex)?' mo-est':''):'')+'">'+esc(ex)+'</td>'+
+      '<td class="mo-c'+(hasEg?' mo-eg':'')+'">'+esc(eg)+'</td></tr>';
+  });
+  h+='</tbody></table></div>';
+  h+='<div class="foot">Prices: Alpaca (IEX) — N/A means no pre-market trade yet (IEX pre-market volume is thin). News, ex-dividend and earnings dates are researched by Claude with web search; <i>est.</i> = projected, not yet confirmed. Hover a pre-market price for its trade time.</div>';
+  return h;
+ }
+
+ function portfolioEditor(port){
+  var h='<details style="margin-top:16px"><summary style="cursor:pointer;font-weight:700">✏️ Edit portfolio ('+port.length+' stocks)</summary>';
+  h+='<div class="bar addtop" style="margin-top:8px"><input id="mo-add" placeholder="Add a ticker (e.g. COST)" maxlength="10" style="flex:1;min-width:160px;text-transform:uppercase" onkeydown="if(event.key===\'Enter\')moAdd()"><button class="primary" onclick="moAdd()">Add</button></div>';
+  h+='<div style="display:flex;flex-wrap:wrap;gap:6px">'+port.map(function(p){
+   return '<span class="mo-chip" title="'+esc(p.name)+'">'+esc(p.symbol)+' <button onclick="moRemove(\''+esc(p.symbol)+'\')" title="Remove">×</button></span>';
+  }).join('')+'</div>';
+  h+='<div class="muted" style="font-size:12px;margin-top:6px;color:#4b5563">Changes apply to the next sheet. Press 🔄 Refresh prices to add a new stock to today\'s sheet (its news fills in on the next Claude run).</div></details>';
+  return h;
+ }
+
+ window.moLoad=function(day){load(day);};
+ window.moDownload=function(){window.location='/api/morning/xlsx?day='+encodeURIComponent(M.day);};
+ window.moGen=async function(ai){
+  if(ai&&!confirm('Re-run Claude for all stocks? Takes 2–4 minutes and uses API credit (~$0.50–$1).'))return;
+  var d=await (await fetch('/api/morning/generate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ai:ai})})).json();
+  if(d.error){msg(d.error);}
+  setTimeout(function(){load(M.data.today);},600);
+ };
+ window.moEmail=async function(){
+  var to=(M.data.email_to||[]).join(', ');
+  if(!confirm('Email this sheet to '+to+'?'))return;
+  msg('Sending…',true);
+  var d=await (await fetch('/api/morning/email',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({day:M.day})})).json();
+  if(d.ok){msg(d.msg||'Sent!',true);load(M.day);}else{msg(d.error||'Email failed');}
+ };
+ window.moAdd=async function(){
+  var v=($('mo-add').value||'').trim().toUpperCase(); if(!v)return;
+  var d=await (await fetch('/api/morning/portfolio',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'add',symbol:v})})).json();
+  if(d.error){msg(d.error);return;}
+  await load(M.day); var det=document.querySelector('#mo-root details'); if(det)det.open=true;
+ };
+ window.moRemove=async function(sym){
+  if(!confirm('Remove '+sym+' from the morning sheet?'))return;
+  await fetch('/api/morning/portfolio',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'remove',symbol:sym})});
+  await load(M.day); var det=document.querySelector('#mo-root details'); if(det)det.open=true;
+ };
+ window.initMorning=function(){load(M.day&&M.data&&M.day!==M.data.today?M.day:'');};
+ window.leaveMorning=function(){stopPoll();};
+})();
+"""
+
+
+PAGE = """<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1"><title>Stock Watch</title>
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="apple-touch-icon" href="/icon.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Stock Watch">
+<meta name="theme-color" content="#1d4ed8">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<style>
+:root{color-scheme:light}*{box-sizing:border-box}
+body{margin:0;padding:18px;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;background:#f6f7f9;color:#16181d}
+h1{font-size:20px;margin:0 0 2px}h2{font-size:15px;margin:16px 0 8px}
+.meta{color:#374151;font-size:12px}.rule{color:#374151;font-size:12px;margin:2px 0 10px}
+.bar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px}
+.addtop{background:#eef3fb;border:1px solid #cfe0f5;border-radius:10px;padding:10px;margin-bottom:12px}
+button{font:inherit;font-size:13px;padding:7px 12px;border-radius:8px;border:1px solid #d1d5db;background:#fff;cursor:pointer}
+button:hover{background:#f3f4f6}.primary{background:#1d4ed8;color:#fff;border-color:#1d4ed8}.primary:hover{background:#1e40af}
+input{font:inherit;font-size:13px;padding:7px 10px;border:1px solid #d1d5db;border-radius:8px}
+.open{background:#ecfdf5;color:#047857;border:1px solid #a7f3d0;padding:5px 11px;border-radius:999px;font-size:12px}
+.closed{background:#fef2f2;color:#b91c1c;border:1px solid #fecaca;padding:5px 11px;border-radius:999px;font-size:12px}
+.warn{background:#fffbeb;color:#92400e;border:1px solid #fde68a;padding:10px 12px;border-radius:8px;font-size:13px;margin-bottom:12px}
+.card-auth{background:#fff;border:1px solid #e7e9ee;border-radius:12px;padding:16px;max-width:340px;margin-bottom:14px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(155px,1fr));gap:10px}
+.card{background:#fff;border:1px solid #e7e9ee;border-left:4px solid #cbd5e1;border-radius:10px;padding:10px 12px;position:relative;cursor:pointer}
+.card:hover{border-color:#c7ccd6}.card.near{border-left-color:#16a34a;background:#f0fdf4}
+.tk{font-weight:700;font-size:15px}.pr{float:right;font-weight:700}
+.sig{margin-left:8px;font-size:11px;font-weight:700;padding:1px 7px;border-radius:999px;vertical-align:middle}
+.alrm{margin-left:6px;font-size:11px;font-weight:800;padding:1px 7px;border-radius:999px;vertical-align:middle;background:#fef3c7;color:#92400e;border:1px solid #fcd34d}
+.alrm.deep{background:#fee2e2;color:#991b1b;border-color:#fca5a5}
+.row{font-size:12px;color:#16181d;margin-top:3px;font-weight:600}
+.card .muted{color:#1f2430;font-weight:700}
+.up{color:#16a34a;font-weight:700}.dn{color:#dc2626;font-weight:700}
+.muted{color:#9ca3af}.foot{color:#16181d;font-weight:600;font-size:12px;margin-top:18px}
+.x{position:absolute;top:6px;right:8px;cursor:pointer;color:#9ca3af;font-size:14px;border:none;background:none;padding:2px 5px}
+.x:hover{color:#dc2626}#msg,#authmsg{font-size:12px;color:#b91c1c}
+.who{font-size:12px;color:#374151;display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+#overlay{position:fixed;inset:0;background:rgba(15,18,25,.45);display:none;align-items:center;justify-content:center;padding:16px;z-index:50}
+#modal{background:#fff;border-radius:14px;max-width:440px;width:100%;padding:18px;position:relative;max-height:92vh;overflow:auto}
+#modal.wide{max-width:780px}
+.stat{display:flex;justify-content:space-between;font-size:13px;padding:5px 0;border-bottom:1px solid #f1f1f1}
+@keyframes blinkamber{0%,100%{background:#fff7ed;border-color:#f59e0b}50%{background:#fde68a;border-color:#b45309}}
+.card.alerting{animation:blinkamber 1s ease-in-out 30}
+/* Watchlist table view (Format 2 — grandpa's alphabetized spreadsheet layout) */
+.wtbl{border-collapse:collapse;width:100%;font-size:13px;background:#fff;border:1px solid #e7e9ee;border-radius:8px;overflow:hidden}
+.wtbl thead th{background:#f6f7f9;color:#374151;font-size:12px;font-weight:700;padding:9px 10px;text-align:right;border-bottom:2px solid #e7e9ee;white-space:nowrap}
+.wtbl thead th:first-child{text-align:left}
+.wtbl thead th:nth-last-child(-n+4){text-align:center}
+.wtbl thead th:last-child{width:32px}
+.wtbl tbody td{padding:8px 10px;border-bottom:1px solid #f1f2f4;text-align:right;white-space:nowrap;vertical-align:middle}
+.wtbl tbody td:first-child{text-align:left}
+.wtbl tbody td:nth-last-child(-n+4){text-align:center}
+.wtbl tbody tr{cursor:pointer;transition:background 0.1s}
+.wtbl tbody tr:nth-child(even){background:#fafbfc}
+.wtbl tbody tr:hover{background:#eff6ff}
+.wtbl .wt-tk{font-weight:800;font-size:14px;color:#111827;letter-spacing:0.02em}
+.wtbl .wt-up{color:#047857;font-weight:600}
+.wtbl .wt-dn{color:#b91c1c;font-weight:600}
+.wtbl .wt-mut{color:#9ca3af}
+.wtbl .wt-sig{display:inline-block;background:#e0f2fe;color:#075985;padding:2px 8px;border-radius:999px;font-size:11px;font-weight:700}
+.wtbl .wt-alarm{display:inline-block;background:#fef3c7;color:#92400e;padding:2px 8px;border-radius:999px;font-size:11px;font-weight:800}
+.wtbl .wt-earn{display:inline-block;background:#ede9fe;color:#5b21b6;padding:2px 8px;border-radius:999px;font-size:11px;font-weight:700}
+.wtbl .wt-x{background:none;border:none;color:#9ca3af;font-size:13px;cursor:pointer;padding:2px 6px}
+.wtbl .wt-x:hover{color:#b91c1c;background:#fef2f2;border-radius:4px}
+@keyframes wtblink{0%,100%{background:#fef3c7}50%{background:#fde68a}}
+.wtbl tbody tr.wt-blink{animation:wtblink 1s ease-in-out 6}
+.empty{font-size:14px;color:#16181d;font-weight:600;margin-top:8px}
+.tabs{display:flex;gap:4px;margin:10px 0 14px;border-bottom:1px solid #e7e9ee;overflow-x:auto;-webkit-overflow-scrolling:touch}
+.tabs .tab{flex:0 0 auto;white-space:nowrap}
+.tab{border:none;background:none;border-radius:0;border-bottom:2px solid transparent;padding:8px 14px;color:#374151;font-weight:600}
+.tab:hover{background:#f3f4f6}
+.tab.active{color:#1d4ed8;border-bottom-color:#1d4ed8}
+.histtbl .stat span{flex:1}
+.histtbl .stat span:nth-child(2),.histtbl .stat span:nth-child(3){text-align:center}
+.histtbl .stat span:nth-child(4),.histtbl .stat span:nth-child(5){text-align:right}
+.etbl{border-collapse:collapse;width:100%;font-size:12px}
+.etbl th,.etbl td{border-bottom:1px solid #eef0f3;padding:6px 8px;text-align:left;vertical-align:top}
+.etbl th{position:sticky;top:0;background:#f6f7f9;font-size:11px;color:#374151;white-space:nowrap}
+.etbl tr.gold{background:#fffbeb}
+.etbl tr.reported{background:#f0f9ff}
+.etbl tr.reported.gold{background:#fef6d9}
+.etbl .rpt{display:inline-block;color:#0891b2;font-weight:800;margin-right:4px;font-size:13px}
+.etbl input.b.beat{color:#166534;font-weight:700;background:#f0fdf4}
+.etbl input.b.miss{color:#991b1b;font-weight:700;background:#fef2f2}
+.etbl td.num{text-align:right;white-space:nowrap}
+.etbl .cons{display:inline-block;font-weight:700;padding:1px 7px;border-radius:999px;font-size:11px}
+.cons.green{background:#dcfce7;color:#166534}.cons.amber{background:#fef3c7;color:#92400e}
+.cons.gray{background:#eef0f3;color:#374151}.cons.red{background:#fee2e2;color:#991b1b}
+.etbl input.g{width:46px;padding:3px 5px;font-size:12px}
+.etbl input.b{width:56px;padding:3px 5px;font-size:12px}
+.etbl textarea.w{width:100%;min-width:190px;height:34px;font:inherit;font-size:12px;padding:3px 5px;border:1px solid #d1d5db;border-radius:6px;resize:vertical}
+.etbl a.ews{text-decoration:none;font-size:14px}
+.star{cursor:pointer;font-size:15px;border:none;background:none;padding:0;line-height:1}
+.edate{font-weight:700;white-space:nowrap}.ewhen{color:#6b7280;white-space:nowrap}
+.earn-badge{display:inline-block;margin-top:4px;font-size:10px;font-weight:800;padding:1px 6px;border-radius:999px;background:#eef2ff;color:#3730a3;border:1px solid #c7d2fe}
+.earn-badge.soon{background:#fef3c7;color:#92400e;border-color:#fcd34d}
+.earn-badge.imm{background:#fee2e2;color:#991b1b;border-color:#fca5a5}
+/* ☀️ Morning sheet — same colours as grandpa's spreadsheet */
+.motbl{border-collapse:collapse;width:100%;font-size:13px;background:#fff;min-width:900px}
+.motbl th,.motbl td{border:1px solid #9ca3af;padding:6px 8px;vertical-align:middle}
+.motbl thead th{background:#2f5496;color:#fff;font-weight:700;text-align:center;font-size:12px}
+.motbl thead th.mo-title{background:#1f3864;font-size:15px;padding:8px}
+.motbl tr.mo-alt td{background:#f2f2f2}.motbl tr.mo-risk td{background:#fff2cc}.motbl tr.mo-high td{background:#ffd966}
+.motbl .mo-tk{font-weight:800;text-align:center}
+.motbl td.mo-num{text-align:center;white-space:nowrap}
+.motbl td.mo-up{background:#c6efce !important;color:#276221}.motbl td.mo-dn{background:#ffc7ce !important;color:#9c0006}
+.motbl .mo-chg{font-size:11px;font-weight:700}
+.motbl td.mo-news{min-width:340px;line-height:1.35}
+.motbl td.mo-c{text-align:center;white-space:nowrap}
+.motbl td.mo-ex{background:#fff2cc !important;font-weight:700}.motbl td.mo-est{font-style:italic}
+.motbl td.mo-eg{background:#deeaf1 !important;font-weight:700}
+.mo-chip{display:inline-flex;align-items:center;gap:2px;background:#fff;border:1px solid #d1d5db;border-radius:999px;padding:2px 4px 2px 10px;font-size:12px;font-weight:700}
+.mo-chip button{border:none;background:none;padding:0 6px;color:#9ca3af;font-size:14px}.mo-chip button:hover{color:#dc2626;background:none}
+</style></head><body>
+<h1>📈 Stock Watch</h1>
+<div class="meta" id="asof">loading…</div>
+<div class="rule" id="rule"></div>
+<div id="warn"></div>
+<div id="authbox"></div>
+
+<div class="tabs">
+  <button id="tab-watch" class="tab active" onclick="showTab('watch')">⭐ Watchlist</button>
+  <button id="tab-hist" class="tab" onclick="showTab('history')">🕘 History</button>
+  <button id="tab-sim" class="tab" onclick="showTab('sim')">🧪 SimuWatch</button>
+  <button id="tab-earn" class="tab" onclick="showTab('earn')">📅 Earnings</button>
+  <button id="tab-simucal" class="tab" onclick="showTab('simucal')">🎯 SimuCal</button>
+  <button id="tab-morning" class="tab" onclick="showTab('morning')">☀️ Morning</button>
+</div>
+
+<div id="view-watch">
+<div id="addbar" class="bar addtop" style="display:none">
+  <input id="addsym" placeholder="Add a stock (e.g. NFLX)" maxlength="10" onkeydown="if(event.key==='Enter')addSym()" style="flex:1;min-width:160px">
+  <button class="primary" onclick="addSym()">Add</button>
+</div>
+<div class="bar">
+  <span id="status"></span>
+  <button onclick="load()">Refresh</button>
+  <button onclick="copyList('pre')">Copy pre-market</button>
+  <button id="viewtog" onclick="toggleWatchView()" title="Switch between card and table layouts">📊 Table view</button>
+  <label style="font-size:13px"><input type="checkbox" id="sndtog" checked> 🔊 Sound</label>
+  <button id="pushbtn" style="display:none" onclick="enablePush()">🔔 Enable phone alerts</button>
+  <span id="msg"></span>
+</div>
+
+<h2>⭐ My Watchlist</h2>
+<div class="grid" id="mygrid"></div>
+<div id="signedout" class="empty" style="display:none">Sign in above to build your watchlist.</div>
+
+<div class="foot">Green cards have bounced up from today's low. Tap any stock for details & today's chart. Data: Alpaca (IEX) — real-time.</div>
+</div>
+
+<div id="view-history" style="display:none">
+  <h2>🔔 Alert history &nbsp;<button onclick="loadHistory()" style="font-weight:600;font-size:12px;padding:4px 9px">Refresh</button></h2>
+  <div id="histalerts" class="empty">Loading…</div>
+  <h2 style="margin-top:18px">📊 Price history</h2>
+  <div class="bar"><label style="font-size:13px">Stock:&nbsp;</label><select id="histsym" onchange="loadDaily()" style="min-width:120px"></select></div>
+  <div style="height:240px;margin-top:6px"><canvas id="hist_chart"></canvas></div>
+  <div class="muted" id="hist_note" style="font-size:12px;margin-top:6px"></div>
+</div>
+
+<div id="view-sim" style="display:none">
+  <div id="sim-root"></div>
+</div>
+
+<div id="view-earn" style="display:none">
+  <div class="bar" style="align-items:center">
+    <button onclick="earnWeek(-1)">◀ Prev</button>
+    <span id="earn-range" style="font-weight:700">…</span>
+    <button onclick="earnWeek(1)">Next ▶</button>
+    <button onclick="earnWeek(0)">This week</button>
+    <button onclick="loadEarnings(true)" style="font-weight:600">Refresh</button>
+    <button id="earn-copy-btn" onclick="copyEarningsToExcel()" title="Copy visible rows as TSV — paste directly into Excel">📋 Copy to Excel</button>
+  </div>
+  <div id="earn-note" class="muted" style="font-size:12px;margin-bottom:8px"></div>
+  <div id="earn-wrap" style="overflow:auto"><div class="empty">Loading…</div></div>
+  <div class="foot">Objective columns auto-fill from Finnhub and refresh on their own. <b>Grade</b>, <b>Beat %</b> and <b>What to Watch</b> are yours — edits save to your account. Tap ☆ to flag a market-mover; ⧉ opens Earnings Whispers for the whisper number.</div>
+</div>
+
+<div id="view-simucal" style="display:none">
+  <h2>🎯 SimuCal <span class="muted" style="font-weight:400;font-size:13px">· v5.0 anchored rubric</span></h2>
+  <div class="bar" style="align-items:center;margin-top:8px">
+    <input id="sc-ticker" placeholder="Enter any ticker (e.g. NVDA)" maxlength="10" style="flex:1;min-width:180px;text-transform:uppercase" onkeydown="if(event.key==='Enter')simucalRun()">
+    <button class="primary" onclick="simucalRun()">Research</button>
+  </div>
+  <div class="muted" style="font-size:12px;margin-top:6px">Claude searches the web for the next earnings date, consensus, revisions, and guide — then scores the 6-factor rubric. Takes 30–60 seconds.</div>
+  <div id="sc-status" style="margin-top:14px"></div>
+  <div id="sc-result" style="margin-top:14px"></div>
+  <div id="sc-basket" style="margin-top:14px"></div>
+  <div class="foot">Probability is a rubric-derived subjective score, not options-implied. Model returns fresh sources with each query.</div>
+</div>
+
+<div id="view-morning" style="display:none">
+  <h2>☀️ Morning Sheet <span class="muted" style="font-weight:400;font-size:13px">· JT portfolio pre-market</span></h2>
+  <div id="mo-root"><div class="empty">Loading…</div></div>
+</div>
+
+<div id="overlay" onclick="if(event.target===this)closeDetail()">
+  <div id="modal">
+    <button class="x" style="font-size:18px" onclick="closeDetail()">✕</button>
+    <div style="font-size:20px;font-weight:700" id="d_tk"></div>
+    <div style="font-size:22px;margin:4px 0 12px" id="d_price"></div>
+    <div id="d_stats"></div>
+    <div style="margin-top:14px;height:200px"><canvas id="d_chart"></canvas></div>
+    <div class="muted" style="font-size:12px;margin-top:8px" id="d_note"></div>
+    <button id="calc-btn" onclick="toggleCalc()" style="margin-top:14px;width:100%;padding:10px;border:1px solid #d1d5db;border-radius:10px;background:#f9fafb;font-size:14px;cursor:pointer">📊 Probability calculator</button>
+    <div id="calc-wrap" style="display:none;margin-top:10px">
+      <iframe id="calc-frame" title="Probability calculator" style="width:100%;height:640px;border:0;border-radius:10px;background:transparent"></iframe>
+    </div>
+  </div>
+</div>
+<script src="/sim.js"></script>
+<script src="/simucal.js"></script>
+<script src="/morning.js"></script>
+<script>
+let LAST={mine:[]}, ME={logged_in:false}, _chart=null, prevAlarmNum={}, firstLoad=true, _curTab='watch', _histChart=null;
+function pctSpan(v){if(v===null||v===undefined)return '<span class="muted">—</span>';var s=(v>=0?"+":"")+v.toFixed(2)+"%";return '<span class="'+(v>=0?'up':'dn')+'">'+s+'</span>';}
+function money(v){return (v===null||v===undefined)?'<span class="muted">—</span>':'$'+v.toFixed(2);}
+function beep(){try{var a=new (window.AudioContext||window.webkitAudioContext)();var o=a.createOscillator(),g=a.createGain();o.connect(g);g.connect(a.destination);o.type='sine';o.frequency.value=880;g.gain.setValueAtTime(0.0001,a.currentTime);g.gain.exponentialRampToValueAtTime(0.12,a.currentTime+0.02);g.gain.exponentialRampToValueAtTime(0.0001,a.currentTime+0.5);o.start();o.stop(a.currentTime+0.52);}catch(e){}}
+function sigBadge(t){
+ if(!t.signal)return '';
+ var bg={'Good':'#fef3c7','Very Good':'#dbeafe','Excellent':'#dcfce7'}[t.signal]||'#eee';
+ var fg={'Good':'#92400e','Very Good':'#1e40af','Excellent':'#166534'}[t.signal]||'#333';
+ return '<span class="sig" style="background:'+bg+';color:'+fg+'">'+t.signal+'</span>';
+}
+function alarmBadge(t){
+ var n=t.alarm_num||0; if(n<=0) return '';
+ var deep=(n>=3)?' deep':'';
+ return '<span class="alrm'+deep+'" title="'+n+' new-low bounce(s) today">🔔 #'+n+'</span>';
+}
+function card(t,blink){
+ let cls='card';if(t.near)cls+=' near';if(blink)cls+=' alerting';
+ const x='<button class="x" title="Remove" onclick="event.stopPropagation();delSym(\\''+t.ticker+'\\')">✕</button>';
+ return '<div class="'+cls+'" onclick="openDetail(\\''+t.ticker+'\\')">'+x+'<span class="tk">'+t.ticker+'</span>'+sigBadge(t)+alarmBadge(t)+'<span class="pr">'+money(t.price)+'</span>'+
+  '<div class="row">change: '+pctSpan(t.change)+'</div>'+
+  '<div class="row">from day low: '+pctSpan(t.from_low)+'</div>'+
+  '<div class="row muted">open: '+(t.open==null?'—':'$'+t.open.toFixed(2))+' · prev: '+(t.prev_close==null?'—':'$'+t.prev_close.toFixed(2))+'</div>'+
+  '<div class="row muted">VWAP: '+(t.vwap==null?'—':'$'+t.vwap.toFixed(2))+'</div>'+
+  '<div class="row muted">'+(t.as_of||'')+'</div>'+earnCardBadge(t)+'</div>';
+}
+
+// Spreadsheet-style table view — same data as cards, laid out for scanning.
+// Alphabetized by ticker so grandpa can find a specific stock quickly.
+function renderWatchTable(mine, newOnes){
+ var fmt = function(v, dp){ return (v==null) ? '<span class="wt-mut">—</span>' : '$'+Number(v).toFixed(dp==null?2:dp); };
+ var pct = function(v){
+   if(v==null) return '<span class="wt-mut">—</span>';
+   var s=(v>=0?'+':'')+Number(v).toFixed(2)+'%';
+   return '<span class="'+(v>=0?'wt-up':'wt-dn')+'">'+s+'</span>';
+ };
+ var sorted = mine.slice().sort(function(a,b){ return (a.ticker||'').localeCompare(b.ticker||''); });
+ var head = '<thead><tr>'
+   + '<th class="wt-tk">Ticker</th>'
+   + '<th>Price</th>'
+   + '<th>Change</th>'
+   + '<th>From Low</th>'
+   + '<th>VWAP</th>'
+   + '<th>Open</th>'
+   + '<th>Prev</th>'
+   + '<th>Signal</th>'
+   + '<th>Alarms</th>'
+   + '<th>Earnings</th>'
+   + '<th></th>'
+   + '</tr></thead>';
+ var body = sorted.map(function(t){
+   var trCls = 'wt-row';
+   if(newOnes && newOnes.has(t.ticker)) trCls += ' wt-blink';
+   var alarms = (t.alarm_num && t.alarm_num > 0)
+     ? '<span class="wt-alarm">#'+t.alarm_num+'</span>'
+     : '<span class="wt-mut">—</span>';
+   // Earnings badge: show short date if we have one
+   var earn = '<span class="wt-mut">—</span>';
+   if(t.earn && t.earn.date){
+     earn = '<span class="wt-earn">'+t.earn.date+'</span>';
+   }
+   var sig = (t.signal ? '<span class="wt-sig">'+t.signal+'</span>' : '<span class="wt-mut">—</span>');
+   return '<tr class="'+trCls+'" onclick="openDetail(\\''+t.ticker+'\\')">'
+     + '<td class="wt-tk">'+t.ticker+'</td>'
+     + '<td>'+fmt(t.price)+'</td>'
+     + '<td>'+pct(t.change)+'</td>'
+     + '<td>'+pct(t.from_low)+'</td>'
+     + '<td>'+fmt(t.vwap)+'</td>'
+     + '<td>'+fmt(t.open)+'</td>'
+     + '<td>'+fmt(t.prev_close)+'</td>'
+     + '<td>'+sig+'</td>'
+     + '<td>'+alarms+'</td>'
+     + '<td>'+earn+'</td>'
+     + '<td><button class="wt-x" title="Remove" onclick="event.stopPropagation();delSym(\\''+t.ticker+'\\')">✕</button></td>'
+     + '</tr>';
+ }).join('');
+ return '<table class="wtbl">'+head+'<tbody>'+body+'</tbody></table>';
+}
+
+async function toggleWatchView(){
+ var next = (ME.watchlist_view === 'table') ? 'cards' : 'table';
+ ME.watchlist_view = next;
+ // Update button label immediately for responsiveness
+ var btn = document.getElementById('viewtog');
+ if(btn) btn.textContent = (next === 'table') ? '🃏 Card view' : '📊 Table view';
+ // Re-render right away with the data we already have
+ load();
+ // Persist the preference server-side (fire-and-forget)
+ try{
+   await fetch('/api/prefs/watchlist_view', {
+     method:'POST',
+     headers:{'Content-Type':'application/json'},
+     body: JSON.stringify({view: next})
+   });
+ } catch(e){ /* preference will just not persist across sessions */ }
+}
+
+function findRow(tk){return (LAST.mine||[]).find(function(r){return r.ticker===tk;});}
+async function openDetail(tk){
+ const t=findRow(tk)||{ticker:tk};
+ document.getElementById('overlay').style.display='flex';
+ window._calcSym=tk;
+ var _cw=document.getElementById('calc-wrap'),_cb=document.getElementById('calc-btn'),_cm=document.getElementById('modal'),_cf=document.getElementById('calc-frame');
+ if(_cw){_cw.style.display='none';} if(_cm){_cm.classList.remove('wide');} if(_cb){_cb.textContent='📊 Probability calculator';} if(_cf){_cf.removeAttribute('src');}
+ document.getElementById('d_tk').textContent=t.ticker;
+ document.getElementById('d_price').innerHTML=money(t.price)+' &nbsp; '+pctSpan(t.change);
+ const rows=[['Alarms today',(t.alarm_num&&t.alarm_num>0)?('#'+t.alarm_num+' (new-low bounces)'):'none yet'],
+   ['Signal',t.signal||'—'],
+   ['From day low',(t.from_low==null?'—':(t.from_low>=0?'+':'')+t.from_low.toFixed(2)+'%')],
+   ['Open',t.open==null?'—':'$'+t.open.toFixed(2)],['Day high',t.high==null?'—':'$'+t.high.toFixed(2)],
+   ['Day low',t.low==null?'—':'$'+t.low.toFixed(2)],['Prev close',t.prev_close==null?'—':'$'+t.prev_close.toFixed(2)],
+   ['As of',t.as_of||'—']];
+ document.getElementById('d_stats').innerHTML=rows.map(function(r){return '<div class="stat"><span class="muted">'+r[0]+'</span><span>'+r[1]+'</span></div>';}).join('');
+ document.getElementById('d_note').textContent='Loading today’s chart…';
+ try{const h=await (await fetch('/api/history?symbol='+encodeURIComponent(tk),{cache:'no-store'})).json();drawChart(h.points||[], (t.prev_close==null?null:t.prev_close));}
+ catch(e){document.getElementById('d_note').textContent='Chart unavailable.';}
+}
+function closeDetail(){document.getElementById('overlay').style.display='none';if(_chart){_chart.destroy();_chart=null;}}
+function annVolFromCloses(closes){
+ var c=(closes||[]).filter(function(v){return typeof v==='number'&&v>0;});
+ if(c.length<10) return null;
+ var recent=c.slice(-64),rets=[];
+ for(var i=1;i<recent.length;i++){rets.push(Math.log(recent[i]/recent[i-1]));}
+ if(rets.length<5) return null;
+ var m=rets.reduce(function(a,b){return a+b;},0)/rets.length;
+ var v=rets.reduce(function(a,b){return a+(b-m)*(b-m);},0)/(rets.length-1);
+ return Math.sqrt(v*252);
+}
+async function toggleCalc(){
+ var wrap=document.getElementById('calc-wrap'),modal=document.getElementById('modal'),btn=document.getElementById('calc-btn'),frame=document.getElementById('calc-frame');
+ if(wrap.style.display==='none'){
+   wrap.style.display='block';modal.classList.add('wide');btn.textContent='📊 Hide probability calculator';
+   var tk=window._calcSym,row=findRow(tk)||{},price=(row.price!=null?row.price:100),sigma=30,days=60;
+   try{
+     var h=await (await fetch('/api/hist/daily?symbol='+encodeURIComponent(tk),{cache:'no-store'})).json();
+     var closes=(h.points||[]).map(function(p){return p.close;});
+     var v=annVolFromCloses(closes);
+     if(v){sigma=+(v*100).toFixed(1);}
+   }catch(e){}
+   frame.src='/calc-widget?symbol='+encodeURIComponent(tk)+'&price='+encodeURIComponent(price)+'&sigma='+encodeURIComponent(sigma)+'&days='+days;
+ } else {
+   wrap.style.display='none';modal.classList.remove('wide');btn.textContent='📊 Probability calculator';
+ }
+}
+function drawChart(points,prevClose){
+ const cv=document.getElementById('d_chart'),note=document.getElementById('d_note');
+ if(_chart){_chart.destroy();_chart=null;}
+ if(!points.length){cv.style.display='none';note.textContent='No intraday data yet today — check back during market hours.';return;}
+ cv.style.display='block';note.textContent='Today’s movement · '+points.length+' points'+(prevClose!=null?' · dashed = prev close':'');
+ const labels=points.map(function(p){return p.t;}),data=points.map(function(p){return p.p;});
+ const up=data[data.length-1]>=data[0];
+ const ds=[{data:data,borderColor:up?'#16a34a':'#dc2626',borderWidth:2,pointRadius:0,tension:0.25,fill:false}];
+ if(prevClose!=null){ds.push({data:labels.map(function(){return prevClose;}),borderColor:'#9ca3af',borderWidth:1,borderDash:[5,4],pointRadius:0,fill:false});}
+ _chart=new Chart(cv,{type:'line',data:{labels:labels,datasets:ds},
+   options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{ticks:{maxTicksLimit:6,font:{size:10}}},y:{ticks:{font:{size:10}}}}}});
+}
+async function whoami(){ME=await (await fetch('/api/me',{cache:'no-store'})).json();renderAuth();}
+function renderAuth(){
+ const b=document.getElementById('authbox');
+ document.getElementById('addbar').style.display=ME.logged_in?'flex':'none';
+ document.getElementById('pushbtn').style.display=(ME.logged_in&&ME.push_on)?'inline-block':'none';
+ // Sync the cards/table toggle button label to the user's saved preference.
+ var vt = document.getElementById('viewtog');
+ if(vt){
+   vt.style.display = ME.logged_in ? 'inline-block' : 'none';
+   vt.textContent = (ME.watchlist_view === 'table') ? '🃏 Card view' : '📊 Table view';
+ }
+ if(ME.logged_in){
+   const al=ME.alerts_on?'checked':'';
+   const note=(ME.email_on||ME.push_on)?'':' <span class="muted">(alerts not set up by site owner)</span>';
+   b.innerHTML='<div class="who">Signed in as <b>'+ME.email+'</b> · <a href="#" onclick="logout();return false">Log out</a>'+
+     ' · <label><input type="checkbox" id="altog" '+al+' onchange="toggleAlerts()"> Send me alerts</label>'+note+'</div>';
+ }else{
+   b.innerHTML='<div class="card-auth"><b>Sign in</b> to build your watchlist & get alerts'+
+     '<div class="bar" style="margin-top:8px"><input id="em" placeholder="email" style="flex:1"></div>'+
+     '<div class="bar"><input id="pw" type="password" placeholder="password" style="flex:1"></div>'+
+     '<div class="bar"><button class="primary" onclick="auth(\\'login\\')">Log in</button>'+
+     '<button onclick="auth(\\'signup\\')">Create account</button></div>'+
+     '<div id="authmsg"></div></div>';
+ }
+}
+async function auth(kind){
+ const email=document.getElementById('em').value.trim(), pw=document.getElementById('pw').value;
+ const r=await fetch('/api/'+kind,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email,password:pw})});
+ const d=await r.json();
+ if(d.ok){await whoami();load();}else{document.getElementById('authmsg').textContent=d.error||'Something went wrong';}
+}
+async function logout(){await fetch('/api/logout',{method:'POST'});ME={logged_in:false};renderAuth();load();}
+async function toggleAlerts(){const on=document.getElementById('altog').checked;await fetch('/api/alerts',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({on})});ME.alerts_on=on;}
+async function addSym(){
+ const v=document.getElementById('addsym').value.trim();if(!v)return;
+ const d=await (await fetch('/api/watch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'add',symbol:v})})).json();
+ if(d.error){document.getElementById('msg').textContent=d.error;}else{document.getElementById('addsym').value='';load();}
+}
+async function delSym(s){await fetch('/api/watch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'remove',symbol:s})});load();}
+function b64ToU8(b){b=(b||'').replace(/[^A-Za-z0-9_-]/g,'');const p='='.repeat((4-b.length%4)%4);const s=(b+p).replace(/-/g,'+').replace(/_/g,'/');const raw=atob(s);const a=new Uint8Array(raw.length);for(let i=0;i<raw.length;i++)a[i]=raw.charCodeAt(i);return a;}
+async function enablePush(){
+ const m=document.getElementById('msg');m.style.color='#b91c1c';
+ if(!('serviceWorker' in navigator)||!('PushManager' in window)){m.textContent='This browser can’t do push. On iPhone, use Safari and Add to Home Screen first.';return;}
+ try{
+  const reg=await navigator.serviceWorker.register('/sw.js');
+  const perm=await Notification.requestPermission();
+  if(perm!=='granted'){m.textContent='Notifications were not allowed.';return;}
+  const k=await (await fetch('/api/push/key')).json();
+  if(!k.key){m.textContent='Push key missing on server.';return;}
+  const sub=await reg.pushManager.subscribe({userVisibleOnly:true,applicationServerKey:b64ToU8(k.key)});
+  await fetch('/api/push/subscribe',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({subscription:sub})});
+  m.style.color='#047857';m.textContent='Phone alerts enabled on this device!';
+ }catch(e){m.textContent='Could not enable alerts: '+(e.message||e);}
+}
+async function load(){
+ try{
+  const d=await (await fetch('/api/quotes',{cache:'no-store'})).json();LAST=d;
+  document.getElementById('asof').textContent='As of '+d.meta.as_of;
+  document.getElementById('rule').textContent=d.meta.rule||'';
+  document.getElementById('warn').innerHTML=d.meta.have_key?'':'<div class="warn">No data keys set. Add ALPACA_KEY and ALPACA_SECRET.</div>';
+  const ses=d.meta.session||'';const sc=(ses==='Open')?'open':'closed';
+  document.getElementById('status').innerHTML='<span class="'+sc+'">● '+ses+'</span>';
+  document.getElementById('signedout').style.display=ME.logged_in?'none':'block';
+  const grid=document.getElementById('mygrid');
+  if(ME.logged_in){
+    // Sort: most alarms first, then closest to a fresh bounce off the low.
+    const mine=(d.mine||[]).slice().sort((a,b)=>((b.alarm_num||0)-(a.alarm_num||0))||((b.from_low??-99)-(a.from_low??-99)));
+    // A "new" alarm = this symbol's alarm number climbed since the last poll.
+    const newOnes=new Set();
+    const curNum={};
+    mine.forEach(function(t){
+      const n=t.alarm_num||0; curNum[t.ticker]=n;
+      if(t.price!=null && n>(prevAlarmNum[t.ticker]||0)) newOnes.add(t.ticker);
+    });
+    if(!mine.length){
+      grid.innerHTML='<div class="empty">No stocks yet — add one in the box at the top.</div>';
+    } else if(ME.watchlist_view === 'table'){
+      grid.innerHTML = renderWatchTable(mine, newOnes);
+    } else {
+      grid.innerHTML = mine.map(t=>card(t, newOnes.has(t.ticker))).join('');
+    }
+    const sndOn=document.getElementById('sndtog')&&document.getElementById('sndtog').checked;
+    if(newOnes.size && sndOn && !firstLoad) beep();
+    prevAlarmNum=curNum;
+  }else{grid.innerHTML='';}
+  firstLoad=false;
+ }catch(e){document.getElementById('asof').textContent='could not load data';}
+}
+function copyList(kind){
+ const date=(LAST.meta&&LAST.meta.date)||'';
+ const priceHdr=(kind==='pre')?'Pre-Market Price':'Intraday Price';
+ const h=["Date","Ticker","Prev Close",priceHdr];
+ const rowsOf=(arr)=>arr.map(t=>[date,t.ticker,t.prev_close??"",t.price??""].join("\\t"));
+ const all=rowsOf(LAST.mine||[]);
+ const text=[h.join("\\t")].concat(all).join("\\n");
+ navigator.clipboard.writeText(text).then(()=>{document.getElementById('msg').style.color='#047857';document.getElementById('msg').textContent='Copied '+(kind==='pre'?'pre-market':'intraday')+' list ('+all.length+' rows)!';setTimeout(()=>document.getElementById('msg').textContent='',2600);});
+}
+function showTab(t){
+ _curTab=t;
+ document.getElementById('view-watch').style.display=(t==='watch')?'block':'none';
+ document.getElementById('view-history').style.display=(t==='history')?'block':'none';
+ document.getElementById('view-sim').style.display=(t==='sim')?'block':'none';
+ document.getElementById('view-earn').style.display=(t==='earn')?'block':'none';
+ document.getElementById('view-simucal').style.display=(t==='simucal')?'block':'none';
+ document.getElementById('tab-watch').classList.toggle('active',t==='watch');
+ document.getElementById('tab-hist').classList.toggle('active',t==='history');
+ document.getElementById('tab-sim').classList.toggle('active',t==='sim');
+ document.getElementById('tab-earn').classList.toggle('active',t==='earn');
+ document.getElementById('tab-simucal').classList.toggle('active',t==='simucal');
+ document.getElementById('view-morning').style.display=(t==='morning')?'block':'none';
+ document.getElementById('tab-morning').classList.toggle('active',t==='morning');
+ if(t==='morning'&&window.initMorning)window.initMorning(); else if(window.leaveMorning)window.leaveMorning();
+ if(t==='history')loadHistory();
+ if(t==='sim'&&window.initSim)window.initSim();
+ if(t==='earn')loadEarnings();
+ if(t==='simucal'&&window.initSimuCal)window.initSimuCal();
+}
+async function loadHistory(){
+ const box=document.getElementById('histalerts');
+ if(!ME.logged_in){box.innerHTML='<div class="empty">Sign in to see your history.</div>';document.getElementById('histsym').innerHTML='';drawDaily([],'');return;}
+ try{
+  const d=await (await fetch('/api/hist/alerts',{cache:'no-store'})).json();
+  const rows=d.rows||[];
+  if(!rows.length){box.innerHTML='<div class="empty">No alarms yet. Each time a stock bounces 0.5%+ off a fresh intraday low during pre-market or market hours, a numbered alarm is saved here.</div>';}
+  else{
+   const head='<div class="stat" style="font-weight:700;color:#374151"><span>Date / time</span><span>Ticker</span><span>Alarm</span><span>Price</span><span>From low</span></div>';
+   box.innerHTML='<div class="histtbl">'+head+rows.map(function(r){
+     return '<div class="stat"><span class="muted">'+r.day+' '+(r.ts||'')+'</span><span class="tk">'+r.symbol+'</span><span>'+alarmBadge({alarm_num:r.num})+'</span><span>'+money(r.price)+'</span><span>'+pctSpan(r.from_low)+'</span></div>';
+   }).join('')+'</div>';
+  }
+ }catch(e){box.innerHTML='<div class="empty">Could not load alert history.</div>';}
+ const syms=(LAST.mine||[]).map(function(t){return t.ticker;});
+ const sel=document.getElementById('histsym');const prev=sel.value;
+ sel.innerHTML=syms.length?syms.map(function(s){return '<option value="'+s+'">'+s+'</option>';}).join(''):'<option value="">(no stocks)</option>';
+ if(prev&&syms.indexOf(prev)>=0)sel.value=prev;
+ loadDaily();
+}
+async function loadDaily(){
+ const sym=document.getElementById('histsym').value;
+ const note=document.getElementById('hist_note');
+ if(!sym){drawDaily([],'');note.textContent='Add stocks to your watchlist to see their price history.';return;}
+ try{
+  const d=await (await fetch('/api/hist/daily?symbol='+encodeURIComponent(sym),{cache:'no-store'})).json();
+  drawDaily(d.points||[],sym);
+ }catch(e){note.textContent='Could not load price history.';}
+}
+function drawDaily(points,sym){
+ const cv=document.getElementById('hist_chart'),note=document.getElementById('hist_note');
+ if(_histChart){_histChart.destroy();_histChart=null;}
+ if(!points.length){cv.style.display='none';if(sym)note.textContent='No saved history yet for '+sym+'. History builds up one point per day from now on.';return;}
+ cv.style.display='block';note.textContent=sym+' · daily closing price · '+points.length+' day'+(points.length===1?'':'s');
+ const labels=points.map(function(p){return p.d;}),data=points.map(function(p){return p.close;});
+ const up=data[data.length-1]>=data[0];
+ _histChart=new Chart(cv,{type:'line',data:{labels:labels,datasets:[{data:data,borderColor:up?'#16a34a':'#dc2626',borderWidth:2,pointRadius:2,tension:0.2,fill:false}]},
+   options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{ticks:{maxTicksLimit:8,font:{size:10}}},y:{ticks:{font:{size:10}}}}}});
+}
+// ---------- Earnings tab ----------
+let _earnOffset=0, _earnReloadT=null, _earnReloadN=0;
+function earnWeek(o){ if(o===0)_earnOffset=0; else _earnOffset=Math.max(-2,Math.min(6,_earnOffset+o)); loadEarnings(); }
+function ewsLink(sym){return 'https://www.earningswhispers.com/stocks/'+encodeURIComponent(sym);}
+function esc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
+function consCell(r){ if(!r.consensus) return '<span class="muted">—</span>'; return '<span class="cons '+(r.consensus_color||'gray')+'">'+esc(r.consensus)+'</span>'; }
+function earnCardBadge(t){
+ if(!t.earn||t.earn.days==null) return '';
+ var d=t.earn.days,cls='earn-badge'; if(d<=1)cls+=' imm'; else if(d<=5)cls+=' soon';
+ var lbl=(d<=0?'today':(d===1?'tomorrow':'in '+d+'d'));
+ return '<div class="row"><span class="'+cls+'">📅 Earnings '+lbl+(t.earn.when?(' · '+t.earn.when):'')+'</span></div>';
+}
+async function loadEarnings(force){
+ const wrap=document.getElementById('earn-wrap'),note=document.getElementById('earn-note');
+ if(_earnReloadT){clearTimeout(_earnReloadT);_earnReloadT=null;}
+ if(force){_earnReloadN=0;}
+ wrap.innerHTML='<div class="empty">'+(force?'Refetching from Finnhub…':'Loading…')+'</div>';
+ try{
+  var url='/api/earnings?week='+_earnOffset+(force?'&force=1':'');
+  const d=await (await fetch(url,{cache:'no-store'})).json();
+  document.getElementById('earn-range').textContent=(d.week_start||'')+'  →  '+(d.week_end||'');
+  if(!d.have_earnings){wrap.innerHTML='<div class="warn">📅 The Earnings tab needs a free <b>Finnhub</b> key. Add <b>FINNHUB_KEY</b> in your server settings and it turns on automatically — everything else keeps working without it.</div>';note.textContent='';return;}
+  const rows=d.rows||[];
+  if(!rows.length){wrap.innerHTML='<div class="empty">No notable earnings found for this week.</div>';note.textContent='';return;}
+  note.textContent=rows.length+' notable companies reporting'+(d.logged_in?'':' — sign in to save your Grade / Beat % / notes.');
+  wrap.innerHTML=earnTable(rows,d.logged_in);
+  // Only re-poll if enrichment is still filling in AND we haven't tried too many times.
+  // Skip entirely if the user is typing — otherwise we'd nuke their in-progress edit.
+  var stillEnriching = rows.some(function(r){return r.pe==null||!r.consensus;});
+  if(stillEnriching && _earnReloadN < 8){
+    _earnReloadN++;
+    var attemptReload = function(){
+      if(_curTab!=='earn') return;
+      var ae=document.activeElement;
+      if(ae && ae.closest && ae.closest('#view-earn') && (ae.matches('input')||ae.matches('textarea'))){
+        // User is editing — postpone without counting against the cap
+        _earnReloadN--;
+        _earnReloadT=setTimeout(attemptReload, 15000);
+        return;
+      }
+      loadEarnings();
+    };
+    _earnReloadT=setTimeout(attemptReload, 25000);
+  }
+ }catch(e){wrap.innerHTML='<div class="empty">Could not load earnings.</div>';note.textContent='';}
+}
+function earnTable(rows,editable){
+ var dis=editable?'':' disabled';
+ var h='<table class="etbl"><thead><tr><th></th><th>Company</th><th>Ticker</th><th>Date</th><th>Time</th><th>P/E</th><th>Est. EPS</th><th>Est. Rev</th><th>Grade</th><th>Beat %</th><th>Consensus</th><th>What to Watch</th><th></th></tr></thead><tbody>';
+ h+=rows.map(function(r){
+   var cls=[]; if(r.gold)cls.push('gold'); if(r.is_reported)cls.push('reported');
+   var ro=cls.length?' class="'+cls.join(' ')+'"':'';
+   var grade=esc(r.grade||''), watch=esc(r.watch||''), beat=(r.beat!=null?r.beat:'');
+   var rptBadge=r.is_reported?'<span class="rpt" title="Already reported">✓</span> ':'';
+   // For reported rows, beat may be negative (miss). Drop the min=0 constraint
+   // and colorize green (beat) / red (miss).
+   var beatCls='b';
+   if(r.is_reported){ beatCls += (Number(beat)>=0?' beat':' miss'); }
+   var beatAttrs=r.is_reported?'type="number" step="1"':'type="number" step="1" min="0" max="100"';
+   return '<tr'+ro+' data-sym="'+r.symbol+'" data-period="'+esc(r.period||'')+'">'
+    +'<td><button class="star" title="Flag market-mover" onclick="toggleGold(this)">'+(r.gold?'⭐':'☆')+'</button></td>'
+    +'<td>'+esc(r.company||r.symbol)+'</td>'
+    +'<td class="tk">'+rptBadge+r.symbol+'</td>'
+    +'<td class="edate">'+(r.date||'—')+'</td>'
+    +'<td class="ewhen">'+(r.when||'—')+'</td>'
+    +'<td class="num">'+(r.pe!=null?r.pe:'—')+'</td>'
+    +'<td class="num">'+(r.eps_est!=null?('$'+Number(r.eps_est).toFixed(2)):'—')+'</td>'
+    +'<td class="num">'+(r.rev_est||'—')+'</td>'
+    +'<td><input class="g" value="'+grade+'" placeholder="—" onchange="saveNote(this)"'+dis+'></td>'
+    +'<td><input class="'+beatCls+'" '+beatAttrs+' value="'+beat+'" placeholder="—" onchange="saveNote(this)"'+dis+'></td>'
+    +'<td>'+consCell(r)+'</td>'
+    +'<td><textarea class="w" placeholder="your notes…" onchange="saveNote(this)"'+dis+'>'+watch+'</textarea></td>'
+    +'<td><a class="ews" href="'+ewsLink(r.symbol)+'" target="_blank" rel="noopener" title="Earnings Whispers (whisper number)">⧉</a></td>'
+   +'</tr>';
+ }).join('');
+ return h+'</tbody></table>';
+}
+function toggleGold(btn){ var on=(btn.textContent==='☆'); btn.textContent=on?'⭐':'☆'; var tr=btn.closest('tr'); if(tr){tr.classList.toggle('gold',on);} saveNote(btn); }
+function copyEarningsToExcel(){
+ var rows = document.querySelectorAll('#earn-wrap table.etbl tbody tr');
+ var btn = document.getElementById('earn-copy-btn');
+ var reset = function(){ if(btn) btn.textContent='📋 Copy to Excel'; };
+ if(!rows.length){
+   if(btn){ btn.textContent='(nothing to copy)'; setTimeout(reset,2000); }
+   return;
+ }
+ // Column order matches Camila's earnings spreadsheet (July_2026_Earnings_Week5.xlsx).
+ // Beat % is exported as a decimal fraction (0.65) to match the spreadsheet format —
+ // paste into a column formatted as "0.00" or Percentage and it will display correctly.
+ var headers = ['Company','Ticker','Date','Time','P/E','Est. EPS','Est. Revenue','Grade','Beat %','Consensus','What to Watch'];
+ var lines = [headers.join('\\t')];
+ var clean = function(s){ return String(s==null?'':s).replace(/\\t/g,' ').replace(/\\r?\\n/g,' ').trim(); };
+ rows.forEach(function(tr){
+   var tds = tr.querySelectorAll('td');
+   // tds indices: 0=star 1=Company 2=Ticker 3=Date 4=Time 5=P/E 6=EPS 7=Rev
+   //              8=Grade(input) 9=Beat(input) 10=Consensus 11=Watch(textarea) 12=EWS
+   var gradeIn = tds[8]  ? tds[8].querySelector('input')    : null;
+   var beatIn  = tds[9]  ? tds[9].querySelector('input')    : null;
+   var watchIn = tds[11] ? tds[11].querySelector('textarea'): null;
+   var beatRaw = beatIn ? beatIn.value.trim() : '';
+   var beat    = beatRaw ? (Number(beatRaw)/100).toFixed(2) : '';
+   var isGold  = tr.classList.contains('gold');
+   var company = (isGold ? '⭐ ' : '') + clean(tds[1] ? tds[1].textContent : '');
+   var cells = [
+     company,
+     clean(tds[2]  ? tds[2].textContent  : ''),
+     clean(tds[3]  ? tds[3].textContent  : ''),
+     clean(tds[4]  ? tds[4].textContent  : ''),
+     clean(tds[5]  ? tds[5].textContent  : ''),
+     clean(tds[6]  ? tds[6].textContent  : ''),
+     clean(tds[7]  ? tds[7].textContent  : ''),
+     clean(gradeIn ? gradeIn.value       : ''),
+     beat,
+     clean(tds[10] ? tds[10].textContent : ''),
+     clean(watchIn ? watchIn.value       : '')
+   ];
+   lines.push(cells.join('\\t'));
+ });
+ var tsv = lines.join('\\n');
+ var done = function(ok){
+   if(!btn) return;
+   btn.textContent = ok ? ('✓ Copied '+rows.length+' rows') : 'Copy failed — try Chrome';
+   setTimeout(reset, 2500);
+ };
+ // Modern browsers first; fall back to a hidden textarea if clipboard API is blocked.
+ if(navigator.clipboard && navigator.clipboard.writeText){
+   navigator.clipboard.writeText(tsv).then(function(){done(true);}).catch(function(){
+     try {
+       var ta=document.createElement('textarea'); ta.value=tsv; ta.style.position='fixed';
+       ta.style.left='-9999px'; document.body.appendChild(ta); ta.select();
+       var ok=document.execCommand('copy'); document.body.removeChild(ta); done(ok);
+     } catch(e){ done(false); }
+   });
+ } else {
+   try {
+     var ta2=document.createElement('textarea'); ta2.value=tsv; ta2.style.position='fixed';
+     ta2.style.left='-9999px'; document.body.appendChild(ta2); ta2.select();
+     var ok2=document.execCommand('copy'); document.body.removeChild(ta2); done(ok2);
+   } catch(e){ done(false); }
+ }
+}
+async function saveNote(el){
+ var tr=el.closest&&el.closest('tr'); if(!tr) return;
+ var sym=tr.getAttribute('data-sym'), period=tr.getAttribute('data-period');
+ var gi=tr.querySelector('input.g'), bi=tr.querySelector('input.b'), wi=tr.querySelector('textarea.w'), st=tr.querySelector('.star');
+ var beatRaw=bi?bi.value:''; var beat=(beatRaw===''||beatRaw==null)?null:Number(beatRaw);
+ var body={symbol:sym,period:period,grade:gi?gi.value:'',beat:beat,watch:wi?wi.value:'',gold:(st?st.textContent==='⭐':false)};
+ try{ await fetch('/api/earnings/note',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}); }catch(e){}
+}
+if('serviceWorker' in navigator){navigator.serviceWorker.register('/sw.js').catch(function(){});}
+whoami();load();setInterval(load,30000);
+</script></body></html>"""
+
+
+CALC_PAGE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Probability Calculator</title></head><body style="margin:0;background:transparent">
+<!-- =========================================================================
+     STOCK PROBABILITY CALCULATOR — embeddable widget
+     Drop this whole block into any page. Everything is namespaced under
+     .spc-widget so it will not collide with your site's CSS or JS.
+
+     Configure via data-* attributes on the root div below:
+       data-price          current price to prefill        (default 100)
+       data-symbol         ticker label to prefill         (optional)
+       data-mu             expected annual return, %        (default 8)
+       data-sigma          annual volatility, %             (default 30)
+       data-days           horizon in days                  (default 60)
+       data-quote-endpoint backend proxy URL for live fetch (optional; if
+                           omitted, the ticker/fetch row is hidden)
+
+     In a Jinja/Django template you can wire these to real data, e.g.:
+       data-symbol="{{ stock.symbol }}" data-price="{{ stock.price }}"
+     ========================================================================= -->
+<div class="spc-widget" id="spc-root"
+     data-symbol=""
+     data-price="100"
+     data-mu="8"
+     data-sigma="30"
+     data-days="60"
+     data-quote-endpoint="">
+<style>
+  .spc-widget{
+    color-scheme: light;
+    --spc-surface-1:#fcfcfb; --spc-page:#f4f4f2;
+    --spc-text-primary:#0b0b0b; --spc-text-secondary:#52514e; --spc-muted:#898781;
+    --spc-grid:#e1e0d9; --spc-baseline:#c3c2b7;
+    --spc-series-1:#2a78d6; --spc-series-2:#eb6834;
+    --spc-border:rgba(11,11,11,0.10); --spc-accent-soft:#cde2fb;
+    --spc-good:#0ca30c; --spc-good-soft:rgba(12,163,12,0.12);
+    --spc-bad:#d03b3b;  --spc-bad-soft:rgba(208,59,59,0.12);
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    line-height:1.5; color:var(--spc-text-primary);
+    background:var(--spc-page); border-radius:14px; padding:18px;
+    max-width:960px; margin:0 auto; -webkit-font-smoothing:antialiased;
+    font-size:15px; box-sizing:border-box;
+  }
+  .spc-widget.spc-dark{
+    color-scheme: dark;
+    --spc-surface-1:#1a1a19; --spc-page:#0f0f0e;
+    --spc-text-primary:#ffffff; --spc-text-secondary:#c3c2b7; --spc-muted:#898781;
+    --spc-grid:#2c2c2a; --spc-baseline:#383835;
+    --spc-series-1:#3987e5; --spc-series-2:#d95926;
+    --spc-border:rgba(255,255,255,0.10); --spc-accent-soft:#184f95;
+    --spc-good:#0ca30c; --spc-good-soft:rgba(12,163,12,0.18);
+    --spc-bad:#e05a5a;  --spc-bad-soft:rgba(224,90,90,0.18);
+  }
+  @media (prefers-color-scheme: dark){
+    .spc-widget:not(.spc-light){
+      color-scheme: dark;
+      --spc-surface-1:#1a1a19; --spc-page:#0f0f0e;
+      --spc-text-primary:#ffffff; --spc-text-secondary:#c3c2b7; --spc-muted:#898781;
+      --spc-grid:#2c2c2a; --spc-baseline:#383835;
+      --spc-series-1:#3987e5; --spc-series-2:#d95926;
+      --spc-border:rgba(255,255,255,0.10); --spc-accent-soft:#184f95;
+      --spc-good:#0ca30c; --spc-good-soft:rgba(12,163,12,0.18);
+      --spc-bad:#e05a5a; --spc-bad-soft:rgba(224,90,90,0.18);
+    }
+  }
+  .spc-widget *{box-sizing:border-box;}
+  .spc-widget .spc-head{display:flex; align-items:flex-start; justify-content:space-between; gap:16px; margin-bottom:6px;}
+  .spc-widget .spc-title{font-size:21px; margin:0 0 2px; letter-spacing:-0.02em; font-weight:700;}
+  .spc-widget .spc-sub{color:var(--spc-text-secondary); font-size:13.5px; margin:0 0 16px;}
+  .spc-widget .spc-theme{flex:none; cursor:pointer; border:1px solid var(--spc-border); background:var(--spc-surface-1);
+    color:var(--spc-text-secondary); border-radius:8px; padding:6px 11px; font-size:13px; font-family:inherit;}
+  .spc-widget .spc-theme:hover{color:var(--spc-text-primary);}
+  .spc-widget .spc-card{background:var(--spc-surface-1); border:1px solid var(--spc-border); border-radius:12px; padding:18px; margin-bottom:16px;}
+  .spc-widget .spc-h2{font-size:16px; margin:0 0 4px; letter-spacing:-0.01em; font-weight:600;}
+  .spc-widget .spc-h3{font-size:12px; color:var(--spc-muted); text-transform:uppercase; letter-spacing:0.05em; margin:0 0 12px; font-weight:600;}
+  .spc-widget .spc-hint{color:var(--spc-text-secondary); font-size:13px; margin:0 0 14px;}
+  .spc-widget label{display:block; font-size:12px; color:var(--spc-text-secondary); margin-bottom:5px; font-weight:500;}
+  /* form controls hardened with !important so an aggressive host reset
+     (e.g. `input{...!important}`) can't override the widget's own look */
+  .spc-widget input, .spc-widget select, .spc-widget textarea{width:100% !important;
+    font-family:inherit !important; font-size:14px !important; line-height:1.4 !important; padding:8px 10px !important;
+    background:var(--spc-page) !important; color:var(--spc-text-primary) !important;
+    border:1px solid var(--spc-border) !important; border-radius:8px !important; text-decoration:none !important;
+    letter-spacing:normal !important; text-transform:none; box-shadow:none !important;}
+  .spc-widget input[style*="uppercase"]{text-transform:uppercase !important;}
+  .spc-widget input:focus, .spc-widget select:focus, .spc-widget textarea:focus{outline:2px solid var(--spc-series-1); outline-offset:-1px; border-color:transparent;}
+  .spc-widget textarea{resize:vertical; min-height:90px; font-variant-numeric:tabular-nums;}
+  .spc-widget .spc-inputgrid{display:grid; grid-template-columns:repeat(auto-fit,minmax(120px,1fr)); gap:12px 14px; align-items:end;}
+  .spc-widget .spc-suffix{position:relative;}
+  .spc-widget .spc-suffix .spc-u{position:absolute; right:10px; top:50%; transform:translateY(-50%); color:var(--spc-muted); font-size:13px; pointer-events:none;}
+  .spc-widget .spc-suffix.spc-pre .spc-u{right:auto; left:10px;}
+  .spc-widget .spc-suffix.spc-pre input{padding-left:20px;}
+  .spc-widget .spc-btn{cursor:pointer; border:1px solid var(--spc-series-1); background:var(--spc-series-1); color:#fff;
+    border-radius:8px; padding:8px 14px; font-size:13px; font-family:inherit; font-weight:500; white-space:nowrap;}
+  .spc-widget .spc-btn:hover{filter:brightness(1.06);}
+  .spc-widget .spc-btn.spc-ghost{background:var(--spc-page); color:var(--spc-series-1);}
+  .spc-widget .spc-fetchrow{display:flex; gap:8px; align-items:flex-end; grid-column:span 2;}
+  .spc-widget .spc-fetchrow > div{flex:1;}
+  .spc-widget .spc-status{font-size:12px; color:var(--spc-muted); margin-top:8px; min-height:16px;}
+  .spc-widget .spc-status.spc-ok{color:var(--spc-good);} .spc-widget .spc-status.spc-warn{color:var(--spc-bad);}
+  .spc-widget .spc-tabs{display:flex; flex-wrap:wrap; gap:4px; border-bottom:1px solid var(--spc-grid); margin-bottom:20px;}
+  .spc-widget .spc-tab{cursor:pointer; border:none; background:none; font-family:inherit; font-size:14px; color:var(--spc-text-secondary);
+    padding:9px 13px; border-bottom:2px solid transparent; margin-bottom:-1px; border-radius:6px 6px 0 0;}
+  .spc-widget .spc-tab:hover{color:var(--spc-text-primary); background:var(--spc-surface-1);}
+  .spc-widget .spc-tab[aria-selected="true"]{color:var(--spc-series-1); border-bottom-color:var(--spc-series-1); font-weight:600;}
+  .spc-widget .spc-panel{display:none;} .spc-widget .spc-panel.spc-active{display:block;}
+  .spc-widget .spc-row{display:flex; gap:16px; flex-wrap:wrap; align-items:flex-end;}
+  .spc-widget .spc-field{flex:1 1 140px; min-width:120px;}
+  .spc-widget .spc-results{margin-top:16px; display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:12px;}
+  .spc-widget .spc-stat{background:var(--spc-page); border:1px solid var(--spc-border); border-radius:10px; padding:11px 13px;}
+  .spc-widget .spc-stat.spc-hl{background:var(--spc-accent-soft);}
+  .spc-widget .spc-stat.spc-pos{background:var(--spc-good-soft);} .spc-widget .spc-stat.spc-neg{background:var(--spc-bad-soft);}
+  .spc-widget .spc-k{font-size:11px; color:var(--spc-muted); text-transform:uppercase; letter-spacing:0.04em; margin-bottom:4px;}
+  .spc-widget .spc-stat.spc-hl .spc-k, .spc-widget .spc-stat.spc-pos .spc-k, .spc-widget .spc-stat.spc-neg .spc-k{color:var(--spc-text-secondary);}
+  .spc-widget .spc-v{font-size:19px; font-variant-numeric:tabular-nums; letter-spacing:-0.01em;}
+  .spc-widget .spc-v.spc-small{font-size:15px;}
+  .spc-widget .spc-err{color:var(--spc-bad); font-size:13px; margin-top:12px; min-height:0;}
+  .spc-widget .spc-chartwrap{margin-top:20px;}
+  .spc-widget .spc-charttitle{font-size:13px; color:var(--spc-text-secondary); margin:0 0 6px;}
+  .spc-widget .spc-chart{width:100%; height:auto; display:block; touch-action:none;}
+  .spc-widget .spc-chart text{fill:var(--spc-muted); font-size:10px; font-family:inherit;}
+  .spc-widget .spc-legend{display:flex; gap:16px; flex-wrap:wrap; font-size:12px; color:var(--spc-text-secondary); margin:2px 0 6px;}
+  .spc-widget .spc-legend span{display:inline-flex; align-items:center; gap:5px;}
+  .spc-widget .spc-legend i{width:14px; height:3px; border-radius:2px; display:inline-block;}
+  .spc-widget .spc-note{font-size:12px; color:var(--spc-muted); margin-top:14px;}
+  .spc-widget code{background:var(--spc-page); border:1px solid var(--spc-border); border-radius:5px; padding:1px 5px; font-size:12px;}
+  .spc-widget .spc-seg{display:inline-flex; border:1px solid var(--spc-border); border-radius:8px; overflow:hidden;}
+  .spc-widget .spc-seg button{border:none; background:var(--spc-page); color:var(--spc-text-secondary); font-family:inherit; font-size:13px; padding:7px 12px; cursor:pointer;}
+  .spc-widget .spc-seg button[aria-pressed="true"]{background:var(--spc-series-1); color:#fff;}
+  .spc-widget table{border:none;}
+  .spc-widget .spc-pct{width:100%; border:none; border-collapse:collapse; font-size:13px; margin-top:16px; font-variant-numeric:tabular-nums;}
+  .spc-widget .spc-pct th, .spc-widget .spc-pct td{text-align:right; padding:7px 10px; border-bottom:1px solid var(--spc-grid);}
+  .spc-widget .spc-pct th:first-child, .spc-widget .spc-pct td:first-child{text-align:left;}
+  .spc-widget .spc-pct th{color:var(--spc-muted); font-weight:500; font-size:11px; text-transform:uppercase; letter-spacing:0.03em;}
+  .spc-widget .spc-disc{font-size:12px; color:var(--spc-muted); border-top:1px solid var(--spc-grid); margin-top:22px; padding-top:14px;}
+  /* tooltip lives on <body>, single class, unlikely to collide */
+  .spc-tt{position:fixed; pointer-events:none; z-index:2147483000; background:#fff; border:1px solid rgba(0,0,0,0.15);
+    border-radius:8px; padding:6px 9px; font-size:12px; color:#0b0b0b; box-shadow:0 4px 14px rgba(0,0,0,0.16);
+    opacity:0; transition:opacity .08s; font-variant-numeric:tabular-nums; white-space:nowrap;
+    font-family:system-ui,-apple-system,"Segoe UI",sans-serif;}
+  @media (prefers-color-scheme: dark){ .spc-tt{background:#1a1a19; color:#fff; border-color:rgba(255,255,255,0.14);} }
+</style>
+
+  <div class="spc-head">
+    <div>
+      <div class="spc-title">Probability Calculator</div>
+      <div class="spc-sub">Model where this stock might go — probabilities, simulations, and risk.</div>
+    </div>
+    <button class="spc-theme" id="spc-themeBtn" type="button">◐ Theme</button>
+  </div>
+
+  <div class="spc-card">
+    <div class="spc-h3">Assumptions — used by every tab</div>
+    <div class="spc-inputgrid">
+      <div class="spc-fetchrow" id="spc-fetchrow">
+        <div><label for="spc-ticker">Ticker</label><input type="text" id="spc-ticker" placeholder="e.g. AAPL" autocomplete="off" spellcheck="false" style="text-transform:uppercase;"></div>
+        <button class="spc-btn" id="spc-fetchBtn" type="button">Fetch</button>
+      </div>
+      <div><label for="spc-price">Current price</label><div class="spc-suffix spc-pre"><span class="spc-u">$</span><input type="number" id="spc-price" step="any" value="100"></div></div>
+      <div><label for="spc-mu">Expected annual return</label><div class="spc-suffix"><input type="number" id="spc-mu" step="any" value="8"><span class="spc-u">%</span></div></div>
+      <div><label for="spc-sigma">Annual volatility</label><div class="spc-suffix"><input type="number" id="spc-sigma" step="any" value="30"><span class="spc-u">%</span></div></div>
+      <div><label for="spc-days">Horizon</label><div class="spc-suffix"><input type="number" id="spc-days" step="1" value="60"><span class="spc-u">days</span></div></div>
+    </div>
+    <div class="spc-status" id="spc-fetchStatus"></div>
+  </div>
+
+  <div class="spc-tabs" role="tablist">
+    <button class="spc-tab" role="tab" aria-selected="true" data-p="prob">Price probability</button>
+    <button class="spc-tab" role="tab" aria-selected="false" data-p="mc">Monte Carlo</button>
+    <button class="spc-tab" role="tab" aria-selected="false" data-p="risk">Return &amp; risk</button>
+    <button class="spc-tab" role="tab" aria-selected="false" data-p="opt">Options</button>
+    <button class="spc-tab" role="tab" aria-selected="false" data-p="est">Estimate inputs</button>
+  </div>
+
+  <div class="spc-panel spc-active" id="spc-p-prob">
+    <div class="spc-card">
+      <div class="spc-h2">Probability of reaching a price</div>
+      <div class="spc-hint">The odds the stock is above or below a target at your horizon — and the chance it <em>touches</em> that level at any point along the way.</div>
+      <div class="spc-row">
+        <div class="spc-field"><label for="spc-target">Target price</label><div class="spc-suffix spc-pre"><span class="spc-u">$</span><input type="number" id="spc-target" step="any" value="115"></div></div>
+      </div>
+      <div class="spc-results" id="spc-probResults"></div>
+      <div class="spc-err" id="spc-probErr"></div>
+      <div class="spc-chartwrap">
+        <div class="spc-charttitle">Where the price could be at your horizon — shaded = beyond target</div>
+        <div class="spc-legend">
+          <span><i style="background:var(--spc-series-1)"></i>probability density</span>
+          <span><i style="background:var(--spc-series-2)"></i>current price</span>
+          <span><i style="background:var(--spc-muted)"></i>target</span>
+        </div>
+        <svg class="spc-chart" id="spc-probChart" viewBox="0 0 660 260" preserveAspectRatio="xMidYMid meet"></svg>
+      </div>
+      <table class="spc-pct" id="spc-probTable"></table>
+    </div>
+  </div>
+
+  <div class="spc-panel" id="spc-p-mc">
+    <div class="spc-card">
+      <div class="spc-h2">Monte Carlo simulation</div>
+      <div class="spc-hint">Simulate thousands of possible price paths and read the outcomes empirically. Values are checked against the exact formulas from the first tab.</div>
+      <div class="spc-row">
+        <div class="spc-field"><label for="spc-mcTarget">Target price</label><div class="spc-suffix spc-pre"><span class="spc-u">$</span><input type="number" id="spc-mcTarget" step="any" value="115"></div></div>
+        <div class="spc-field"><label for="spc-mcN">Simulations</label>
+          <select id="spc-mcN"><option>2000</option><option selected>5000</option><option>10000</option><option>20000</option></select></div>
+        <div class="spc-field" style="flex:0 0 auto;"><label>&nbsp;</label><button class="spc-btn" id="spc-mcRun" type="button">Run again</button></div>
+      </div>
+      <div class="spc-results" id="spc-mcResults"></div>
+      <div class="spc-err" id="spc-mcErr"></div>
+      <div class="spc-chartwrap">
+        <div class="spc-charttitle">Simulated price paths — band = 5th–95th percentile, line = median</div>
+        <svg class="spc-chart" id="spc-mcFan" viewBox="0 0 660 280" preserveAspectRatio="xMidYMid meet"></svg>
+      </div>
+      <div class="spc-chartwrap">
+        <div class="spc-charttitle">Distribution of prices at horizon</div>
+        <svg class="spc-chart" id="spc-mcHist" viewBox="0 0 660 240" preserveAspectRatio="xMidYMid meet"></svg>
+      </div>
+    </div>
+  </div>
+
+  <div class="spc-panel" id="spc-p-risk">
+    <div class="spc-card">
+      <div class="spc-h2">Return &amp; risk</div>
+      <div class="spc-hint">The distribution of your return over the horizon, with downside risk measures. Enter a position size for dollar figures.</div>
+      <div class="spc-row">
+        <div class="spc-field"><label for="spc-posVal">Position value</label><div class="spc-suffix spc-pre"><span class="spc-u">$</span><input type="number" id="spc-posVal" step="any" value="10000"></div></div>
+      </div>
+      <div class="spc-results" id="spc-riskResults"></div>
+      <div class="spc-err" id="spc-riskErr"></div>
+      <div class="spc-chartwrap">
+        <div class="spc-charttitle">Distribution of return at horizon — red = 5% worst-case zone (VaR)</div>
+        <svg class="spc-chart" id="spc-riskChart" viewBox="0 0 660 260" preserveAspectRatio="xMidYMid meet"></svg>
+      </div>
+      <table class="spc-pct" id="spc-riskTable"></table>
+      <div class="spc-note">VaR (Value at Risk) at 95%: with 95% confidence, losses won't exceed this over the horizon. CVaR (expected shortfall): the average loss in the worst 5% of cases.</div>
+    </div>
+  </div>
+
+  <div class="spc-panel" id="spc-p-opt">
+    <div class="spc-card">
+      <div class="spc-h2">Option probability of profit</div>
+      <div class="spc-hint">For buying a single call or put: the chance it pays off and the expected profit/loss <em>under your return assumption</em>. This is not an option-pricing model — see the note below.</div>
+      <div class="spc-row">
+        <div class="spc-field"><label>Type</label>
+          <div class="spc-seg" role="group" id="spc-optType">
+            <button type="button" data-t="call" aria-pressed="true">Buy call</button>
+            <button type="button" data-t="put" aria-pressed="false">Buy put</button>
+          </div>
+        </div>
+        <div class="spc-field"><label for="spc-strike">Strike</label><div class="spc-suffix spc-pre"><span class="spc-u">$</span><input type="number" id="spc-strike" step="any" value="110"></div></div>
+        <div class="spc-field"><label for="spc-premium">Premium (per share)</label><div class="spc-suffix spc-pre"><span class="spc-u">$</span><input type="number" id="spc-premium" step="any" value="3.50"></div></div>
+        <div class="spc-field"><label for="spc-contracts">Contracts (×100)</label><input type="number" id="spc-contracts" step="1" value="1"></div>
+      </div>
+      <div class="spc-results" id="spc-optResults"></div>
+      <div class="spc-err" id="spc-optErr"></div>
+      <div class="spc-chartwrap">
+        <div class="spc-charttitle">Profit / loss at expiration vs stock price</div>
+        <div class="spc-legend">
+          <span><i style="background:var(--spc-good)"></i>profit</span>
+          <span><i style="background:var(--spc-bad)"></i>loss</span>
+          <span><i style="background:var(--spc-series-2)"></i>current price</span>
+        </div>
+        <svg class="spc-chart" id="spc-optChart" viewBox="0 0 660 260" preserveAspectRatio="xMidYMid meet"></svg>
+      </div>
+      <div class="spc-note" id="spc-optNote"></div>
+    </div>
+  </div>
+
+  <div class="spc-panel" id="spc-p-est">
+    <div class="spc-card">
+      <div class="spc-h2">Estimate volatility &amp; return from history</div>
+      <div class="spc-hint">Paste recent closing prices (oldest first), separated by commas, spaces, or new lines. You can also paste <code>date,close</code> rows — the last number on each line is used.</div>
+      <div><label for="spc-hist">Closing prices</label><textarea id="spc-hist" style="min-height:110px;" placeholder="185.2, 187.9, 186.1, 190.4, …"></textarea></div>
+      <div class="spc-results" id="spc-estResults"></div>
+      <div class="spc-err" id="spc-estErr"></div>
+      <div style="margin-top:16px;"><button class="spc-btn spc-ghost" id="spc-useEst" type="button">Use these values in Assumptions ↑</button></div>
+      <div class="spc-note">Volatility is annualized assuming 252 trading days. The estimated expected return is just the historical average — a notoriously poor predictor of the future, so you'll usually want to set it by hand.</div>
+    </div>
+  </div>
+
+  <div class="spc-disc">
+    <strong>How this works &amp; what it isn't.</strong> Every calculation assumes prices follow a lognormal random walk (geometric Brownian motion) with the constant expected return and volatility you enter. Real markets have fat tails, jumps, and changing volatility, so treat these as rough scenario odds, not predictions. Time is in calendar days (÷365); volatility is annualized on 252 trading days. Not investment advice — a modeling tool whose output is only as good as your assumptions. All computation runs locally in the browser.
+  </div>
+
+<script>
+(function(){
+"use strict";
+var R=document.getElementById('spc-root');
+if(!R || R._spcInit) return; R._spcInit=true;
+function g(id){ return R.querySelector('#'+id); }
+function css(v){ return getComputedStyle(R).getPropertyValue(v).trim(); }
+
+/* tooltip on body (single shared) */
+var tooltip=document.getElementById('spc-tooltip');
+if(!tooltip){ tooltip=document.createElement('div'); tooltip.className='spc-tt'; tooltip.id='spc-tooltip'; document.body.appendChild(tooltip); }
+function showTip(html,evt){ tooltip.innerHTML=html; tooltip.style.opacity=1; tooltip.style.left=(evt.clientX+14)+'px'; tooltip.style.top=(evt.clientY-10)+'px'; }
+function hideTip(){ tooltip.style.opacity=0; }
+
+/* ---------- normal helpers (verified) ---------- */
+function erf(x){ var s=x<0?-1:1; x=Math.abs(x); var t=1/(1+0.5*x);
+  var tau=t*Math.exp(-x*x-1.26551223+t*(1.00002368+t*(0.37409196+t*(0.09678418+
+    t*(-0.18628806+t*(0.27886807+t*(-1.13520398+t*(1.48851587+
+    t*(-0.82215223+t*0.17087277))))))))); return s*(1-tau); }
+function normCdf(x){ return 0.5*(1+erf(x/Math.SQRT2)); }
+function normPdf(x){ return Math.exp(-0.5*x*x)/Math.sqrt(2*Math.PI); }
+function normInv(p){ if(p<=0)return -Infinity; if(p>=1)return Infinity;
+  var a=[-3.969683028665376e+01,2.209460984245205e+02,-2.759285104469687e+02,1.383577518672690e+02,-3.066479806614716e+01,2.506628277459239e+00];
+  var b=[-5.447609879822406e+01,1.615858368580409e+02,-1.556989798598866e+02,6.680131188771972e+01,-1.328068155288572e+01];
+  var c=[-7.784894002430293e-03,-3.223964580411365e-01,-2.400758277161838e+00,-2.549732539343734e+00,4.374664141464968e+00,2.938163982698783e+00];
+  var d=[7.784695709041462e-03,3.224671290700398e-01,2.445134137142996e+00,3.754408661907416e+00];
+  var pl=0.02425,ph=1-pl,q,r,z;
+  if(p<pl){ q=Math.sqrt(-2*Math.log(p)); z=(((((c[0]*q+c[1])*q+c[2])*q+c[3])*q+c[4])*q+c[5])/((((d[0]*q+d[1])*q+d[2])*q+d[3])*q+1); }
+  else if(p<=ph){ q=p-0.5; r=q*q; z=(((((a[0]*r+a[1])*r+a[2])*r+a[3])*r+a[4])*r+a[5])*q/(((((b[0]*r+b[1])*r+b[2])*r+b[3])*r+b[4])*r+1); }
+  else { q=Math.sqrt(-2*Math.log(1-p)); z=-(((((c[0]*q+c[1])*q+c[2])*q+c[3])*q+c[4])*q+c[5])/((((d[0]*q+d[1])*q+d[2])*q+d[3])*q+1); }
+  var e=normCdf(z)-p; var u=e*Math.sqrt(2*Math.PI)*Math.exp(z*z/2); z=z-u/(1+z*u/2); return z; }
+
+/* ---------- GBM engine (verified vs MC) ---------- */
+function getA(){
+  var S0=parseFloat(g('spc-price').value), mu=parseFloat(g('spc-mu').value)/100,
+      sigma=parseFloat(g('spc-sigma').value)/100, days=parseFloat(g('spc-days').value), T=days/365;
+  var m=Math.log(S0)+(mu-0.5*sigma*sigma)*T, s=sigma*Math.sqrt(T);
+  return {S0:S0,mu:mu,sigma:sigma,days:days,T:T,m:m,s:s,valid:(S0>0&&sigma>0&&T>0&&isFinite(m))};
+}
+function pAbove(a,K){ return normCdf((a.m-Math.log(K))/a.s); }
+function pctile(a,p){ return Math.exp(a.m+a.s*normInv(p)); }
+function expectedPrice(a){ return a.S0*Math.exp(a.mu*a.T); }
+function medianPrice(a){ return Math.exp(a.m); }
+function lnpdf(a,x){ if(x<=0)return 0; var z=(Math.log(x)-a.m)/a.s; return normPdf(z)/(x*a.s); }
+function touchProb(a,B){ var nu=a.mu-0.5*a.sigma*a.sigma, sT=a.sigma*Math.sqrt(a.T), b=Math.log(B/a.S0);
+  if(Math.abs(B-a.S0)<1e-12) return 1;
+  if(B>a.S0) return Math.min(1, normCdf((-b+nu*a.T)/sT)+Math.exp(2*nu*b/(a.sigma*a.sigma))*normCdf((-b-nu*a.T)/sT));
+  return Math.min(1, normCdf((b-nu*a.T)/sT)+Math.exp(2*nu*b/(a.sigma*a.sigma))*normCdf((b+nu*a.T)/sT)); }
+function cvarPrice(a,alpha){ var q=pctile(a,alpha), A=(Math.log(q)-a.m)/a.s;
+  return Math.exp(a.m+0.5*a.s*a.s)*normCdf(A-a.s)/normCdf(A); }
+function callExp(a,K){ var d2=(a.m-Math.log(K))/a.s,d1=d2+a.s; return Math.exp(a.m+0.5*a.s*a.s)*normCdf(d1)-K*normCdf(d2); }
+function putExp(a,K){ var d2=(a.m-Math.log(K))/a.s,d1=d2+a.s; return K*normCdf(-d2)-Math.exp(a.m+0.5*a.s*a.s)*normCdf(-d1); }
+
+/* ---------- formatting ---------- */
+function money(x){ if(!isFinite(x))return "—"; var n=Math.abs(x), dp=n>=1000?0:2;
+  return (x<0?"-$":"$")+Math.abs(x).toLocaleString(undefined,{minimumFractionDigits:dp,maximumFractionDigits:dp}); }
+function pct(x,dp){ if(!isFinite(x))return "—"; return (x*100).toFixed(dp===undefined?1:dp)+"%"; }
+function num(x,dp){ if(!isFinite(x))return "—"; return x.toFixed(dp===undefined?2:dp); }
+function statHTML(k,v,cls){ return '<div class="spc-stat'+(cls?' spc-'+cls:'')+'"><div class="spc-k">'+k+'</div><div class="spc-v'+(String(v).length>11?' spc-small':'')+'">'+v+'</div></div>'; }
+
+/* ---------- svg util ---------- */
+var NS="http://www.w3.org/2000/svg";
+function el(t,at){ var e=document.createElementNS(NS,t); for(var k in at) e.setAttribute(k,at[k]); return e; }
+function clear(svg){ while(svg.firstChild) svg.removeChild(svg.firstChild); }
+function axes(svg,W,H,xmin,xmax,ymin,ymax,fmtX,fmtY){
+  var mL=52,mR=16,mT=14,mB=30, plotW=W-mL-mR, plotH=H-mT-mB;
+  if(xmax<=xmin)xmax=xmin+1; if(ymax<=ymin)ymax=ymin+1;
+  var sx=function(x){return mL+(x-xmin)/(xmax-xmin)*plotW;}, sy=function(y){return mT+plotH-(y-ymin)/(ymax-ymin)*plotH;};
+  for(var i=0;i<=4;i++){ var yv=ymin+(ymax-ymin)*i/4, yy=sy(yv);
+    svg.appendChild(el('line',{x1:mL,y1:yy,x2:W-mR,y2:yy,stroke:css('--spc-grid'),'stroke-width':1}));
+    var t=el('text',{x:mL-6,y:yy+3,'text-anchor':'end'}); t.textContent=fmtY(yv); svg.appendChild(t); }
+  for(var j=0;j<=5;j++){ var xv=xmin+(xmax-xmin)*j/5, xx=sx(xv);
+    var t2=el('text',{x:xx,y:H-mB+16,'text-anchor':'middle'}); t2.textContent=fmtX(xv); svg.appendChild(t2); }
+  var zeroY=(ymin<0&&ymax>0)?0:ymin;
+  svg.appendChild(el('line',{x1:mL,y1:sy(zeroY),x2:W-mR,y2:sy(zeroY),stroke:css('--spc-baseline'),'stroke-width':1}));
+  return {sx:sx,sy:sy,mL:mL,mR:mR,mT:mT,mB:mB,plotW:plotW,plotH:plotH,xmin:xmin,xmax:xmax,ymin:ymin,ymax:ymax};
+}
+function vline(svg,ax,x,color,label){ if(x<ax.xmin||x>ax.xmax)return;
+  var zeroY=(ax.ymin<0&&ax.ymax>0)?0:ax.ymin;
+  svg.appendChild(el('line',{x1:ax.sx(x),y1:ax.mT,x2:ax.sx(x),y2:ax.sy(zeroY),stroke:color,'stroke-width':1.5,'stroke-dasharray':'4 3'}));
+  if(label){ var t=el('text',{x:ax.sx(x),y:ax.mT+2,'text-anchor':'middle',fill:color}); t.setAttribute('font-size','9'); t.textContent=label; svg.appendChild(t); } }
+function hoverPts(svg,ax,pts,fx,fy,yl){
+  var col=css('--spc-series-1');
+  var hl=el('line',{x1:0,y1:ax.mT,x2:0,y2:ax.sy(ax.ymin),stroke:css('--spc-muted'),'stroke-width':1,opacity:0});
+  var dot=el('circle',{r:4,fill:col,stroke:css('--spc-surface-1'),'stroke-width':2,opacity:0});
+  svg.appendChild(hl); svg.appendChild(dot);
+  var ov=el('rect',{x:ax.mL,y:ax.mT,width:ax.plotW,height:ax.plotH,fill:'transparent'}); svg.appendChild(ov);
+  function mv(evt){ var r=svg.getBoundingClientRect(), px=(evt.clientX-r.left)/r.width*660,
+    dx=ax.xmin+(px-ax.mL)/ax.plotW*(ax.xmax-ax.xmin);
+    if(dx<ax.xmin||dx>ax.xmax){lv();return;}
+    var best=pts[0],bd=Infinity; for(var i=0;i<pts.length;i++){var dd=Math.abs(pts[i].x-dx); if(dd<bd){bd=dd;best=pts[i];}}
+    hl.setAttribute('x1',ax.sx(best.x)); hl.setAttribute('x2',ax.sx(best.x)); hl.setAttribute('opacity',0.5);
+    dot.setAttribute('cx',ax.sx(best.x)); dot.setAttribute('cy',ax.sy(best.y)); dot.setAttribute('opacity',1);
+    showTip(fx(best.x)+'<br>'+yl+' = <b>'+fy(best.y)+'</b>',evt); }
+  function lv(){ hl.setAttribute('opacity',0); dot.setAttribute('opacity',0); hideTip(); }
+  ov.addEventListener('mousemove',mv); ov.addEventListener('mouseleave',lv);
+  ov.addEventListener('touchmove',function(e){if(e.touches[0])mv(e.touches[0]);},{passive:true}); ov.addEventListener('touchend',lv);
+}
+
+/* ---------- TAB 1: PRICE PROBABILITY ---------- */
+function renderProb(){
+  var a=getA(), err=g('spc-probErr'); err.textContent='';
+  var K=parseFloat(g('spc-target').value), res=g('spc-probResults'), tbl=g('spc-probTable');
+  if(!a.valid){ err.textContent='Check your assumptions — price, volatility, and horizon must be positive.'; res.innerHTML=''; return; }
+  if(!(K>0)) err.textContent='Enter a positive target price.';
+  var above=pAbove(a,K), touch=touchProb(a,K), dir=K>=a.S0?'up to':'down to';
+  res.innerHTML=
+    statHTML('P(≥ '+money(K)+') at horizon', pct(above,1),'hl')+
+    statHTML('P(≤ '+money(K)+') at horizon', pct(1-above,1))+
+    statHTML('P(touches '+dir+' '+money(K)+')', pct(touch,1),'hl')+
+    statHTML('Expected price', money(expectedPrice(a)))+
+    statHTML('Median price', money(medianPrice(a)));
+  var ps=[0.05,0.10,0.25,0.5,0.75,0.90,0.95], rows='<tr><th>Percentile</th><th>Price</th><th>Return</th></tr>';
+  for(var i=0;i<ps.length;i++){ var pr=pctile(a,ps[i]); rows+='<tr><td>'+(ps[i]*100)+'th</td><td>'+money(pr)+'</td><td>'+pct(pr/a.S0-1,1)+'</td></tr>'; }
+  tbl.innerHTML=rows;
+  var svg=g('spc-probChart'); clear(svg);
+  var lo=Math.max(0.01,pctile(a,0.002)), hi=pctile(a,0.998), N=200, pts=[], ymax=0;
+  for(var k=0;k<=N;k++){ var x=lo+(hi-lo)*k/N, y=lnpdf(a,x); pts.push({x:x,y:y}); if(y>ymax)ymax=y; }
+  var ax=axes(svg,660,260,lo,hi,0,ymax*1.12,function(v){return '$'+num(v,0);},function(){return '';});
+  var beyond=function(x){ return K>=a.S0? x>=K : x<=K; };
+  var dArea='',open=false, ii;
+  for(ii=0;ii<pts.length;ii++){ var p=pts[ii];
+    if(beyond(p.x)){ if(!open){dArea+='M '+ax.sx(p.x)+' '+ax.sy(0); open=true;} dArea+=' L '+ax.sx(p.x)+' '+ax.sy(p.y); }
+    else if(open){ dArea+=' L '+ax.sx(pts[ii-1].x)+' '+ax.sy(0)+' Z'; open=false; } }
+  if(open) dArea+=' L '+ax.sx(pts[pts.length-1].x)+' '+ax.sy(0)+' Z';
+  if(dArea) svg.appendChild(el('path',{d:dArea,fill:css('--spc-series-1'),'fill-opacity':0.22}));
+  var dFill='M '+ax.sx(pts[0].x)+' '+ax.sy(0), dLine='';
+  for(ii=0;ii<pts.length;ii++){ dFill+=' L '+ax.sx(pts[ii].x)+' '+ax.sy(pts[ii].y); dLine+=(ii?' L ':'M ')+ax.sx(pts[ii].x)+' '+ax.sy(pts[ii].y); }
+  dFill+=' L '+ax.sx(pts[pts.length-1].x)+' '+ax.sy(0)+' Z';
+  svg.appendChild(el('path',{d:dFill,fill:css('--spc-series-1'),'fill-opacity':0.07}));
+  svg.appendChild(el('path',{d:dLine,fill:'none',stroke:css('--spc-series-1'),'stroke-width':2,'stroke-linejoin':'round'}));
+  vline(svg,ax,a.S0,css('--spc-series-2'),'now'); vline(svg,ax,K,css('--spc-muted'),'target');
+  hoverPts(svg,ax,pts,function(v){return '$'+num(v,2);},function(v){return num(v,5);},'density');
+}
+
+/* ---------- TAB 2: MONTE CARLO ---------- */
+function randn(){ var u=0,v=0; while(u===0)u=Math.random(); while(v===0)v=Math.random(); return Math.sqrt(-2*Math.log(u))*Math.cos(2*Math.PI*v); }
+function renderMC(){
+  var a=getA(), err=g('spc-mcErr'); err.textContent=''; var res=g('spc-mcResults');
+  if(!a.valid){ err.textContent='Check your assumptions.'; res.innerHTML=''; clear(g('spc-mcFan')); clear(g('spc-mcHist')); return; }
+  var K=parseFloat(g('spc-mcTarget').value), N=parseInt(g('spc-mcN').value,10),
+      M=Math.max(20,Math.min(120,Math.round(a.days))),
+      dt=a.T/M, drift=(a.mu-0.5*a.sigma*a.sigma)*dt, vol=a.sigma*Math.sqrt(dt), s2dt=a.sigma*a.sigma*dt,
+      lK=Math.log(K), up=K>a.S0;
+  var stepVals=[]; for(var j0=0;j0<=M;j0++) stepVals.push(new Float64Array(N));
+  var nSample=Math.min(120,N), samplePaths=[], terminals=new Float64Array(N), touchAcc=0, aboveCnt=0;
+  for(var i=0;i<N;i++){
+    var x=Math.log(a.S0); stepVals[0][i]=a.S0; var hit=false, pNo=1, keep=i<nSample, path=keep?[a.S0]:null;
+    for(var j=1;j<=M;j++){ var xn=x+drift+vol*randn();
+      if(K>0){ if(up){ if(x>=lK||xn>=lK) hit=true; else pNo*=(1-Math.exp(-2*(lK-x)*(lK-xn)/s2dt)); }
+               else  { if(x<=lK||xn<=lK) hit=true; else pNo*=(1-Math.exp(-2*(x-lK)*(xn-lK)/s2dt)); } }
+      x=xn; var S=Math.exp(x); stepVals[j][i]=S; if(keep) path.push(S); }
+    terminals[i]=Math.exp(x); if(terminals[i]>=K) aboveCnt++;
+    if(K>0) touchAcc+=hit?1:(1-pNo); if(keep) samplePaths.push(path);
+  }
+  var sortedT=Float64Array.from(terminals).sort(); var q=function(p){return sortedT[Math.min(N-1,Math.floor(p*N))];};
+  var mean=0; for(i=0;i<N;i++) mean+=terminals[i]; mean/=N;
+  res.innerHTML=
+    statHTML('Mean price', money(mean),'hl')+
+    statHTML('Median (P50)', money(q(0.5)))+
+    statHTML('P5 – P95', money(q(0.05))+' – '+money(q(0.95)))+
+    statHTML('P(≥ '+money(K)+')', pct(aboveCnt/N,1)+' <span style="font-size:11px;color:var(--spc-muted)">· exact '+pct(pAbove(a,K),1)+'</span>','hl')+
+    statHTML('P(touches '+money(K)+')', pct(touchAcc/N,1)+' <span style="font-size:11px;color:var(--spc-muted)">· exact '+pct(touchProb(a,K),1)+'</span>');
+  var p5=[],p50=[],p95=[]; for(j=0;j<=M;j++){ var col=Float64Array.from(stepVals[j]).sort();
+    p5.push(col[Math.floor(0.05*N)]); p50.push(col[Math.floor(0.5*N)]); p95.push(col[Math.floor(0.95*N)]); }
+  drawFan(samplePaths,p5,p50,p95,a,M,K); drawHist('spc-mcHist',terminals,K);
+}
+function drawFan(paths,p5,p50,p95,a,M,K){
+  var svg=g('spc-mcFan'); clear(svg); var W=660,H=280, ymax=0,ymin=Infinity, ii,jj;
+  for(ii=0;ii<p95.length;ii++) if(p95[ii]>ymax)ymax=p95[ii];
+  for(ii=0;ii<p5.length;ii++) if(p5[ii]<ymin)ymin=p5[ii];
+  for(ii=0;ii<paths.length;ii++) for(jj=0;jj<paths[ii].length;jj++){ var v=paths[ii][jj]; if(v>ymax)ymax=v; if(v<ymin)ymin=v; }
+  ymin=Math.max(0,Math.min(ymin,a.S0)); ymax=Math.max(ymax,a.S0);
+  var ax=axes(svg,W,H,0,a.days,ymin*0.98,ymax*1.04,function(v){return num(v,0)+'d';},function(v){return '$'+num(v,0);});
+  var tx=function(j){return ax.sx(a.days*j/M);};
+  var band='M '+tx(0)+' '+ax.sy(p95[0]);
+  for(jj=1;jj<=M;jj++) band+=' L '+tx(jj)+' '+ax.sy(p95[jj]);
+  for(jj=M;jj>=0;jj--) band+=' L '+tx(jj)+' '+ax.sy(p5[jj]); band+=' Z';
+  svg.appendChild(el('path',{d:band,fill:css('--spc-series-1'),'fill-opacity':0.13}));
+  for(ii=0;ii<paths.length;ii++){ var d=''; for(jj=0;jj<paths[ii].length;jj++) d+=(jj?' L ':'M ')+tx(jj)+' '+ax.sy(paths[ii][jj]);
+    svg.appendChild(el('path',{d:d,fill:'none',stroke:css('--spc-series-1'),'stroke-width':0.6,'stroke-opacity':0.16})); }
+  var dm=''; for(jj=0;jj<=M;jj++) dm+=(jj?' L ':'M ')+tx(jj)+' '+ax.sy(p50[jj]);
+  svg.appendChild(el('path',{d:dm,fill:'none',stroke:css('--spc-series-1'),'stroke-width':2.2}));
+  if(K>0&&K>=ax.ymin&&K<=ax.ymax){ svg.appendChild(el('line',{x1:ax.mL,y1:ax.sy(K),x2:W-ax.mR,y2:ax.sy(K),stroke:css('--spc-series-2'),'stroke-width':1.4,'stroke-dasharray':'5 4'}));
+    var t=el('text',{x:W-ax.mR,y:ax.sy(K)-4,'text-anchor':'end',fill:css('--spc-series-2')}); t.setAttribute('font-size','9'); t.textContent='target '+money(K); svg.appendChild(t); }
+  var ov=el('rect',{x:ax.mL,y:ax.mT,width:ax.plotW,height:ax.plotH,fill:'transparent'}); svg.appendChild(ov);
+  var vl=el('line',{x1:0,y1:ax.mT,x2:0,y2:ax.mT+ax.plotH,stroke:css('--spc-muted'),'stroke-width':1,opacity:0}); svg.appendChild(vl);
+  ov.addEventListener('mousemove',function(evt){ var r=svg.getBoundingClientRect(), px=(evt.clientX-r.left)/r.width*W;
+    var jsel=Math.round((px-ax.mL)/ax.plotW*M); jsel=Math.max(0,Math.min(M,jsel));
+    vl.setAttribute('x1',tx(jsel)); vl.setAttribute('x2',tx(jsel)); vl.setAttribute('opacity',0.5);
+    showTip('day '+num(a.days*jsel/M,0)+'<br>P95 <b>'+money(p95[jsel])+'</b><br>P50 <b>'+money(p50[jsel])+'</b><br>P5 <b>'+money(p5[jsel])+'</b>',evt); });
+  ov.addEventListener('mouseleave',function(){vl.setAttribute('opacity',0); hideTip();});
+}
+function drawHist(id,data,mark){
+  var svg=g(id); clear(svg); var N=data.length; if(!N)return;
+  var min=Infinity,max=-Infinity,ii; for(ii=0;ii<N;ii++){ if(data[ii]<min)min=data[ii]; if(data[ii]>max)max=data[ii]; }
+  var bins=40, w=(max-min)/bins||1, counts=new Array(bins); for(ii=0;ii<bins;ii++)counts[ii]=0;
+  for(ii=0;ii<N;ii++){ var b=Math.floor((data[ii]-min)/w); if(b>=bins)b=bins-1; if(b<0)b=0; counts[b]++; }
+  var cmax=0; for(ii=0;ii<bins;ii++) if(counts[ii]>cmax)cmax=counts[ii];
+  var ax=axes(svg,660,240,min,max,0,cmax*1.1,function(v){return '$'+num(v,0);},function(v){return ((v/N)*100).toFixed(0)+'%';});
+  var bw=ax.plotW/bins, col=css('--spc-series-1');
+  for(var i=0;i<bins;i++){ if(!counts[i])continue; var x=ax.mL+i*bw, h=ax.plotH*counts[i]/(cmax*1.1);
+    var r=el('rect',{x:x+0.6,y:ax.sy(0)-h,width:Math.max(0.6,bw-1.2),height:h,fill:col,rx:1.5}); svg.appendChild(r);
+    (function(lo,hi,c){ r.addEventListener('mousemove',function(evt){showTip(money(lo)+'–'+money(hi)+'<br><b>'+((c/N)*100).toFixed(1)+'%</b> of outcomes',evt);});
+      r.addEventListener('mouseleave',hideTip); })(min+i*w,min+(i+1)*w,counts[i]); }
+  if(mark>0&&mark>=min&&mark<=max) svg.appendChild(el('line',{x1:ax.sx(mark),y1:ax.mT,x2:ax.sx(mark),y2:ax.sy(0),stroke:css('--spc-series-2'),'stroke-width':1.5,'stroke-dasharray':'4 3'}));
+}
+
+/* ---------- TAB 3: RETURN & RISK ---------- */
+function renderRisk(){
+  var a=getA(), err=g('spc-riskErr'); err.textContent=''; var res=g('spc-riskResults'), tbl=g('spc-riskTable');
+  if(!a.valid){ err.textContent='Check your assumptions.'; res.innerHTML=''; clear(g('spc-riskChart')); return; }
+  var pos=parseFloat(g('spc-posVal').value)||0;
+  var er=expectedPrice(a)/a.S0-1, pLoss=1-pAbove(a,a.S0),
+      v95p=pctile(a,0.05), v99p=pctile(a,0.01),
+      var95=1-v95p/a.S0, var99=1-v99p/a.S0,
+      cvar95=1-cvarPrice(a,0.05)/a.S0, cvar99=1-cvarPrice(a,0.01)/a.S0;
+  res.innerHTML=
+    statHTML('Expected return', pct(er,1), er>=0?'pos':'neg')+
+    statHTML('Chance of a loss', pct(pLoss,1))+
+    statHTML('95% VaR', pct(var95,1)+' · '+money(var95*pos),'neg')+
+    statHTML('99% VaR', pct(var99,1)+' · '+money(var99*pos),'neg')+
+    statHTML('95% CVaR (avg worst 5%)', pct(cvar95,1)+' · '+money(cvar95*pos),'neg')+
+    statHTML('Best case (P95)', pct(pctile(a,0.95)/a.S0-1,1),'pos');
+  var ps=[0.01,0.05,0.25,0.5,0.75,0.95,0.99], rows='<tr><th>Percentile</th><th>Return</th><th>P/L on '+money(pos)+'</th></tr>';
+  for(var i=0;i<ps.length;i++){ var rr=pctile(a,ps[i])/a.S0-1; rows+='<tr><td>'+(ps[i]*100)+'th</td><td>'+pct(rr,1)+'</td><td>'+money(rr*pos)+'</td></tr>'; }
+  tbl.innerHTML=rows;
+  var svg=g('spc-riskChart'); clear(svg);
+  var lo=pctile(a,0.002)/a.S0-1, hi=pctile(a,0.998)/a.S0-1, N=200, pts=[], ymax=0, ii;
+  for(ii=0;ii<=N;ii++){ var r=lo+(hi-lo)*ii/N, S=a.S0*(1+r), y=lnpdf(a,S)*a.S0; pts.push({x:r,y:y}); if(y>ymax)ymax=y; }
+  var ax=axes(svg,660,260,lo,hi,0,ymax*1.12,function(v){return (v*100).toFixed(0)+'%';},function(){return '';});
+  var varR=v95p/a.S0-1;
+  var dRed='',open=false;
+  for(ii=0;ii<pts.length;ii++){ var p=pts[ii];
+    if(p.x<=varR){ if(!open){dRed+='M '+ax.sx(p.x)+' '+ax.sy(0);open=true;} dRed+=' L '+ax.sx(p.x)+' '+ax.sy(p.y); }
+    else if(open){ dRed+=' L '+ax.sx(pts[ii-1].x)+' '+ax.sy(0)+' Z'; open=false; } }
+  if(open) dRed+=' L '+ax.sx(varR)+' '+ax.sy(0)+' Z';
+  if(dRed) svg.appendChild(el('path',{d:dRed,fill:css('--spc-bad'),'fill-opacity':0.28}));
+  var dFill='M '+ax.sx(pts[0].x)+' '+ax.sy(0), dLine='';
+  for(ii=0;ii<pts.length;ii++){ dFill+=' L '+ax.sx(pts[ii].x)+' '+ax.sy(pts[ii].y); dLine+=(ii?' L ':'M ')+ax.sx(pts[ii].x)+' '+ax.sy(pts[ii].y); }
+  dFill+=' L '+ax.sx(pts[pts.length-1].x)+' '+ax.sy(0)+' Z';
+  svg.appendChild(el('path',{d:dFill,fill:css('--spc-series-1'),'fill-opacity':0.08}));
+  svg.appendChild(el('path',{d:dLine,fill:'none',stroke:css('--spc-series-1'),'stroke-width':2}));
+  vline(svg,ax,0,css('--spc-muted'),'0%'); vline(svg,ax,varR,css('--spc-bad'),'VaR');
+  hoverPts(svg,ax,pts,function(v){return 'return '+(v*100).toFixed(1)+'%';},function(v){return num(v,5);},'density');
+}
+
+/* ---------- TAB 4: OPTIONS ---------- */
+var optT='call';
+function renderOpt(){
+  var a=getA(), err=g('spc-optErr'); err.textContent=''; var res=g('spc-optResults');
+  var K=parseFloat(g('spc-strike').value), prem=parseFloat(g('spc-premium').value), con=parseInt(g('spc-contracts').value,10)||0, mult=100*con;
+  if(!a.valid){ err.textContent='Check your assumptions.'; res.innerHTML=''; clear(g('spc-optChart')); return; }
+  if(!(K>0)||!(prem>=0)) err.textContent='Enter a positive strike and premium.';
+  var isCall=optT==='call', be=isCall?K+prem:K-prem,
+      pITM=isCall?pAbove(a,K):1-pAbove(a,K),
+      pProfit=isCall?pAbove(a,be):Math.max(0,1-pAbove(a,be)),
+      expPayoff=isCall?callExp(a,K):putExp(a,K),
+      expPL=(expPayoff-prem)*mult, maxLoss=prem*mult;
+  res.innerHTML=
+    statHTML('Breakeven price', money(be),'hl')+
+    statHTML('P(profit)', pct(pProfit,1),'hl')+
+    statHTML('P(expires in-the-money)', pct(pITM,1))+
+    statHTML('Expected P/L', money(expPL), expPL>=0?'pos':'neg')+
+    statHTML('Max loss', money(-maxLoss),'neg')+
+    statHTML('Expected payoff / share', money(expPayoff));
+  g('spc-optNote').innerHTML='Expected P/L uses <b>your</b> expected annual return ('+g('spc-mu').value+'%), i.e. the real-world probability measure — so it answers "given my view, is this a good bet?" It is <b>not</b> a fair option price (that would use the risk-free rate under the risk-neutral measure). Assumes holding a long option to expiration.';
+  var svg=g('spc-optChart'); clear(svg);
+  var lo=Math.max(0.01,pctile(a,0.01)), hi=pctile(a,0.99), N=160,
+      payoff=function(S){ return (isCall?Math.max(S-K,0):Math.max(K-S,0))-prem; },
+      pts=[], ymin=Infinity, ymax=-Infinity, ii;
+  for(ii=0;ii<=N;ii++){ var S=lo+(hi-lo)*ii/N, pl=payoff(S)*mult; pts.push({x:S,y:pl}); if(pl<ymin)ymin=pl; if(pl>ymax)ymax=pl; }
+  if(ymax<=0)ymax=maxLoss*0.2; if(ymin>=0)ymin=-maxLoss*0.2;
+  var ax=axes(svg,660,260,lo,hi,ymin*1.1,ymax*1.1,function(v){return '$'+num(v,0);},function(v){return money(v);});
+  function areaPath(cond){ var d='',open=false,i2;
+    for(i2=0;i2<pts.length;i2++){ var p=pts[i2], on=cond(p.y);
+      if(on){ if(!open){ d+='M '+ax.sx(p.x)+' '+ax.sy(0); open=true;} d+=' L '+ax.sx(p.x)+' '+ax.sy(p.y);}
+      else if(open){ d+=' L '+ax.sx(pts[i2-1].x)+' '+ax.sy(0)+' Z'; open=false;} }
+    if(open) d+=' L '+ax.sx(pts[pts.length-1].x)+' '+ax.sy(0)+' Z'; return d; }
+  var gp=areaPath(function(y){return y>0;}), rp=areaPath(function(y){return y<=0;});
+  if(rp) svg.appendChild(el('path',{d:rp,fill:css('--spc-bad'),'fill-opacity':0.20}));
+  if(gp) svg.appendChild(el('path',{d:gp,fill:css('--spc-good'),'fill-opacity':0.20}));
+  var dLine=''; for(ii=0;ii<pts.length;ii++) dLine+=(ii?' L ':'M ')+ax.sx(pts[ii].x)+' '+ax.sy(pts[ii].y);
+  svg.appendChild(el('path',{d:dLine,fill:'none',stroke:css('--spc-text-secondary'),'stroke-width':2}));
+  vline(svg,ax,a.S0,css('--spc-series-2'),'now'); vline(svg,ax,be,css('--spc-muted'),'B/E');
+  hoverPts(svg,ax,pts,function(v){return 'price '+money(v);},function(v){return money(v);},'P/L');
+}
+
+/* ---------- TAB 5: ESTIMATE ---------- */
+var estSigma=null, estMu=null;
+function parseLines(str){ return str.split(/\n/).map(function(line){ var m=line.match(/-?\d+(\.\d+)?/g); return m?parseFloat(m[m.length-1]):NaN; }).filter(function(v){return !isNaN(v);}); }
+function renderEst(){
+  var err=g('spc-estErr'); err.textContent=''; var res=g('spc-estResults'), raw=g('spc-hist').value.trim();
+  if(!raw){ res.innerHTML='<div class="spc-note" style="grid-column:1/-1">Paste at least ~10 closing prices to estimate.</div>'; estSigma=estMu=null; return; }
+  var prices; if(/\n/.test(raw)) prices=parseLines(raw); else prices=raw.split(/[\s,;]+/).map(Number).filter(function(v){return !isNaN(v);});
+  if(prices.length<3){ err.textContent='Need at least 3 prices.'; res.innerHTML=''; return; }
+  for(var i=0;i<prices.length;i++) if(prices[i]<=0){ err.textContent='Prices must be positive.'; res.innerHTML=''; return; }
+  var rets=[]; for(i=1;i<prices.length;i++) rets.push(Math.log(prices[i]/prices[i-1]));
+  var n=rets.length, mean=0; for(i=0;i<n;i++) mean+=rets[i]; mean/=n;
+  var vv=0; for(i=0;i<n;i++) vv+=(rets[i]-mean)*(rets[i]-mean); vv/=(n-1);
+  var sdDaily=Math.sqrt(vv); estSigma=sdDaily*Math.sqrt(252);
+  estMu=mean*252+0.5*estSigma*estSigma;
+  res.innerHTML=
+    statHTML('Data points', prices.length+' prices')+
+    statHTML('Daily volatility', pct(sdDaily,2))+
+    statHTML('Annualized volatility', pct(estSigma,1),'hl')+
+    statHTML('Est. expected return', pct(estMu,1),'hl')+
+    statHTML('Latest price', money(prices[prices.length-1]));
+}
+
+/* ---------- FETCH (via configurable backend proxy) ---------- */
+var QUOTE_ENDPOINT=(R.dataset.quoteEndpoint||'').trim();
+function fetchTicker(){
+  var sym=g('spc-ticker').value.trim().toUpperCase().replace(/[^A-Z0-9.\-]/g,''), st=g('spc-fetchStatus'); st.className='spc-status';
+  if(!QUOTE_ENDPOINT){ st.textContent='No data endpoint configured — enter price and volatility manually.'; return; }
+  if(!sym){ st.textContent='Enter a ticker first.'; return; }
+  st.textContent='Fetching '+sym+'…';
+  var url=QUOTE_ENDPOINT+(QUOTE_ENDPOINT.indexOf('?')>=0?'&':'?')+'ticker='+encodeURIComponent(sym);
+  fetch(url).then(function(r){ if(!r.ok) throw new Error('http '+r.status); return r.json(); }).then(function(d){
+    if(d.error) throw new Error(d.error);
+    if(typeof d.price==='number') g('spc-price').value=d.price;
+    if(typeof d.volatility==='number') g('spc-sigma').value=(d.volatility*100).toFixed(1);
+    st.className='spc-status spc-ok';
+    st.textContent='Loaded '+sym+': price '+money(d.price)+(typeof d.volatility==='number'?', volatility '+(d.volatility*100).toFixed(1)+'%':'')+'. Expected return left as-is — set it to your own view.';
+    renderAll();
+  }).catch(function(e){ st.className='spc-status spc-warn';
+    st.textContent="Couldn't fetch "+sym+" ("+e.message+"). Enter price and volatility manually, or use the Estimate inputs tab."; });
+}
+
+/* ---------- wiring ---------- */
+function activeP(){ return R.querySelector('.spc-tab[aria-selected="true"]').dataset.p; }
+function renderActive(){ var on=activeP(); if(on==='prob')renderProb(); else if(on==='mc')renderMC(); else if(on==='risk')renderRisk(); else if(on==='opt')renderOpt(); else if(on==='est')renderEst(); }
+function renderAll(){ renderProb(); renderRisk(); renderOpt(); renderEst(); if(activeP()==='mc') renderMC(); }
+
+['spc-price','spc-mu','spc-sigma','spc-days'].forEach(function(id){ g(id).addEventListener('input',renderAll); });
+g('spc-target').addEventListener('input',renderProb);
+g('spc-mcTarget').addEventListener('input',renderMC);
+g('spc-mcN').addEventListener('change',renderMC);
+g('spc-mcRun').addEventListener('click',renderMC);
+g('spc-posVal').addEventListener('input',renderRisk);
+['spc-strike','spc-premium','spc-contracts'].forEach(function(id){ g(id).addEventListener('input',renderOpt); });
+g('spc-hist').addEventListener('input',renderEst);
+g('spc-fetchBtn').addEventListener('click',fetchTicker);
+g('spc-ticker').addEventListener('keydown',function(e){ if(e.key==='Enter') fetchTicker(); });
+R.querySelectorAll('#spc-optType button').forEach(function(b){ b.addEventListener('click',function(){
+  R.querySelectorAll('#spc-optType button').forEach(function(x){x.setAttribute('aria-pressed','false');}); b.setAttribute('aria-pressed','true'); optT=b.dataset.t; renderOpt(); }); });
+g('spc-useEst').addEventListener('click',function(){ if(estSigma){ g('spc-sigma').value=(estSigma*100).toFixed(1); g('spc-mu').value=(estMu*100).toFixed(1); renderAll();
+  R.querySelector('.spc-tab[data-p="prob"]').click(); } });
+R.querySelectorAll('.spc-tab').forEach(function(t){ t.addEventListener('click',function(){
+  R.querySelectorAll('.spc-tab').forEach(function(x){x.setAttribute('aria-selected','false');}); t.setAttribute('aria-selected','true');
+  R.querySelectorAll('.spc-panel').forEach(function(p){p.classList.remove('spc-active');});
+  g('spc-p-'+t.dataset.p).classList.add('spc-active'); renderActive(); }); });
+g('spc-themeBtn').addEventListener('click',function(){
+  if(R.classList.contains('spc-dark')){ R.classList.remove('spc-dark'); R.classList.add('spc-light'); }
+  else if(R.classList.contains('spc-light')){ R.classList.remove('spc-light'); R.classList.add('spc-dark'); }
+  else { R.classList.add(matchMedia('(prefers-color-scheme: dark)').matches?'spc-light':'spc-dark'); }
+  renderAll(); });
+
+/* ---------- apply config: URL query params override data-* attributes ---------- */
+function applyConfig(){
+  var ds=R.dataset, params=null;
+  try{ params=new URLSearchParams(location.search); }catch(e){ params=null; }
+  function cfg(k){
+    if(params && params.get(k)!=null && params.get(k)!=='') return params.get(k);
+    return (ds[k]!==undefined && ds[k]!=='') ? ds[k] : null;
+  }
+  var vP=cfg('price'), vMu=cfg('mu'), vSig=cfg('sigma'), vDays=cfg('days'), vSym=cfg('symbol');
+  if(vP!=null) g('spc-price').value=vP;
+  if(vMu!=null) g('spc-mu').value=vMu;
+  if(vSig!=null) g('spc-sigma').value=vSig;
+  if(vDays!=null) g('spc-days').value=vDays;
+  if(vSym!=null) g('spc-ticker').value=vSym;
+  if(!QUOTE_ENDPOINT){ g('spc-fetchrow').style.display='none'; }
+  // seed target/strike near a round move from price
+  var S0=parseFloat(g('spc-price').value);
+  if(isFinite(S0)&&S0>0){ var tgt=Math.round(S0*1.15*100)/100; g('spc-target').value=tgt; g('spc-mcTarget').value=tgt; g('spc-strike').value=Math.round(S0*1.10*100)/100; }
+}
+applyConfig();
+
+/* ---------- public hook: update the stock without reloading (for SPA embeds) ---------
+   window.spcSetStock({symbol, price, sigma, mu, days})  — sigma/mu are PERCENT numbers */
+window.spcSetStock=function(o){
+  o=o||{};
+  if(o.price!=null) g('spc-price').value=o.price;
+  if(o.sigma!=null) g('spc-sigma').value=o.sigma;
+  if(o.mu!=null) g('spc-mu').value=o.mu;
+  if(o.days!=null) g('spc-days').value=o.days;
+  if(o.symbol!=null) g('spc-ticker').value=o.symbol;
+  var S0=parseFloat(g('spc-price').value);
+  if(isFinite(S0)&&S0>0){ var tgt=Math.round(S0*1.15*100)/100; g('spc-target').value=tgt; g('spc-mcTarget').value=tgt; g('spc-strike').value=Math.round(S0*1.10*100)/100; }
+  renderAll();
+};
+
+renderAll();
+})();
+</script>
+</div>
+<!-- === END STOCK PROBABILITY CALCULATOR WIDGET === -->
+</body></html>
+"""
+
+
+# =========================== HTTP ===========================
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+    def _send(self, code, body, ctype, extra=None):
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Cache-Control", "no-store")
+        for k, v in (extra or []):
+            self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _json(self, obj, extra=None):
+        self._send(200, json.dumps(obj).encode("utf-8"), "application/json", extra)
+
+    def _uid(self):
+        c = SimpleCookie(self.headers.get("Cookie", ""))
+        if "session" in c:
+            return read_session(c["session"].value)
+        return None
+
+    def _body(self):
+        n = int(self.headers.get("Content-Length", 0) or 0)
+        if not n:
+            return {}
+        try:
+            return json.loads(self.rfile.read(n).decode())
+        except Exception:
+            return {}
+
+    def _morning_get(self):
+        uid = self._uid()
+        if not uid:
+            return self._json({"logged_in": False})
+        q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        today = datetime.now(ET).date().isoformat()
+        day = (q.get("day") or [""])[0][:10]
+        days = morning_report_days()
+        if not day:
+            day = today if today in days else (days[0] if days else today)
+        h, m = _morning_time()
+        self._json({"logged_in": True, "day": day, "today": today, "days": days,
+                    "report": morning_report_get(day),
+                    "portfolio": [{"symbol": s, "name": n} for s, n in morning_get_portfolio()],
+                    "state": dict(_morning_state),
+                    "schedule": f"{(h % 12) or 12}:{m:02d} {'AM' if h < 12 else 'PM'} CT weekdays",
+                    "email_to": MORNING_EMAIL_TO, "email_on": EMAIL_ON,
+                    "ai_on": bool(MORNING_AI and HAVE_SIMUCAL), "have_data": HAVE_DATA})
+
+    def _morning_post(self, body):
+        uid = self._uid()
+        if not uid:
+            return self._json({"error": "Please log in first."})
+        if self.path.startswith("/api/morning/generate"):
+            started = morning_run_async(use_ai=bool(body.get("ai", True)), email=False)
+            return self._json({"ok": started, "error": "" if started else "Already running — hang on."})
+        if self.path.startswith("/api/morning/email"):
+            day = (body.get("day") or datetime.now(ET).date().isoformat())[:10]
+            rep = morning_report_get(day)
+            if not rep:
+                return self._json({"error": "Build the sheet first."})
+            ok, m = send_morning_email(rep)
+            return self._json({"ok": ok, "error": "" if ok else m, "msg": m})
+        if self.path.startswith("/api/morning/portfolio"):
+            sym = clean_symbol(body.get("symbol"))
+            if not sym:
+                return self._json({"error": "That doesn't look like a valid symbol."})
+            if body.get("action") == "add":
+                ok, m = morning_add(sym)
+                if not ok:
+                    return self._json({"error": m})
+            elif body.get("action") == "remove":
+                morning_remove(sym)
+            return self._json({"ok": True})
+        return self._send(404, b"not found", "text/plain")
+
+    def do_GET(self):
+        if self.path in ("/", "/index.html"):
+            self._send(200, PAGE.encode("utf-8"), "text/html; charset=utf-8")
+        elif self.path.startswith("/manifest.webmanifest"):
+            self._send(200, MANIFEST.encode("utf-8"), "application/manifest+json")
+        elif self.path.startswith("/sw.js"):
+            self._send(200, SW_JS.encode("utf-8"), "application/javascript")
+        elif self.path.startswith("/sim.js"):
+            self._send(200, SIM_JS.encode("utf-8"), "application/javascript")
+        elif self.path.startswith("/simucal.js"):
+            self._send(200, SIMUCAL_JS.encode("utf-8"), "application/javascript")
+        elif self.path.startswith("/calc-widget"):
+            self._send(200, CALC_PAGE.encode("utf-8"), "text/html; charset=utf-8")
+        elif self.path.startswith("/icon.png") or self.path.startswith("/apple-touch-icon"):
+            self._send(200, icon_bytes(), "image/png")
+        elif self.path.startswith("/morning.js"):
+            self._send(200, MORNING_JS.encode("utf-8"), "application/javascript")
+        elif self.path.startswith("/api/morning/cron"):
+            # For an outside scheduler (e.g. cron-job.org) in case the server sleeps.
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            if not MORNING_KEY or not hmac.compare_digest((q.get("key") or [""])[0], MORNING_KEY):
+                return self._send(403, b"forbidden", "text/plain")
+            threading.Thread(target=morning_due_job, daemon=True).start()
+            self._json({"ok": True})
+        elif self.path.startswith("/api/morning/xlsx"):
+            if not self._uid():
+                return self._send(401, b"Please log in first.", "text/plain")
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            day = (q.get("day") or [datetime.now(ET).date().isoformat()])[0][:10]
+            rep = morning_report_get(day)
+            if not rep:
+                return self._send(404, b"No sheet for that day yet.", "text/plain")
+            try:
+                data = morning_build_xlsx(rep)
+            except Exception as e:
+                return self._send(500, f"Export failed: {e}".encode(), "text/plain")
+            fn = _morning_filename(day)
+            self._send(200, data, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                       extra=[("Content-Disposition",
+                               "attachment; filename=\"" + fn + "\"; filename*=UTF-8''" + urllib.parse.quote(fn))])
+        elif self.path.startswith("/api/morning"):
+            try:
+                self._morning_get()
+            except Exception as e:
+                print(f"[MORNING] /api/morning failed: {type(e).__name__}: {e}", flush=True)
+                self._json({"logged_in": True, "fatal": f"{type(e).__name__}: {str(e)[:300]}"})
+        elif self.path.startswith("/api/hist/alerts"):
+            uid = self._uid()
+            self._json({"rows": get_alarm_events(uid) if uid else []})
+        elif self.path.startswith("/api/hist/daily"):
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            sym = clean_symbol((q.get("symbol") or [""])[0])
+            self._json({"symbol": sym, "points": get_daily_history(sym) if sym else []})
+        elif self.path.startswith("/api/history"):
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            sym = clean_symbol((q.get("symbol") or [""])[0])
+            self._json({"symbol": sym, "points": history_for(sym) if sym else []})
+        elif self.path.startswith("/api/push/key"):
+            self._json({"key": VAPID_PUBLIC_KEY, "enabled": PUSH_ON})
+        elif self.path.startswith("/api/me"):
+            uid = self._uid()
+            if uid:
+                self._json({"logged_in": True, "email": get_email(uid),
+                            "alerts_on": get_alerts_on(uid), "email_on": EMAIL_ON, "push_on": PUSH_ON,
+                            "watchlist_view": get_watchlist_view(uid)})
+            else:
+                self._json({"logged_in": False, "email_on": EMAIL_ON, "push_on": PUSH_ON})
+        elif self.path.startswith("/api/quotes"):
+            uid = self._uid()
+            out = {"meta": meta(), "mine": []}
+            if uid:
+                mine = rows_for(get_watchlist(uid))
+                try:
+                    eb = earnings_badges([r["ticker"] for r in mine])
+                    for r in mine:
+                        r["earn"] = eb.get(r["ticker"])
+                except Exception:
+                    pass
+                out["mine"] = mine
+            self._json(out)
+        elif self.path.startswith("/api/earnings"):
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            try:
+                offset = int((q.get("week") or ["0"])[0])
+            except Exception:
+                offset = 0
+            offset = max(-2, min(offset, 6))
+            # Force a fresh Finnhub fetch when the user hits Refresh (?force=1).
+            # Cheap re-loads (auto-poll while enrichment fills in) don't set it.
+            if (q.get("force") or ["0"])[0] == "1":
+                try:
+                    _refresh_earnings_raw(force=True)
+                    _refresh_earnings_week(offset, force=True)
+                except Exception as e:
+                    print(f"[EARN] force refresh failed: {str(e)[:140]}", flush=True)
+            try:
+                rows, bounds = earnings_week_rows(offset)
+            except Exception as e:
+                print(f"[EARN] week build failed: {str(e)[:140]}", flush=True)
+                rows, bounds = [], ("", "")
+            uid = self._uid()
+            notes = get_earn_notes(uid) if uid else {}
+            for r in rows:
+                n = notes.get((r["symbol"], r["period"])) if uid else None
+                if n:
+                    # Tier 1: user's manual grade always wins.
+                    r["grade"] = n["grade"]; r["beat"] = n["beat"]
+                    r["watch"] = n["watch"]; r["gold"] = n["gold"]
+                    r["is_reported"] = False
+                elif r.get("reported"):
+                    # Tier 2 (new): actual result overrides all predictions.
+                    # Grade jumps to actuals scale (A allowed since it's fact,
+                    # not probability). Beat cell shows the surprise % (signed).
+                    rep = r["reported"]
+                    pct = rep.get("surprise_pct")
+                    r["grade"] = _actual_grade(pct)
+                    if pct is not None:
+                        # Round to nearest whole percent so the tab reads cleanly
+                        r["beat"] = int(round(pct))
+                    r["watch"] = _reported_watch(rep)
+                    r["is_reported"] = True
+                    r["actual_eps"] = rep.get("actual")
+                else:
+                    r["is_reported"] = False
+                    # Tier 3: SimuCal-derived (Watchlist tickers only).
+                    if r.get("sc_grade"):
+                        r["grade"] = r["sc_grade"]
+                    if r.get("sc_beat"):
+                        r["beat"]  = r["sc_beat"]
+                    if r.get("sc_watch"):
+                        r["watch"] = r["sc_watch"]
+                    # Tier 4: cheap beat-history auto (fills what SimuCal hasn't).
+                    if not r.get("grade") and r.get("auto_grade"):
+                        r["grade"] = r["auto_grade"]
+                    if not r.get("beat")  and r.get("auto_beat"):
+                        r["beat"]  = r["auto_beat"]
+            self._json({"have_earnings": HAVE_EARNINGS, "week_start": bounds[0],
+                        "week_end": bounds[1], "offset": offset,
+                        "rows": rows, "logged_in": bool(uid)})
+        elif self.path.startswith("/healthz"):
+            self._send(200, b"ok", "text/plain")
+        else:
+            self._send(404, b"not found", "text/plain")
+
+    def do_POST(self):
+        body = self._body()
+        if self.path.startswith("/api/simucal/export_xlsx"):
+            uid = self._uid()
+            if not uid:
+                return self._json({"error": "Please log in first."})
+            basket = body.get("basket") or []
+            if not basket:
+                return self._json({"error": "Basket is empty."})
+            try:
+                xlsx_bytes = _simucal_build_xlsx(basket)
+            except Exception as e:
+                return self._json({"error": f"Export failed: {str(e)[:180]}"})
+            return self._send(
+                200, xlsx_bytes,
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                extra=[("Content-Disposition", 'attachment; filename="Earnings_Beat_Probability.xlsx"')]
+            )
+        if self.path.startswith("/api/morning/"):
+            try:
+                return self._morning_post(body)
+            except Exception as e:
+                print(f"[MORNING] POST {self.path} failed: {type(e).__name__}: {e}", flush=True)
+                return self._json({"error": f"{type(e).__name__}: {str(e)[:300]}"})
+        if self.path.startswith("/api/simucal/research"):
+            uid = self._uid()
+            if not uid:
+                return self._json({"error": "Please log in first."})
+            if not HAVE_SIMUCAL:
+                return self._json({"error": "SimuCal needs ANTHROPIC_API_KEY set on the server."})
+            sym = clean_symbol(body.get("symbol"))
+            if not sym:
+                return self._json({"error": "Enter a ticker to research."})
+            today = datetime.now(ET).date().isoformat()
+            force = bool(body.get("force"))
+            if not force:
+                cached = simucal_cache_get(sym, today)
+                if cached:
+                    cached["_cached"] = True
+                    return self._json(cached)
+            try:
+                data = simucal_research(sym)
+                simucal_cache_put(sym, today, data)
+                simucal_usage_log(uid, sym)
+                data["_cached"] = False
+                return self._json(data)
+            except Exception as e:
+                return self._json({"error": f"Research failed: {str(e)[:180]}"})
+        if self.path.startswith("/api/earnings/note"):
+            uid = self._uid()
+            if not uid:
+                return self._json({"error": "Please log in first."})
+            sym = clean_symbol(body.get("symbol"))
+            period = (body.get("period") or "").strip()[:16]
+            if not sym or not period:
+                return self._json({"error": "Missing symbol or period."})
+            grade = (body.get("grade") or "").strip()[:12]
+            watch = (body.get("watch") or "").strip()[:2000]
+            gold = bool(body.get("gold"))
+            beat = body.get("beat")
+            try:
+                beat = None if beat in (None, "") else float(beat)
+            except Exception:
+                beat = None
+            save_earn_note(uid, sym, period, grade, beat, watch, gold)
+            return self._json({"ok": True})
+        if self.path.startswith("/api/signup") or self.path.startswith("/api/login"):
+            email = (body.get("email") or "").strip().lower()
+            pw = body.get("password") or ""
+            if "@" not in email or len(pw) < 6:
+                return self._json({"ok": False, "error": "Enter a valid email and a password of 6+ characters."})
+            if self.path.startswith("/api/signup"):
+                uid = create_user(email, hash_pw(pw))
+                if not uid:
+                    return self._json({"ok": False, "error": "That email already has an account — try logging in."})
+            else:
+                row = get_user_by_email(email)
+                if not row or not verify_pw(pw, row[1]):
+                    return self._json({"ok": False, "error": "Wrong email or password."})
+                uid = row[0]
+            cookie = f"session={sign_session(uid)}; HttpOnly; Path=/; Max-Age=2592000; SameSite=Lax"
+            return self._json({"ok": True}, extra=[("Set-Cookie", cookie)])
+        elif self.path.startswith("/api/logout"):
+            return self._json({"ok": True}, extra=[("Set-Cookie", "session=; Path=/; Max-Age=0")])
+        elif self.path.startswith("/api/alerts"):
+            uid = self._uid()
+            if not uid:
+                return self._json({"error": "Please log in first."})
+            set_alerts_on(uid, bool(body.get("on")))
+            return self._json({"ok": True})
+        elif self.path.startswith("/api/prefs/watchlist_view"):
+            uid = self._uid()
+            if not uid:
+                return self._json({"error": "Please log in first."})
+            view = str(body.get("view") or "cards").lower()
+            if view not in ("cards", "table"):
+                return self._json({"error": "view must be 'cards' or 'table'"})
+            set_watchlist_view(uid, view)
+            return self._json({"ok": True, "view": view})
+        elif self.path.startswith("/api/push/subscribe"):
+            uid = self._uid()
+            if not uid:
+                return self._json({"error": "Please log in first."})
+            sub = body.get("subscription")
+            if not isinstance(sub, dict) or not sub.get("endpoint"):
+                return self._json({"error": "bad subscription"})
+            save_sub(uid, sub)
+            return self._json({"ok": True})
+        elif self.path.startswith("/api/push/unsubscribe"):
+            ep = body.get("endpoint")
+            if ep:
+                delete_sub(ep)
+            return self._json({"ok": True})
+        elif self.path.startswith("/api/watch"):
+            uid = self._uid()
+            if not uid:
+                return self._json({"error": "Please log in first."})
+            sym = clean_symbol(body.get("symbol"))
+            if not sym:
+                return self._json({"error": "That doesn't look like a valid symbol."})
+            if body.get("action") == "add":
+                if not add_watch(uid, sym):
+                    return self._json({"error": f"Watchlist limit is {MAX_PER_USER}."})
+            elif body.get("action") == "remove":
+                remove_watch(uid, sym)
+            return self._json({"ok": True})
+        elif self.path.startswith("/api/hist/backfill"):
+            uid = self._uid()
+            if not uid:
+                return self._json({"error": "Please log in first."})
+            if not HAVE_DATA:
+                return self._json({"error": "No Alpaca data keys set on the server."})
+            sym = clean_symbol(body.get("symbol"))
+            targets = [sym] if sym else get_watchlist(uid)
+            if not targets:
+                return self._json({"error": "No symbols to load — add one to your watchlist."})
+            try:
+                days = int(body.get("days") or 365)
+            except Exception:
+                days = 365
+            try:
+                n = backfill_daily_history(targets, days=max(30, min(days, 2000)))
+                return self._json({"ok": True, "symbols": targets, "saved": n})
+            except Exception as e:
+                return self._json({"error": f"Backfill failed: {str(e)[:120]}"})
+        self._send(404, b"not found", "text/plain")
+
+
+def _ensure_db_ready():
+    """Initialise the DB, retrying in the background until it succeeds.
+
+    Lets the web server boot even when the database is temporarily unreachable
+    (Neon suspended, over quota, or briefly down) instead of crashing on
+    startup with exit status 1.
+    """
+    delay = 30
+    while True:
+        try:
+            init_db()
+            print("DB ready.", flush=True)
+            return
+        except Exception as e:
+            print(f"  (DB not ready, retrying in {delay}s: {str(e)[:120]})", flush=True)
+            time.sleep(delay)
+            delay = min(delay * 2, 600)
+
+
+def main():
+    try:
+        init_db()
+    except Exception as e:
+        print(f"  (initial DB init failed: {str(e)[:120]}; starting web server anyway, will retry)", flush=True)
+        threading.Thread(target=_ensure_db_ready, daemon=True).start()
+    if not HAVE_DATA:
+        print("WARNING: ALPACA_KEY / ALPACA_SECRET not set.")
+    print(f"Storage: {'Postgres' if DATABASE_URL else 'local SQLite ('+DB_PATH+')'}")
+    print(f"Data: Alpaca feed={ALPACA_FEED} | Email: {'ON' if EMAIL_ON else 'OFF'} | "
+          f"Push: {'ON' if PUSH_ON else 'OFF'} | Pushover: {'ON' if PUSHOVER_ON else 'OFF'} | "
+          f"Earnings(Finnhub): {'ON' if HAVE_EARNINGS else 'OFF'} | "
+          f"SimuCal(Anthropic): {'ON' if HAVE_SIMUCAL else 'OFF'}")
+    print(f"Morning sheet: {MORNING_TIME_CT} CT weekdays | AI {'ON' if (MORNING_AI and HAVE_SIMUCAL) else 'OFF'} | "
+          f"email to: {', '.join(MORNING_EMAIL_TO) or '(none — set MORNING_EMAIL_TO)'}")
+    print(f"Icon: {'icon.png found' if os.path.exists(ICON_PATH) else 'using fallback (add icon.png)'}")
+    threading.Thread(target=refresher, daemon=True).start()
+    threading.Thread(target=morning_scheduler, daemon=True).start()
+    srv = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
+    print(f"Stock Watch running on http://localhost:{PORT}  (Ctrl+C to stop)")
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        print("\nStopped.")
+
+
+if __name__ == "__main__":
+    main()
