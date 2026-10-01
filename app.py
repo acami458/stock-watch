@@ -212,10 +212,15 @@ def init_db():
             user_id INTEGER PRIMARY KEY, alerts_on INTEGER DEFAULT 1)""")
         # Per-user watchlist display preference: 'cards' (default) or 'table'.
         # ALTER TABLE IF NOT EXISTS handles the migration for existing rows.
-        try:
-            cur.execute("ALTER TABLE user_settings ADD COLUMN watchlist_view TEXT DEFAULT 'cards'")
-        except Exception:
-            pass  # column already exists — subsequent starts
+        if kind == "pg":
+            # IF NOT EXISTS: a failing ALTER would abort the whole Postgres
+            # transaction and silently skip every CREATE TABLE after it.
+            cur.execute("ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS watchlist_view TEXT DEFAULT 'cards'")
+        else:
+            try:
+                cur.execute("ALTER TABLE user_settings ADD COLUMN watchlist_view TEXT DEFAULT 'cards'")
+            except Exception:
+                pass  # column already exists — subsequent starts
         cur.execute("""CREATE TABLE IF NOT EXISTS alerts_sent(
             user_id INTEGER NOT NULL, symbol TEXT NOT NULL, day TEXT NOT NULL,
             PRIMARY KEY(user_id, symbol, day))""")
@@ -2350,6 +2355,27 @@ _morning_lock = threading.Lock()
 _morning_state = {"running": False, "step": "", "error": "", "started": None}
 
 
+_morning_tables_ok = False
+
+
+def _morning_ensure_tables():
+    """Create the Morning tables on first use (independent of init_db)."""
+    global _morning_tables_ok
+    if _morning_tables_ok:
+        return
+    conn, kind = _db()
+    try:
+        cur = conn.cursor()
+        cur.execute("""CREATE TABLE IF NOT EXISTS morning_portfolio(
+            symbol TEXT PRIMARY KEY, name TEXT)""")
+        cur.execute("""CREATE TABLE IF NOT EXISTS morning_reports(
+            day TEXT PRIMARY KEY, data_json TEXT NOT NULL, updated_at TEXT)""")
+        conn.commit()
+        _morning_tables_ok = True
+    finally:
+        conn.close()
+
+
 def _morning_time():
     try:
         h, m = MORNING_TIME_CT.split(":")
@@ -2360,6 +2386,7 @@ def _morning_time():
 
 def morning_get_portfolio():
     """[(symbol, name)] sorted by symbol. Seeds the default list on first use."""
+    _morning_ensure_tables()
     conn, kind = _db()
     try:
         cur = conn.cursor()
@@ -2414,6 +2441,7 @@ def morning_add(sym):
 
 
 def morning_remove(sym):
+    _morning_ensure_tables()
     conn, kind = _db()
     try:
         cur = conn.cursor()
@@ -2424,6 +2452,7 @@ def morning_remove(sym):
 
 
 def morning_report_get(day):
+    _morning_ensure_tables()
     conn, kind = _db()
     try:
         cur = conn.cursor()
@@ -2435,6 +2464,7 @@ def morning_report_get(day):
 
 
 def morning_report_days(limit=15):
+    _morning_ensure_tables()
     conn, kind = _db()
     try:
         cur = conn.cursor()
@@ -2446,6 +2476,7 @@ def morning_report_days(limit=15):
 
 
 def morning_report_put(day, data):
+    _morning_ensure_tables()
     conn, kind = _db()
     try:
         cur = conn.cursor()
@@ -4106,7 +4137,7 @@ MORNING_JS = r"""/* ============================================================
    var d=await (await fetch(url,{cache:'no-store'})).json();
    M.data=d; render();
    if(d.state&&d.state.running){startPoll();}else{stopPoll();}
-  }catch(e){$('mo-body').innerHTML='<div class="empty">Could not load the morning sheet.</div>';}
+  }catch(e){stopPoll();$('mo-root').innerHTML='<div class="warn">Could not load the morning sheet ('+esc(e&&e.message||e)+'). Try refreshing the page.</div>';}
  }
  function startPoll(){if(!M.poll)M.poll=setInterval(function(){load(M.day);},4000);}
  function stopPoll(){if(M.poll){clearInterval(M.poll);M.poll=null;}}
@@ -4114,6 +4145,7 @@ MORNING_JS = r"""/* ============================================================
  function render(){
   var d=M.data, root=$('mo-root');
   if(!d.logged_in){root.innerHTML='<div class="empty">Sign in above to see the morning sheet.</div>';return;}
+  if(d.fatal){root.innerHTML='<div class="warn" style="background:#fef2f2;color:#991b1b;border-color:#fecaca">Server error loading the morning sheet: '+esc(d.fatal)+'</div>';return;}
   M.day=d.day;
   var r=d.report, st=d.state||{};
   var opts=(d.days||[]).slice();
@@ -5610,6 +5642,52 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             return {}
 
+    def _morning_get(self):
+        uid = self._uid()
+        if not uid:
+            return self._json({"logged_in": False})
+        q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        today = datetime.now(ET).date().isoformat()
+        day = (q.get("day") or [""])[0][:10]
+        days = morning_report_days()
+        if not day:
+            day = today if today in days else (days[0] if days else today)
+        h, m = _morning_time()
+        self._json({"logged_in": True, "day": day, "today": today, "days": days,
+                    "report": morning_report_get(day),
+                    "portfolio": [{"symbol": s, "name": n} for s, n in morning_get_portfolio()],
+                    "state": dict(_morning_state),
+                    "schedule": f"{(h % 12) or 12}:{m:02d} {'AM' if h < 12 else 'PM'} CT weekdays",
+                    "email_to": MORNING_EMAIL_TO, "email_on": EMAIL_ON,
+                    "ai_on": bool(MORNING_AI and HAVE_SIMUCAL), "have_data": HAVE_DATA})
+
+    def _morning_post(self, body):
+        uid = self._uid()
+        if not uid:
+            return self._json({"error": "Please log in first."})
+        if self.path.startswith("/api/morning/generate"):
+            started = morning_run_async(use_ai=bool(body.get("ai", True)), email=False)
+            return self._json({"ok": started, "error": "" if started else "Already running — hang on."})
+        if self.path.startswith("/api/morning/email"):
+            day = (body.get("day") or datetime.now(ET).date().isoformat())[:10]
+            rep = morning_report_get(day)
+            if not rep:
+                return self._json({"error": "Build the sheet first."})
+            ok, m = send_morning_email(rep)
+            return self._json({"ok": ok, "error": "" if ok else m, "msg": m})
+        if self.path.startswith("/api/morning/portfolio"):
+            sym = clean_symbol(body.get("symbol"))
+            if not sym:
+                return self._json({"error": "That doesn't look like a valid symbol."})
+            if body.get("action") == "add":
+                ok, m = morning_add(sym)
+                if not ok:
+                    return self._json({"error": m})
+            elif body.get("action") == "remove":
+                morning_remove(sym)
+            return self._json({"ok": True})
+        return self._send(404, b"not found", "text/plain")
+
     def do_GET(self):
         if self.path in ("/", "/index.html"):
             self._send(200, PAGE.encode("utf-8"), "text/html; charset=utf-8")
@@ -5651,23 +5729,11 @@ class Handler(BaseHTTPRequestHandler):
                        extra=[("Content-Disposition",
                                "attachment; filename=\"" + fn + "\"; filename*=UTF-8''" + urllib.parse.quote(fn))])
         elif self.path.startswith("/api/morning"):
-            uid = self._uid()
-            if not uid:
-                return self._json({"logged_in": False})
-            q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
-            today = datetime.now(ET).date().isoformat()
-            day = (q.get("day") or [""])[0][:10]
-            days = morning_report_days()
-            if not day:
-                day = today if today in days else (days[0] if days else today)
-            h, m = _morning_time()
-            self._json({"logged_in": True, "day": day, "today": today, "days": days,
-                        "report": morning_report_get(day),
-                        "portfolio": [{"symbol": s, "name": n} for s, n in morning_get_portfolio()],
-                        "state": dict(_morning_state),
-                        "schedule": f"{(h % 12) or 12}:{m:02d} {'AM' if h < 12 else 'PM'} CT weekdays",
-                        "email_to": MORNING_EMAIL_TO, "email_on": EMAIL_ON,
-                        "ai_on": bool(MORNING_AI and HAVE_SIMUCAL), "have_data": HAVE_DATA})
+            try:
+                self._morning_get()
+            except Exception as e:
+                print(f"[MORNING] /api/morning failed: {type(e).__name__}: {e}", flush=True)
+                self._json({"logged_in": True, "fatal": f"{type(e).__name__}: {str(e)[:300]}"})
         elif self.path.startswith("/api/hist/alerts"):
             uid = self._uid()
             self._json({"rows": get_alarm_events(uid) if uid else []})
@@ -5785,31 +5851,11 @@ class Handler(BaseHTTPRequestHandler):
                 extra=[("Content-Disposition", 'attachment; filename="Earnings_Beat_Probability.xlsx"')]
             )
         if self.path.startswith("/api/morning/"):
-            uid = self._uid()
-            if not uid:
-                return self._json({"error": "Please log in first."})
-            if self.path.startswith("/api/morning/generate"):
-                started = morning_run_async(use_ai=bool(body.get("ai", True)), email=False)
-                return self._json({"ok": started, "error": "" if started else "Already running — hang on."})
-            if self.path.startswith("/api/morning/email"):
-                day = (body.get("day") or datetime.now(ET).date().isoformat())[:10]
-                rep = morning_report_get(day)
-                if not rep:
-                    return self._json({"error": "Build the sheet first."})
-                ok, m = send_morning_email(rep)
-                return self._json({"ok": ok, "error": "" if ok else m, "msg": m})
-            if self.path.startswith("/api/morning/portfolio"):
-                sym = clean_symbol(body.get("symbol"))
-                if not sym:
-                    return self._json({"error": "That doesn't look like a valid symbol."})
-                if body.get("action") == "add":
-                    ok, m = morning_add(sym)
-                    if not ok:
-                        return self._json({"error": m})
-                elif body.get("action") == "remove":
-                    morning_remove(sym)
-                return self._json({"ok": True})
-            return self._send(404, b"not found", "text/plain")
+            try:
+                return self._morning_post(body)
+            except Exception as e:
+                print(f"[MORNING] POST {self.path} failed: {type(e).__name__}: {e}", flush=True)
+                return self._json({"error": f"{type(e).__name__}: {str(e)[:300]}"})
         if self.path.startswith("/api/simucal/research"):
             uid = self._uid()
             if not uid:
