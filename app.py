@@ -2922,8 +2922,12 @@ def morning_due_job():
     if rep and rep.get("scheduled_done"):
         return True
     if not _is_trading_day(today):
+        print(f"[MORNING] {today.isoformat()} is a market holiday — skipping", flush=True)
         return True
+    print(f"[MORNING] scheduled run starting for {today.isoformat()}", flush=True)
     report = morning_run(use_ai=True, email=bool(MORNING_EMAIL_TO))
+    print(f"[MORNING] scheduled run {'finished' if report else 'FAILED: ' + _morning_state.get('error', '')}"
+          f"{' — email: ' + str(report.get('emailed')) if report else ''}", flush=True)
     if report:
         report["scheduled_done"] = True
         morning_report_put(report["day"], report)
@@ -2936,6 +2940,8 @@ def morning_scheduler():
     scheduled time, and only until today's run is done (keeps Neon idle)."""
     done_day = None
     fails = 0
+    h0, m0 = _morning_time()
+    print(f"[MORNING] scheduler started — will run weekdays at {h0}:{m0:02d} CT", flush=True)
     while True:
         try:
             today = datetime.now(ET).date()
@@ -4150,6 +4156,7 @@ MORNING_JS = r"""/* ============================================================
   var r=d.report, st=d.state||{};
   var opts=(d.days||[]).slice();
   if(opts.indexOf(d.day)<0)opts.unshift(d.day);
+  if(opts.indexOf(d.today)<0)opts.unshift(d.today);
   var sel='<select id="mo-day" onchange="moLoad(this.value)">'+opts.map(function(x){return '<option value="'+x+'"'+(x===d.day?' selected':'')+'>'+shortDay(x)+(x===d.today?' (today)':'')+'</option>';}).join('')+'</select>';
   var h='';
   h+='<div class="bar" style="align-items:center;margin-top:4px">'+sel;
@@ -5687,6 +5694,14 @@ class Handler(BaseHTTPRequestHandler):
                 morning_remove(sym)
             return self._json({"ok": True})
         return self._send(404, b"not found", "text/plain")
+
+    def do_HEAD(self):
+        # Uptime monitors (UptimeRobot etc.) often send HEAD; answer 200 so
+        # they report "up" and the request still counts as traffic.
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
     def do_GET(self):
         if self.path in ("/", "/index.html"):
